@@ -1,16 +1,27 @@
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
 
 mod spmc;
 mod buffer;
+mod cpal;
 mod exceptions;
 mod utils;
 
-/// RTL sample rate = audio sample rate × this. 50 keeps both 48k and 44.1k in
-/// the RTL's valid range (2.4 MS/s and 2.205 MS/s). Also the boxcar decimation
-/// factor — see the DSP callback.
-const AUDIO_DECIM: u32 = 50;
+use spmc::{RingProducer};
+
+use crate::cpal::{Cpal, AUDIO_DECIM};
+
+/// Ring geometry: RING_SLOTS buffers of RING_BLOCK f32 audio samples each.
+/// RING_BLOCK is also the staging size in the DSP callback — `Buffer::write`
+/// takes exactly M elements, so the two must not drift apart.
+///
+/// Sized to the *smallest* consumer, not the largest. A block only becomes
+/// readable once it is full, so RING_BLOCK is a latency floor paid by every
+/// consumer: 512 @ 48 kHz = ~10.7 ms per block, ~171 ms for the whole ring.
+/// Consumers wanting a larger window (an FFT, say) accumulate blocks on their
+/// own side — that is cheap, whereas splitting a large block down to cpal's
+/// ~512-frame callbacks would mean holding a borrow into a ring slot across
+/// dozens of real-time callbacks.
+const RING_SLOTS: usize = 16;
+const RING_BLOCK: usize = 512;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── Device discovery ────────────────────────────────────────────────────
@@ -19,74 +30,48 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("#{i}: {}", name.to_string_lossy());
     }
 
-    let host = cpal::default_host();
-    let device = host
-        .default_output_device()
-        .expect("no output device available");
+    // Ring producer
+    // Non-blocking: a slow DSP consumer must never stall the USB callback, so
+    // the ring overwrites and drags the reader forward to the freshest data.
+    let mut producer = RingProducer::<f32, RING_SLOTS, RING_BLOCK>::new(false);
 
-    // ── Audio output config ─────────────────────────────────────────────────
-    // Take the device's default; derive the RTL rate so decimation is an exact
-    // integer.
-    let out_cfg = device.default_output_config()?;
-    let channels = out_cfg.channels() as usize;
-    let audio_rate = out_cfg.sample_rate(); // u32 in cpal 0.18
-    let rtl_rate = audio_rate * AUDIO_DECIM;
-    println!(
-        "audio: {} Hz × {} ch  |  rtl: {} Hz  |  decim: {}",
-        audio_rate, channels, rtl_rate, AUDIO_DECIM
-    );
+    // A consumer for cpal
+    let consumer_cpal = producer.subscribe();
 
-    // ── Ring b (placeholder) ────────────────────────────────────────────────
-    // Mutex<VecDeque<f32>> stands in for the bounded SPSC audio ring in the
-    // plan. A lock in the audio callback breaks the "never block in the
-    // callback" rule — fine for first-sound, replace before it matters.
-    let audio_buf = Arc::new(Mutex::new(VecDeque::<f32>::new()));
-    let cb_buf = Arc::clone(&audio_buf);
-
-    let config = cpal::StreamConfig {
-        channels: out_cfg.channels(),
-        sample_rate: audio_rate,
-        buffer_size: cpal::BufferSize::Default,
-    };
-
-    // cpal drives this callback on its own real-time thread.
-    let stream = device.build_output_stream(
-        config,
-        move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-            let mut buf = cb_buf.lock().unwrap();
-            for frame in data.chunks_mut(channels) {
-                let s = buf.pop_front().unwrap_or(0.0); // underrun → silence
-                for out in frame.iter_mut() {
-                    *out = s; // mono → every channel
-                }
-            }
-        },
-        move |err| eprintln!("audio stream error: {err}"),
-        None,
-    )?;
-    stream.play()?;
+    // cpal itself
+    let cpal = Cpal::new(consumer_cpal);
 
     // ── SDR setup (librtlsdr via rtlsdr_mt) ─────────────────────────────────
     let (mut ctl, mut reader) =
         rtlsdr_mt::open(0).map_err(|_| "rtlsdr: failed to open device 0")?;
     ctl.set_center_freq(100_000_000)
         .map_err(|_| "rtlsdr: set_center_freq failed")?; // 100.0 MHz — set to a strong local station
-    ctl.set_sample_rate(rtl_rate)
+    ctl.set_sample_rate(cpal.rtl_rate)
         .map_err(|_| "rtlsdr: set_sample_rate failed")?;
     ctl.enable_agc()
         .map_err(|_| "rtlsdr: enable_agc failed")?; // FC0013: auto gain for first sound
     ctl.reset_buffer()
         .map_err(|_| "rtlsdr: reset_buffer failed")?; // flush stale USB buffers before streaming
 
+    cpal.play()?;
+
     // ── DSP: runs inside librtlsdr's async read callback ────────────────────
     // read_async blocks this (main) thread and invokes the closure per USB
-    // buffer. cpal's callback runs on its own thread → two threads, plus
-    // librtlsdr's internal USB thread.
+    // buffer, on this same thread. cpal's callback runs on its own thread, so
+    // only finished audio crosses the ring.
     let (mut prev_i, mut prev_q) = (0.0f32, 0.0f32); // FM discriminator state
     let mut acc = 0.0f32; // boxcar accumulator for decimate-by-AUDIO_DECIM
     let mut acc_n = 0u32;
     let volume = 0.3f32;
-    let cap = audio_rate as usize; // ~1 s backlog ceiling
+
+    // Ring slots are fixed size and `Buffer::write` rejects anything that is not
+    // exactly RING_BLOCK long, so stage samples here and hand over a full block.
+    // One USB buffer yields 16384/2/AUDIO_DECIM ≈ 164 samples, so a 512-sample
+    // block fills every ~3.1 callbacks. The 164 is fractional, so block edges
+    // never align with transfer edges — the decimation accumulator carries
+    // across callbacks, which is what makes that harmless.
+    let mut block = [0.0f32; RING_BLOCK];
+    let mut block_n = 0usize;
 
     reader
         .read_async(15, 16384, move |bytes| {
@@ -112,10 +97,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     acc = 0.0;
                     acc_n = 0;
 
-                    let mut b = audio_buf.lock().unwrap();
-                    if b.len() < cap {
-                        b.push_back(sample);
-                    } // else: producer outrunning consumer — drop (clock mismatch)
+                    block[block_n] = sample;
+                    block_n += 1;
+                    if block_n == RING_BLOCK {
+                        block_n = 0;
+                        if let Err(e) = producer.write(&block) {
+                            eprintln!("ring write failed: {e:?}");
+                        }
+                    }
                 }
             }
         })
