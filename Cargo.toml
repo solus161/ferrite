@@ -3,6 +3,14 @@ name = "rust-radio"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "rust_radio"
+path = "src/lib.rs"
+
+[[bench]]
+name = "ring_vs_mutex"
+harness = false
+
 [dependencies]
 cpal = "0.18.1"
 ratatui = "0.30.2"

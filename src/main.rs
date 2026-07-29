@@ -1,11 +1,7 @@
 
-mod spmc;
-mod buffer;
 mod cpal;
-mod exceptions;
-mod utils;
 
-use spmc::{RingProducer};
+use rust_radio::spmc::RingProducer;
 
 use crate::cpal::{Cpal, AUDIO_DECIM};
 
@@ -44,7 +40,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── SDR setup (librtlsdr via rtlsdr_mt) ─────────────────────────────────
     let (mut ctl, mut reader) =
         rtlsdr_mt::open(0).map_err(|_| "rtlsdr: failed to open device 0")?;
-    ctl.set_center_freq(100_000_000)
+    ctl.set_center_freq(90_000_000)
         .map_err(|_| "rtlsdr: set_center_freq failed")?; // 100.0 MHz — set to a strong local station
     ctl.set_sample_rate(cpal.rtl_rate)
         .map_err(|_| "rtlsdr: set_sample_rate failed")?;

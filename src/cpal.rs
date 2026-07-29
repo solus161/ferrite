@@ -1,6 +1,6 @@
 use cpal::{Stream, traits::{DeviceTrait, HostTrait, StreamTrait}};
 
-use crate::spmc::RingConsumer;
+use rust_radio::spmc::RingConsumer;
 
 pub struct Cpal {
     stream: Stream,
@@ -46,10 +46,10 @@ impl Cpal {
         // per callback while the ring hands out fixed M-sample blocks, so the
         // remainder has to survive between callbacks.
         //
-        // This is a *copy*, not a borrow into the slot. The producer is
-        // non-blocking and overwrites slots regardless of readers, so a `&[f32]`
-        // held across callbacks would rot underneath us; copying narrows the
-        // exposure to the memcpy itself.
+        // Filled via `read_into`, which copies before releasing the slot. Doing
+        // it the other way round — `read()` then copy — leaves a window where the
+        // producer can overwrite the block mid-copy, and an audio callback is a
+        // prime candidate for being preempted inside it.
         let mut staging = [0.0f32; M];
         let mut pos = M; // start "drained" so the first callback pulls a block
 
@@ -59,11 +59,8 @@ impl Cpal {
             move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                 for frame in data.chunks_mut(channels) {
                     if pos == M {
-                        match consumer.read() {
-                            Ok(block) => {
-                                staging.copy_from_slice(block);
-                                pos = 0;
-                            }
+                        match consumer.read_into(&mut staging) {
+                            Ok(()) => pos = 0,
                             Err(_) => {
                                 // Ring empty — underrun. Emit silence for this
                                 // frame and retry on the next one, so a block
