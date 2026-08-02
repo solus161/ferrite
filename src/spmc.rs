@@ -1,16 +1,16 @@
+use std::cell::UnsafeCell;
 use std::ops::Deref;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread::JoinHandle;
 use std::time::Duration;
 use std::{array, thread};
-use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::thread::JoinHandle;
 
-use crate::exceptions::CustomError;
 use crate::buffer::Buffer;
+use crate::exceptions::CustomError;
 
 /// The number of time the consumer retries when the buffer is partly written when reading
-/// Each retry move the consumer's cursor forwards
+/// Each retry move the consumer's cursor 1 step forwards
 const READ_RETRIES: usize = 4;
 
 /// A lock-free circular ring.
@@ -19,16 +19,20 @@ const READ_RETRIES: usize = 4;
 ///
 /// # Synchronisation
 ///
-/// The Ring's `head` is a single monotonically increasing sequence number — *not* an index.
-/// It never wraps in practice (u64 at 4687 writes/s overflows in ~125 million
-/// years), which is what lets consumers do arithmetic on it: `head - cursor` is
-/// the exact number of blocks a consumer is behind.
+/// The Ring's `head` is just an atomic sequence number
+/// So it does not wrap when get to the end of the buffer
+/// It's abundant and will never be exhausted: 4687 writes/s of u64 overflows in ~125 million yrs
+/// Benefit: consumers could know exactly how many block they lag behind
 ///
 /// # Index wrapped-around mechanism
 ///
-/// The ring slot index is for sequence `s` is `s & (N - 1)`, so sequences `s` and `s + N`
-/// share a slot. That single fact is the whole safety argument:
+/// The ring slot index is calculated as `s & (N - 1)`, with `s` is the above cursor number
 ///
+/// # Block safety mechanism:
+///
+/// When `h` (head) is x times of N blocks ahead of `c` (consumer),
+/// the `h` could overwrite what `c` is reading/copying.
+/// So in that case, write is forbidden.
 /// > A consumer at sequence `c` collides with a producer writing sequence `h`
 /// > **iff** `c ≡ h (mod N)`. Since `c < h`, that means `h - c ∈ {N, 2N, ...}`.
 /// > Therefore **`h - c < N` proves the producer is not in the consumer's slot.**
@@ -61,12 +65,14 @@ struct Ring<T: Copy + Default, const N: usize, const M: usize> {
 
 // Arc<Ring> is only Send if Ring is Sync + Send. UnsafeCell is unconditionally
 // !Sync, so this has to be asserted by hand; the protocol above is the proof.
-unsafe impl<T: Copy + Default + Send, const N: usize, const M: usize> Sync
-    for Ring<T, N, M> {}
+unsafe impl<T: Copy + Default + Send, const N: usize, const M: usize> Sync for Ring<T, N, M> {}
 
 impl<T: Copy + Default, const N: usize, const M: usize> Ring<T, N, M> {
     pub fn new() -> Self {
-        assert!(N.is_power_of_two(), "ring slot count N must be a power of two");
+        assert!(
+            N.is_power_of_two(),
+            "ring slot count N must be a power of two"
+        );
         Self {
             slots: array::from_fn(|_| UnsafeCell::new(Buffer::<T, M>::new())),
             head: AtomicU64::new(0),
@@ -81,14 +87,45 @@ impl<T: Copy + Default, const N: usize, const M: usize> Ring<T, N, M> {
         // Relaxed is sufficient: the producer is the only writer of `head`, so
         // it always observes its own last store.
         let head = self.head.load(Ordering::Relaxed);
-        let slot = self.slots.get(head as usize & (N - 1)).ok_or(CustomError::InvalidIndex)?;
+        let slot = self
+            .slots
+            .get(head as usize & (N - 1))
+            .ok_or(CustomError::InvalidIndex)?;
 
         unsafe { (*slot.get()).write(src)? };
 
-        // Release: everything above must be visible to any consumer that
-        // observes this new head value. This store is what publishes the block.
-        self.head.store(head + 1, Ordering::Release);
+        self.publish();
         Ok(())
+    }
+
+    /// Store one element into the *open* (not yet published) slot at `head`.
+    ///
+    /// # Why holding a slot open is free
+    ///
+    /// This is for producers that compute their data one element at a time and
+    /// would otherwise fill a staging array and memcpy it in. Spreading a block
+    /// across many calls does **not** widen the tearing window: a consumer at
+    /// sequence `c` can only be in this slot if `head - c ≡ 0 (mod N)`, which
+    /// the lag check in [`RingConsumer::claim`] already excludes. Exposure is
+    /// created by `head` *advancing* — a single instant either way — not by how
+    /// long the producer spends before [`publish`](Self::publish).
+    fn put(&self, i: usize, x: T) -> Result<(), CustomError> {
+        let head = self.head.load(Ordering::Relaxed);
+        let slot = self
+            .slots
+            .get(head as usize & (N - 1))
+            .ok_or(CustomError::InvalidIndex)?;
+
+        unsafe { (*slot.get()).set(i, x) }
+    }
+
+    /// Make the open slot visible to consumers.
+    ///
+    /// Release: everything written to the slot must be visible to any consumer
+    /// that observes this new head value. This store is what publishes a block.
+    fn publish(&self) {
+        let head = self.head.load(Ordering::Relaxed);
+        self.head.store(head + 1, Ordering::Release);
     }
 
     pub fn slot(&self, i: usize) -> Result<&UnsafeCell<Buffer<T, M>>, CustomError> {
@@ -124,6 +161,10 @@ pub struct RingProducer<T: Copy + Default, const N: usize, const M: usize> {
     /// flat iteration.
     consumers: Vec<(JoinHandle<()>, Arc<AtomicU64>)>,
     blocking: bool,
+    /// How many elements [`push`](Self::push) has put into the open slot. Zero
+    /// whenever no block is under construction, which is always the case for a
+    /// producer that only ever calls [`write`](Self::write).
+    fill: usize,
 }
 
 impl<T: Copy + Default, const N: usize, const M: usize> RingProducer<T, N, M> {
@@ -132,7 +173,36 @@ impl<T: Copy + Default, const N: usize, const M: usize> RingProducer<T, N, M> {
             ring: Arc::new(Ring::new()),
             consumers: Vec::new(),
             blocking,
+            fill: 0,
         }
+    }
+
+    /// Drop consumers that have already exited, so a dead cursor cannot gate
+    /// this producer forever.
+    fn reap(&mut self) {
+        self.consumers.retain(|(h, _)| !h.is_finished());
+    }
+
+    /// This is the safety guard for the data race in case of slow consumers:
+    /// - If head and consumer both occupy a slot, write is forbidden
+    /// - This is different from the seqlock mechanism
+    ///   where head & consumer could be in the same slot.
+    ///   But that nead 2 atomic read to check for write state.
+    ///   This only need one.
+    fn gated(&self) -> bool {
+        let head = self.ring.head_relaxed();
+
+        // Here the gated condition is h - c >= N
+        // this means consumer is likely to loose package
+        self.consumers
+            .iter()
+            .any(|(_, c)| head.saturating_sub(c.load(Ordering::Acquire)) >= N as u64 - 1)
+    }
+
+    /// Wake every consumer — including after a refusal, since a consumer
+    /// draining a slot is exactly what unblocks the next write.
+    fn wake(&self) {
+        self.consumers.iter().for_each(|(h, _)| h.thread().unpark());
     }
 
     /// Write one block.
@@ -149,43 +219,75 @@ impl<T: Copy + Default, const N: usize, const M: usize> RingProducer<T, N, M> {
     /// ring bounds latency by discarding, it does not apply back-pressure to the
     /// caller. Non-blocking mode never returns this error.
     pub fn write(&mut self, src: &[T]) -> Result<(), CustomError> {
-        // Reap consumers that have already exited, so a dead cursor does not
-        // gate this write forever.
-        self.consumers.retain(|(h, _)| !h.is_finished());
+        debug_assert_eq!(
+            self.fill, 0,
+            "write() would publish a block that push() is still filling"
+        );
+        self.reap();
 
-        let mut refused = false;
-
-        if !self.blocking {
-            // Never consult consumers. A lapped one detects and resyncs itself,
-            // which is why the producer no longer writes consumer cursors at
-            // all — that used to be a data race against their own `store`.
+        // Non-blocking never consults consumers. A lapped one detects and
+        // resyncs itself, which is why the producer no longer writes consumer
+        // cursors at all — that used to be a data race against their own store.
+        let refused = self.blocking && self.gated();
+        if !refused {
             self.ring.write(src)?;
-        } else {
-            let head = self.ring.head_relaxed();
-
-            // Gate one slot early — at N-1 rather than N — so the head never
-            // reaches the ambiguous `head - c == N` state that would make the
-            // consumer resync. See the guard-band note on `Ring`.
-            let gated = self
-                .consumers
-                .iter()
-                .any(|(_, c)| head.saturating_sub(c.load(Ordering::Acquire)) >= N as u64 - 1);
-
-            if gated {
-                refused = true;
-            } else {
-                self.ring.write(src)?;
-            }
         }
 
-        // Wake the survivors — including after a refusal, since a consumer
-        // draining a slot is exactly what unblocks the next write.
-        self.consumers.iter().for_each(|(h, _)| h.thread().unpark());
+        self.wake();
 
         if refused {
             return Err(CustomError::SlowConsumer);
         }
         Ok(())
+    }
+
+    /// Append one element to the block under construction, publishing it once
+    /// `M` elements have accumulated.
+    ///
+    /// For producers that compute samples one at a time. [`write`](Self::write)
+    /// forces such a producer to fill a staging array and hand over a full
+    /// block, which costs an extra whole-block copy; `push` writes straight into
+    /// the ring slot and skips it. The two must not be interleaved within a
+    /// block — `write` debug-asserts that no fill is open.
+    ///
+    /// Returns `Ok(true)` on the call that published a block, `Ok(false)` while
+    /// one is still filling.
+    ///
+    /// # Errors
+    ///
+    /// [`CustomError::SlowConsumer`] — blocking mode only, and only ever on the
+    /// *first* element of a block, since that is where the slot is committed to.
+    /// Note the granularity this implies: a gated `push` producer drops
+    /// individual elements rather than whole blocks, so a caller that keeps
+    /// pushing through a refusal will splice a discontinuity into the middle of
+    /// the next block. Callers that need block-aligned loss should count `M`
+    /// refusals themselves, or use `write`.
+    pub fn push(&mut self, x: T) -> Result<bool, CustomError> {
+        if self.fill == 0 {
+            self.reap();
+            if self.blocking && self.gated() {
+                self.wake();
+                return Err(CustomError::SlowConsumer);
+            }
+        }
+
+        self.ring.put(self.fill, x)?;
+        self.fill += 1;
+
+        if self.fill < M {
+            return Ok(false);
+        }
+
+        self.fill = 0;
+        self.ring.publish();
+        self.wake();
+        Ok(true)
+    }
+
+    /// How many elements are sitting in the block [`push`](Self::push) has not
+    /// published yet.
+    pub fn pending(&self) -> usize {
+        self.fill
     }
 
     pub fn subscribe(&self) -> RingConsumer<T, N, M> {
@@ -205,8 +307,14 @@ impl<T: Copy + Default, const N: usize, const M: usize> RingProducer<T, N, M> {
     /// call `join_all`.
     #[cfg(test)]
     fn register_cursor_for_test(&mut self, cursor: Arc<AtomicU64>) {
-        self.consumers
-            .push((thread::spawn(|| loop { thread::park() }), cursor));
+        self.consumers.push((
+            thread::spawn(|| {
+                loop {
+                    thread::park()
+                }
+            }),
+            cursor,
+        ));
     }
 
     /// Block until every consumer thread has finished.
@@ -228,7 +336,10 @@ impl<T: Copy + Default, const N: usize, const M: usize> RingConsumer<T, N, M> {
     /// Private: consumers are only ever created through
     /// [`RingProducer::subscribe`], which is what ties them to a ring.
     fn new(ring: Arc<Ring<T, N, M>>) -> Self {
-        Self { ring, head: Arc::new(AtomicU64::new(0)) }
+        Self {
+            ring,
+            head: Arc::new(AtomicU64::new(0)),
+        }
     }
 
     /// This consumer's current sequence number.
@@ -497,7 +608,9 @@ mod test {
         // Ten laps' worth, one at a time, so the consumer never falls behind.
         for i in 0..40u8 {
             producer.write(&[i; 2]).unwrap();
-            consumer.read_into(&mut dst).expect("wrapped index must stay valid");
+            consumer
+                .read_into(&mut dst)
+                .expect("wrapped index must stay valid");
             assert_eq!(dst, [i, i]);
         }
         assert_eq!(consumer.head(), 40);
@@ -515,14 +628,22 @@ mod test {
         producer.register_cursor_for_test(consumer.cursor());
 
         producer.write(&[1u8; 2]).unwrap();
-        assert_eq!(producer.ring.head_relaxed(), 1, "empty ring must accept a write");
+        assert_eq!(
+            producer.ring.head_relaxed(),
+            1,
+            "empty ring must accept a write"
+        );
 
         let mut dst = [0u8; 2];
         consumer.read_into(&mut dst).unwrap();
         assert_eq!(consumer.head(), 1, "consumer now caught up");
 
         producer.write(&[2u8; 2]).unwrap();
-        assert_eq!(producer.ring.head_relaxed(), 2, "caught-up consumer must not gate");
+        assert_eq!(
+            producer.ring.head_relaxed(),
+            2,
+            "caught-up consumer must not gate"
+        );
     }
 
     /// The producer refuses to overwrite a slot the slowest consumer has not
@@ -533,8 +654,16 @@ mod test {
         let consumer = producer.subscribe();
         producer.register_cursor_for_test(consumer.cursor());
 
-        assert_eq!(write_seq(&mut producer, 0..4), 1, "the 4th write is refused");
-        assert_eq!(producer.ring.head_relaxed(), 3, "N-1 blocks fit, then it gates");
+        assert_eq!(
+            write_seq(&mut producer, 0..4),
+            1,
+            "the 4th write is refused"
+        );
+        assert_eq!(
+            producer.ring.head_relaxed(),
+            3,
+            "N-1 blocks fit, then it gates"
+        );
 
         // Consumer never reads, so every further write is refused — and says so.
         for i in 4..8u8 {
@@ -545,7 +674,11 @@ mod test {
             );
             assert_eq!(producer.ring.head_relaxed(), 3, "write {i} must be gated");
         }
-        assert_eq!(consumer.head(), 0, "blocking mode never moves a consumer cursor");
+        assert_eq!(
+            consumer.head(),
+            0,
+            "blocking mode never moves a consumer cursor"
+        );
     }
 
     /// Draining one slot releases exactly one write, then it gates again.
@@ -564,7 +697,9 @@ mod test {
         consumer.read_into(&mut dst).unwrap();
         assert_eq!(dst, [0, 0], "oldest block survives");
 
-        producer.write(&[99; 2]).expect("one slot freed buys one write");
+        producer
+            .write(&[99; 2])
+            .expect("one slot freed buys one write");
         assert_eq!(producer.ring.head_relaxed(), 4);
 
         assert_eq!(
@@ -607,7 +742,11 @@ mod test {
         for i in 0..12u8 {
             let before = producer.ring.head_relaxed();
             producer.write(&[i; 2]).unwrap();
-            assert_eq!(producer.ring.head_relaxed(), before + 1, "write {i} must land");
+            assert_eq!(
+                producer.ring.head_relaxed(),
+                before + 1,
+                "write {i} must land"
+            );
         }
         assert_eq!(producer.ring.head_relaxed(), 12, "three full laps");
         assert_eq!(
@@ -677,6 +816,174 @@ mod test {
         for w in got.windows(2) {
             assert_eq!(w[1], w[0] + 1, "surviving blocks are contiguous: {got:?}");
         }
+    }
+
+    // ── push ────────────────────────────────────────────────────────────────
+
+    /// A block becomes visible on the push that completes it, and not before —
+    /// a half-filled slot must stay invisible to consumers.
+    #[test]
+    fn test_push_publishes_only_on_the_last_element() {
+        let mut producer = RingProducer::<u8, 4, 4>::new(false);
+        let consumer = producer.subscribe();
+
+        let mut dst = [0u8; 4];
+        for (i, x) in [10u8, 11, 12].into_iter().enumerate() {
+            assert_eq!(producer.push(x), Ok(false), "element {i} does not publish");
+            assert_eq!(producer.ring.head_relaxed(), 0, "head pinned mid-block");
+            assert_eq!(producer.pending(), i + 1);
+            assert_eq!(
+                consumer.read_into(&mut dst),
+                Err(CustomError::SlowProducer),
+                "a partial block must not be readable"
+            );
+        }
+
+        assert_eq!(producer.push(13), Ok(true), "the Mth element publishes");
+        assert_eq!(producer.ring.head_relaxed(), 1);
+        assert_eq!(producer.pending(), 0, "fill resets for the next block");
+
+        consumer.read_into(&mut dst).unwrap();
+        assert_eq!(dst, [10, 11, 12, 13], "elements land in push order");
+    }
+
+    /// `push` is a drop-in for `write`: same blocks, same sequence, no staging
+    /// array and no whole-block copy.
+    #[test]
+    fn test_push_matches_write_across_laps() {
+        let mut pushed = RingProducer::<u8, 4, 4>::new(false);
+        let mut written = RingProducer::<u8, 4, 4>::new(false);
+        let (cp, cw) = (pushed.subscribe(), written.subscribe());
+
+        // Three laps of a 4-slot ring, so the slot index wraps repeatedly.
+        for b in 0..12u8 {
+            let block = [b * 4, b * 4 + 1, b * 4 + 2, b * 4 + 3];
+            for x in block {
+                pushed.push(x).unwrap();
+            }
+            written.write(&block).unwrap();
+
+            let (mut a, mut c) = ([0u8; 4], [0u8; 4]);
+            cp.read_into(&mut a).unwrap();
+            cw.read_into(&mut c).unwrap();
+            assert_eq!(a, c, "block {b}");
+            assert_eq!(a, block);
+        }
+        assert_eq!(pushed.ring.head_relaxed(), written.ring.head_relaxed());
+    }
+
+    /// Blocking mode gates `push` at the block boundary only. Once a slot is
+    /// committed to, the remaining elements always land — a block can never be
+    /// left half-written by the gate.
+    #[test]
+    fn test_push_blocking_gates_at_block_boundaries_only() {
+        let mut producer = RingProducer::<u8, 4, 4>::new(true);
+        let consumer = producer.subscribe();
+        producer.register_cursor_for_test(consumer.cursor());
+
+        // Fill the guard band: N-1 = 3 blocks of M = 4 elements.
+        for x in 0..12u8 {
+            producer.push(x).unwrap();
+        }
+        assert_eq!(producer.ring.head_relaxed(), 3, "at the guard band");
+
+        // The next block cannot start...
+        assert_eq!(producer.push(99), Err(CustomError::SlowConsumer));
+        assert_eq!(producer.pending(), 0, "a refused push opens no slot");
+
+        // ...until a consumer drains one.
+        let mut dst = [0u8; 4];
+        consumer.read_into(&mut dst).unwrap();
+        assert_eq!(dst, [0, 1, 2, 3]);
+
+        // Now the block starts, and mid-block pushes are never gated even
+        // though the consumer stops reading again.
+        assert_eq!(producer.push(90), Ok(false));
+        for x in [91u8, 92] {
+            assert_eq!(producer.push(x), Ok(false), "mid-block push must not gate");
+        }
+        assert_eq!(producer.push(93), Ok(true), "the block completes");
+        assert_eq!(producer.ring.head_relaxed(), 4);
+
+        for expected in [[4u8, 5, 6, 7], [8, 9, 10, 11], [90, 91, 92, 93]] {
+            consumer.read_into(&mut dst).unwrap();
+            assert_eq!(dst, expected);
+        }
+    }
+
+    /// Non-blocking `push` never refuses, exactly like `write`.
+    #[test]
+    fn test_push_non_blocking_never_refuses() {
+        let mut producer = RingProducer::<u8, 4, 2>::new(false);
+        let consumer = producer.subscribe();
+        producer.register_cursor_for_test(consumer.cursor());
+
+        // Five laps with a consumer that never reads.
+        for x in 0..40u8 {
+            assert!(producer.push(x).is_ok(), "push {x} must not be refused");
+        }
+        assert_eq!(producer.ring.head_relaxed(), 20);
+    }
+
+    /// The point of the API: a pushed block is not torn by a saturated producer
+    /// any more than a written one is, because holding a slot open does not
+    /// widen the window — `head` still advances in a single instant.
+    #[test]
+    fn test_push_does_not_tear_under_saturation() {
+        const N: usize = 8;
+        const M: usize = 256;
+        const BLOCKS: u32 = 20_000;
+
+        let mut producer = RingProducer::<u32, N, M>::new(false);
+        let consumer = producer.subscribe();
+        let cursor = consumer.cursor();
+
+        let reader = thread::spawn(move || {
+            let mut staging = [0u32; M];
+            let (mut torn, mut got) = (0u64, 0u64);
+            let mut idle = 0u32;
+            loop {
+                match consumer.read_into(&mut staging) {
+                    Ok(()) => {
+                        idle = 0;
+                        got += 1;
+                        let first = staging[0];
+                        if staging.iter().any(|&x| x != first) {
+                            torn += 1;
+                        }
+                    }
+                    Err(_) => {
+                        idle += 1;
+                        if idle > 2_000_000 {
+                            break;
+                        }
+                        std::hint::spin_loop();
+                    }
+                }
+            }
+            (got, torn)
+        });
+        producer.add_consumer(
+            thread::spawn(|| {
+                loop {
+                    thread::park()
+                }
+            }),
+            cursor,
+        );
+
+        // Each block is filled element-by-element with its own sequence number,
+        // so a tear shows up as elements that disagree.
+        for b in 0..BLOCKS {
+            for _ in 0..M {
+                producer.push(b).unwrap();
+            }
+        }
+
+        let (got, torn) = reader.join().unwrap();
+        assert!(got > 0, "consumer received nothing — harness is broken");
+        assert_eq!(torn, 0, "{torn} torn blocks out of {got} received");
+        println!("push saturation: {got} received of {BLOCKS} written, {torn} torn");
     }
 
     // ── read_into ───────────────────────────────────────────────────────────
@@ -752,7 +1059,11 @@ mod test {
             let _guard = consumer.read_guard().unwrap();
             assert_eq!(cursor.load(Ordering::Relaxed), 0, "held: cursor pinned");
         }
-        assert_eq!(cursor.load(Ordering::Relaxed), 1, "dropped: cursor released");
+        assert_eq!(
+            cursor.load(Ordering::Relaxed),
+            1,
+            "dropped: cursor released"
+        );
     }
 
     /// A held guard gates a blocking producer at the capacity edge, and
@@ -806,7 +1117,9 @@ mod test {
         let mut dst = [0u8; 2];
         consumer.read_into(&mut dst).unwrap();
         assert_eq!(dst, [0, 0]);
-        producer.write(&[42; 2]).expect("retry after a drain succeeds");
+        producer
+            .write(&[42; 2])
+            .expect("retry after a drain succeeds");
 
         // Nothing was corrupted by the refusal: 1, 2, then the retried 42.
         for expected in [1u8, 2, 42] {
@@ -825,7 +1138,11 @@ mod test {
         producer.register_cursor_for_test(consumer.cursor());
 
         // Consumer never reads; the producer laps it five times regardless.
-        assert_eq!(write_seq(&mut producer, 0..20), 0, "no write may be refused");
+        assert_eq!(
+            write_seq(&mut producer, 0..20),
+            0,
+            "no write may be refused"
+        );
         assert_eq!(producer.ring.head_relaxed(), 20);
     }
 
@@ -855,7 +1172,10 @@ mod test {
 
         // Producer laps the ring while the guard is held.
         write_seq(&mut producer, 10..14);
-        assert!(!guard.is_valid(), "guard must report that its slot was reused");
+        assert!(
+            !guard.is_valid(),
+            "guard must report that its slot was reused"
+        );
     }
 
     // ── Threaded ────────────────────────────────────────────────────────────
@@ -901,7 +1221,11 @@ mod test {
             (got, torn)
         });
         producer.add_consumer(
-            thread::spawn(|| loop { thread::park() }),
+            thread::spawn(|| {
+                loop {
+                    thread::park()
+                }
+            }),
             cursor,
         );
 
@@ -922,10 +1246,8 @@ mod test {
 
         let consumer = producer.subscribe();
         let cursor = consumer.cursor();
-        let handle = consumer.start_reading(
-            |buf: &[u8]| println!("Consumer receives: {buf:?}"),
-            Some(1),
-        );
+        let handle =
+            consumer.start_reading(|buf: &[u8]| println!("Consumer receives: {buf:?}"), Some(1));
         producer.add_consumer(handle, cursor);
 
         for i in 0..8u8 {

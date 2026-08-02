@@ -12,10 +12,18 @@ impl<T: Copy + Default, const N: usize> Buffer<T, N> {
 
     pub fn write(&mut self, src: &[T]) -> Result<(), CustomError> {
         if src.len() != N {
-            return Err(CustomError::MismatchInputLength)
+            return Err(CustomError::MismatchInputLength);
         };
         self.0.copy_from_slice(src);
-        Ok(()) 
+        Ok(())
+    }
+
+    /// Store a single element. Lets a producer that computes its data one
+    /// element at a time fill the buffer in place, instead of accumulating in a
+    /// staging array and paying a whole-buffer `copy_from_slice` afterwards.
+    pub fn set(&mut self, i: usize, x: T) -> Result<(), CustomError> {
+        *self.0.get_mut(i).ok_or(CustomError::InvalidIndex)? = x;
+        Ok(())
     }
 }
 

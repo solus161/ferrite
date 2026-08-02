@@ -7,5 +7,7 @@
 
 pub mod buffer;
 pub mod exceptions;
+pub mod fft;
+pub mod source;
 pub mod spmc;
 pub mod utils;

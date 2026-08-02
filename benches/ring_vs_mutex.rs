@@ -566,7 +566,13 @@ struct Summary {
 
 fn percentiles(lat: &mut Vec<u64>) -> Summary {
     if lat.is_empty() {
-        return Summary { mean: 0, p50: 0, p99: 0, p999: 0, max: 0 };
+        return Summary {
+            mean: 0,
+            p50: 0,
+            p99: 0,
+            p999: 0,
+            max: 0,
+        };
     }
     lat.sort_unstable();
     let at = |q: f64| lat[((lat.len() - 1) as f64 * q) as usize];
@@ -596,8 +602,7 @@ fn header(scenario: &str, note: &str) {
     }
     println!(
         "{:<26} {:>7} {:>7} {:>8} {:>9} {:>9} {:>10} {:>9} {:>9} {:>7} {:>6}",
-        "impl", "mean", "p50", "p99", "p99.9", "max", "blocks/s", "written", "recv",
-        "lost", "torn"
+        "impl", "mean", "p50", "p99", "p99.9", "max", "blocks/s", "written", "recv", "lost", "torn"
     );
 }
 
@@ -700,7 +705,13 @@ fn s1_uncontended(iters: usize) {
         }
         let elapsed = start.elapsed();
 
-        row(imp.name(), &percentiles(&mut lat), written, &counters, elapsed);
+        row(
+            imp.name(),
+            &percentiles(&mut lat),
+            written,
+            &counters,
+            elapsed,
+        );
     }
 }
 
@@ -776,9 +787,15 @@ fn main() {
         Impl::Mpsc,
     ];
 
-    println!("ring_vs_mutex — BLOCK={BLOCK} f32 ({} KB/op), SLOTS={SLOTS}", BLOCK * 4 / 1024);
+    println!(
+        "ring_vs_mutex — BLOCK={BLOCK} f32 ({} KB/op), SLOTS={SLOTS}",
+        BLOCK * 4 / 1024
+    );
     println!("latencies in ns, measured on the producer side only");
-    println!("timer overhead (Instant::now x2 floor): {} ns", timer_overhead());
+    println!(
+        "timer overhead (Instant::now x2 floor): {} ns",
+        timer_overhead()
+    );
     println!(
         "consumer also pays a {}-element uniformity scan per block for tear detection",
         BLOCK
@@ -826,7 +843,11 @@ fn main() {
         &all,
         20_000,
         Some(Duration::from_micros(200)),
-        Some(Stall { every: 8, min_us: 1_000, max_us: 20_000 }),
+        Some(Stall {
+            every: 8,
+            min_us: 1_000,
+            max_us: 20_000,
+        }),
         1,
     );
 
@@ -841,8 +862,7 @@ fn main() {
             } else {
                 ""
             },
-            &all
-                .iter()
+            &all.iter()
                 .copied()
                 .filter(|i| i.supports_multi_consumer())
                 .collect::<Vec<_>>(),
