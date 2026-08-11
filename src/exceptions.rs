@@ -6,6 +6,7 @@ pub enum CustomError {
     SlowConsumer, // lapped repeatedly; gave up after RETRIES attempts
     Speaker,
     Internal,
+    IQStreamNotEven,
 }
 
 impl From<Box<dyn std::error::Error>> for CustomError {

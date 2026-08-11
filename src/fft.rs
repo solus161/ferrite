@@ -10,15 +10,17 @@ use core::ops::{Add, Mul};
 /// N by N DFT matrix: because the matrix entry at (i, j) is only ever
 /// `cis(-2*pi*((i*j) % N)/N)`, the matrix holds just N distinct values.
 pub struct Fft<const N: usize> {
-    samples: [f32; N],
+    samples: [ComplexF32; N],
     offset: usize,
     twiddles: [ComplexF32; N],
-    pub output: [f32; N],
+    output: [f32; N],
+    freq: [f32; N],
+    indexes_rev: [usize; N],
 }
 
 impl<const N: usize> Fft<N> {
     pub fn new() -> Self {
-        let samples = array::from_fn(|_| 0f32);
+        let samples = array::from_fn(|_| ComplexF32::default());
 
         // Borrow this from Reducible's video at https://www.youtube.com/watch?v=h7apO7q16V0
         // Fill the twiddle factors, we only need N angle within full circle 2*pi
@@ -29,26 +31,47 @@ impl<const N: usize> Fft<N> {
         });
 
         let output = array::from_fn(|_| 0f32);
+        let freq = array::from_fn(|_| 0f32);
+
+        // Bit-reversed
+        let mut indexes_rev: [usize; N] = array::from_fn(|i| i);
+        indexes_rev
+            .iter_mut()
+            .for_each(|x| *x = x.reverse_bits() >> usize::BITS - N.trailing_zeros());
 
         Self {
             samples,
             offset: 0,
             twiddles,
             output,
+            freq,
+            indexes_rev,
         }
     }
 
-    /// Continuously copy array to fill samples
-    /// return coeffs array when samples filled
-    pub fn push(&mut self, src: &[f32]) -> Option<&[f32]> {
-        let src_len = src.len();
-        let max_index = N.min(self.offset + src_len);
-        for i in self.offset..max_index {
-            self.samples[i] = src[i - self.offset]
+    /// Continuously copy array to fill samples, return coeffs array when samples filled
+    /// `iq` is stream of IQ u8
+    /// `iq` length must be even and all `iq` must make up the the samples size,
+    /// Consumers may still work, but you'll lose data
+    pub fn push(&mut self, iq: &[u8]) -> Option<&[f32]> {
+        // let src_len = src.len();
+        // let max_index = N.min(self.offset + src_len/2);
+        // for i in self.offset..max_index {
+        //     if i*2 + 1 > src_len { /* TODO: silenced error here */};
+        //     let i_idx = (i - self.offset)*2;
+        //     let q_idx = i_idx+1;
+        //     self.samples[i] = ComplexF32 { real: src[i_idx] as f32, img: src[q_idx] as f32 };
+        // }
+        for pair in iq.chunks_exact(2) {
+            self.samples[self.offset] = ComplexF32 { 
+                real: (pair[0] as f32 - 127.5)*(1.0/127.5),
+                img: (pair[1] as f32 - 127.5)*(1.0/127.5)
+            };
+            self.offset += 1;
         }
-        self.offset = max_index;
-        if self.offset >= N {
+        if self.offset == N {
             self.dft_fwd();
+            self.post_process();
             self.offset = 0;
             Some(&self.output)
         } else {
@@ -82,36 +105,15 @@ impl<const N: usize> Fft<N> {
     ///  First step: bit-reversed to get the deepest level
     ///  https://brianmcfee.net/dstbook-site/content/ch08-fft/FFT.html
     pub fn dft_fwd(&mut self) {
-        // self.output.iter_mut().enumerate()
-        //     .for_each(|(i, o)| {
-        //         let p = self.samples.iter().enumerate().fold(ComplexF32::default(), |acc, (j, p)| {
-        //             let t = self.twiddles[(i*j)%N];
-        //             acc + ComplexF32::new(t.real*p, t.img*p)
-        //         });
-        //         *o = p.norm();
-        //     });
-        let mut indexes: [usize; N] = array::from_fn(|i| i);
+        // Keep sample intact 
+        // We need 2 bufs for this step
+        // - one for reversed samples
+        // - another for calculation, as inplace modification will break the calculation
+        let mut buf_a: [ComplexF32; N] = array::from_fn(|i| self.samples[self.indexes_rev[i]]);
+        let mut buf_b: [ComplexF32; N] = array::from_fn(|_| ComplexF32::default());
 
-        // Bit-reversed
-        indexes
-            .iter_mut()
-            .for_each(|x| *x = x.reverse_bits() >> usize::BITS - N.trailing_zeros());
-
-        // Also reorder sample
-        let mut output_cpx: [ComplexF32; N] = array::from_fn(|i| {
-            let i = indexes[i];
-            ComplexF32 {
-                real: self.samples[i],
-                img: 0.0,
-            }
-        });
-
-        // A stage reads every slot of the previous stage, so it cannot write in
-        // place: slot e_id is both the source of E[0] and the destination of
-        // X[0], and X[n/2] still needs E[0] long after X[0] overwrote it.
-        // Writing into scratch keeps the two roles in separate arrays, the way
-        // the recursion gets a fresh output array at every level for free.
-        let mut scratch: [ComplexF32; N] = array::from_fn(|_| ComplexF32::default());
+        // This is for swapping two bufs when done
+        let (mut src, mut dst) = (&mut buf_a, &mut buf_b);
 
         // Size of a sequence of both even and odd: 2, 4, 8, 16, 32, 64, 128, etc
         let mut n = 2usize;
@@ -127,22 +129,45 @@ impl<const N: usize> Fft<N> {
 
                     // The even sequence starts at e_id
                     // The odd sequence starts at e_id + n/2
-                    scratch[e_id + i] =
-                        output_cpx[e_id + i_alias] + tw * output_cpx[e_id + n / 2 + i_alias];
+                    dst[e_id + i] = src[e_id + i_alias] + tw * src[e_id + n / 2 + i_alias];
                 }
                 // Move up sequence id
                 e_id += n;
-            }
-            // This stage's results become the next stage's E and O
-            output_cpx = scratch;
-            n *= 2;
-        }
+            };
 
-        // Extract to output
+            core::mem::swap(&mut src, &mut dst);
+            n *= 2;
+        };
+        
         self.output
             .iter_mut()
-            .zip(output_cpx)
+            .zip(src.iter())
             .for_each(|(o, c)| *o = c.norm());
+    }
+
+    /// Convert output to db
+    /// Rotate the spectrum, sample rate 2.048MHz
+    /// k =  0           1       2          N/2          N/2+1          N-1
+    /// From 0Hz         1,000Hz 2,000Hz .. 1,024,000Hz -1,203,00Hz .. -1,000Hz
+    /// To   -1,024,00Hz ..                 0Hz                         1,023,000Hz
+    ///
+    /// Then convert to decibel
+    pub fn post_process(&mut self) {
+        self.output.rotate_left(N/2);
+
+        let scale = 1.0/(N as f32);
+        self.output.iter_mut().for_each(|o| {
+            *o = 20.0 * (*o*scale + 1e-12).log10();
+        });
+    }
+
+    /// Update freq to match with center freq
+    fn abs_freq(&mut self, center_freq: f32, sample_rate: f32) {
+        self.freq.iter_mut().enumerate().for_each(|(i, f)| {
+            let offset = i as f32 - (N/2) as f32;
+            let freq = offset*(sample_rate/N as f32);
+            *f = center_freq + freq
+        });
     }
 }
 
@@ -188,51 +213,62 @@ impl Mul for ComplexF32 {
     }
 }
 
+
 /// Testing the FFT
+///
+/// Everything here speaks the post-`push` contract: raw interleaved u8 IQ in,
+/// a spectrum that is already fftshift'd and in dBFS out. Index `N / 2` is DC.
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const N: usize = 2048;
 
-    /// Sample rate equal to N makes the window exactly 1 second, so bin index == Hz
-    /// (resolution is SAMPLE_RATE / N = 1 Hz). Nyquist is 1024 Hz.
-    const SAMPLE_RATE: f32 = N as f32;
+    /// Shifted index of a tone `bins` away from centre. Negative is to the
+    /// left of DC — a distinction that only exists because the input is
+    /// complex; real samples fold the two sides onto each other.
+    fn shifted(bins: i32) -> usize {
+        (N as i32 / 2 + bins) as usize
+    }
 
-    /// A real tone of amplitude 1 splits into a mirrored pair, each of magnitude N/2.
-    const PEAK: f32 = N as f32 / 2.0;
-
-    /// Fill `dst` with a unit-amplitude sine at `freq_hz`, continuing the waveform from
-    /// absolute sample index `start` so chunk boundaries stay phase-continuous.
-    fn fill_sine(dst: &mut [f32], freq_hz: f32, start: usize) {
-        for (i, s) in dst.iter_mut().enumerate() {
-            let t = (start + i) as f32 / SAMPLE_RATE;
-            *s = (2.0 * core::f32::consts::PI * freq_hz * t).sin();
+    /// Fill `dst` with interleaved u8 IQ for a complex exponential of amplitude
+    /// `amp` sitting exactly `bins` bins from centre.
+    ///
+    /// `start` is the absolute sample index, so chunked pushes stay phase
+    /// continuous. The quantisation is the exact inverse of `push`'s decode, so
+    /// a round trip recovers `amp` to within one 1/127.5 step.
+    fn fill_tone(dst: &mut [u8], bins: f32, amp: f32, start: usize) {
+        for (n, pair) in dst.chunks_exact_mut(2).enumerate() {
+            let theta = 2.0 * core::f32::consts::PI * bins * (start + n) as f32 / N as f32;
+            let q = |x: f32| (x * amp * 127.5 + 127.5).round().clamp(0.0, 255.0) as u8;
+            pair[0] = q(theta.cos());
+            pair[1] = q(theta.sin());
         }
     }
 
-    /// Bin of the largest coefficient below Nyquist.
-    fn peak_bin(coeffs: &[f32]) -> usize {
-        coeffs[..coeffs.len() / 2]
+    /// Feed exactly one window in `chunk`-byte pushes and return the spectrum.
+    fn analyse(bins: f32, amp: f32, chunk: usize) -> Vec<f32> {
+        let mut fft = Fft::<N>::new();
+        let mut buf = vec![0u8; chunk];
+        let pairs = chunk / 2;
+
+        let mut fired = None;
+        for c in 0..(N / pairs) {
+            fill_tone(&mut buf, bins, amp, c * pairs);
+            if let Some(spectrum) = fft.push(&buf) {
+                fired = Some(spectrum.to_vec());
+            }
+        }
+        fired.expect("N/pairs pushes should fill the window exactly once")
+    }
+
+    fn peak_bin(spectrum: &[f32]) -> usize {
+        spectrum
             .iter()
             .enumerate()
             .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
             .map(|(bin, _)| bin)
             .unwrap()
-    }
-
-    /// Feed a tone through the window in `chunk`-sized pushes and return the one spectrum.
-    fn analyse(freq_hz: f32, chunk: usize) -> Vec<f32> {
-        let mut fft = Fft::<N>::new();
-        let mut buf = vec![0f32; chunk];
-        let mut fired = None;
-        for c in 0..(N / chunk) {
-            fill_sine(&mut buf, freq_hz, c * chunk);
-            if let Some(coeffs) = fft.push(&buf) {
-                fired = Some(coeffs.to_vec());
-            }
-        }
-        fired.expect("N/chunk pushes should fill the window exactly once")
     }
 
     #[test]
@@ -241,7 +277,6 @@ mod tests {
         indexes
             .iter_mut()
             .for_each(|i| *i = i.reverse_bits() >> 8 * 7 + 4);
-        println!("Bit-reversed: {:?}", &indexes);
         assert_eq!(
             indexes,
             [0, 8, 4, 12, 2, 10, 6, 14, 1, 9, 5, 13, 3, 11, 7, 15]
@@ -249,65 +284,74 @@ mod tests {
     }
 
     #[test]
-    fn tone_512hz_in_512_sample_chunks() {
-        let coeffs = analyse(512.0, 512);
-        assert_eq!(peak_bin(&coeffs), 512);
-        assert!(
-            (coeffs[512] - PEAK).abs() < 1.0,
-            "bin 512 = {}",
-            coeffs[512]
-        );
-        assert!(
-            (coeffs[N - 512] - PEAK).abs() < 1.0,
-            "mirror = {}",
-            coeffs[N - 512]
-        );
+    fn positive_and_negative_tones_land_on_opposite_sides() {
+        // The whole payoff of complex input. Fed real samples these two tones
+        // are the same bin and no cursor, scale or shift could separate them.
+        assert_eq!(peak_bin(&analyse(256.0, 1.0, 4096)), shifted(256));
+        assert_eq!(peak_bin(&analyse(-256.0, 1.0, 4096)), shifted(-256));
     }
 
     #[test]
-    fn tone_768hz_in_1024_sample_chunks() {
-        let coeffs = analyse(768.0, 1024);
-        assert_eq!(peak_bin(&coeffs), 768);
-        assert!(
-            (coeffs[768] - PEAK).abs() < 1.0,
-            "bin 768 = {}",
-            coeffs[768]
-        );
+    fn full_scale_tone_reads_zero_dbfs() {
+        // A complex exponential puts all of its energy in one bin at |X| = A*N,
+        // so the 1/N scale in post_process reads back A directly. No factor of
+        // two: there is no conjugate twin to fold in.
+        let peak = analyse(256.0, 1.0, 4096)[shifted(256)];
+        assert!(peak.abs() < 0.5, "expected ~0 dBFS, got {peak}");
+    }
+
+    #[test]
+    fn half_scale_tone_reads_minus_six_db() {
+        // 20*log10(0.5) = -6.02. Proves 1/N is a real amplitude normalisation
+        // and not a constant that merely happens to look right at full scale.
+        let peak = analyse(256.0, 0.5, 4096)[shifted(256)];
+        assert!((peak + 6.02).abs() < 0.5, "expected ~-6 dBFS, got {peak}");
     }
 
     #[test]
     fn energy_is_confined_to_the_tone() {
-        let coeffs = analyse(512.0, 512);
-        for (bin, &m) in coeffs.iter().enumerate() {
-            if bin == 512 || bin == N - 512 {
+        // A bin-centred exponential is analytically zero in every other bin
+        // under a rectangular window, so what remains is 8-bit quantisation
+        // noise spread over N bins — around -83 dBFS. -40 leaves wide margin
+        // while still catching a broken twiddle or a botched butterfly.
+        let spectrum = analyse(256.0, 1.0, 4096);
+        let peak = shifted(256);
+        for (bin, &db) in spectrum.iter().enumerate() {
+            if bin == peak {
                 continue;
             }
-            assert!(m < 1.0, "bin {bin} should be silent, got {m}");
+            assert!(db < -40.0, "bin {bin} should be noise floor, got {db}");
         }
+    }
+
+    #[test]
+    fn nyquist_tone_is_the_leftmost_column() {
+        // exp(i*pi*n) = (-1)^n lands wholly in bin N/2, which the rotate sends
+        // to index 0 — the negative Nyquist edge. That bin is its own mirror,
+        // so unlike every other tone it has no partner to share energy with.
+        assert_eq!(peak_bin(&analyse(N as f32 / 2.0, 1.0, 4096)), 0);
+    }
+
+    #[test]
+    fn chunked_pushes_reassemble_one_window() {
+        // 4 x 512 pairs must agree with a single 2048-pair push: `offset` has
+        // to carry the fill position across calls without dropping a sample.
+        let whole = analyse(256.0, 1.0, 4096);
+        let split = analyse(256.0, 1.0, 1024);
+        assert_eq!(peak_bin(&whole), peak_bin(&split));
+        assert!((whole[shifted(256)] - split[shifted(256)]).abs() < 0.1);
     }
 
     #[test]
     fn window_only_fires_when_full() {
         let mut fft = Fft::<N>::new();
-        let buf = [0f32; 512];
+        let buf = [127u8; 1024]; // 512 IQ pairs at mid-scale
         assert!(fft.push(&buf).is_none());
         assert!(fft.push(&buf).is_none());
         assert!(fft.push(&buf).is_none());
         assert!(
             fft.push(&buf).is_some(),
-            "4 x 512 should complete the 2048 window"
-        );
-    }
-
-    #[test]
-    fn nyquist_sine_is_silent() {
-        // sin(2*pi*1024*j/2048) == sin(pi*j) == 0 for every integer sample, so a sine
-        // exactly at Nyquist carries no energy at all. Documented here because the
-        // obvious "test a 1024 Hz tone" analyses silence and passes for the wrong reason.
-        let coeffs = analyse(1024.0, 1024);
-        assert!(
-            coeffs.iter().all(|&m| m < 1.0),
-            "sin at Nyquist is all zeros"
+            "4 x 512 pairs should complete the 2048 window"
         );
     }
 }

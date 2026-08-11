@@ -352,6 +352,21 @@ impl<T: Copy + Default, const N: usize, const M: usize> RingConsumer<T, N, M> {
         self.head.clone()
     }
 
+    /// Jump to the newest published block, abandoning the backlog.
+    ///
+    /// For consumers that want freshness over completeness — a waterfall, a
+    /// signal meter — where [`claim`](Self::claim)'s mid-ring resync is backlog
+    /// they will never work through. A UI reading one block per frame while the
+    /// producer publishes ten is lapped every frame regardless; this makes the
+    /// block it does read the freshest one rather than one `N / 2` slots old.
+    ///
+    /// Wrong for anything that must not skip: on a bounded ring this discards
+    /// exactly the cushion the ring exists to provide.
+    pub fn seek_latest(&self) {
+        self.head
+            .store(self.ring.head().saturating_sub(1), Ordering::Release);
+    }
+
     /// Pick a sequence to read, resyncing first if the producer has lapped us.
     ///
     /// This is the **pre-check** half of the protocol: on return, `head - seq`
