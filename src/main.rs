@@ -1,10 +1,15 @@
+use std::sync::mpsc::channel;
+
 mod speaker;
-mod tui;
 
-use rust_radio::{exceptions::CustomError, source::Source, spmc::RingProducer};
+use rust_radio::{
+    exceptions::CustomError,
+    source::Source,
+    spmc::RingProducer,
+    tui::{control_signal::CtrlSignal, tui::Tui, app_states::AppStates},
+};
 
-use crate::{speaker::Speaker};
-use tui::tui::Tui;
+use crate::speaker::Speaker;
 
 /// Ring geometry: RING_SLOTS buffers of RING_BLOCK f32 audio samples each.
 /// RING_BLOCK is also the staging size in the DSP callback — `Buffer::write`
@@ -23,7 +28,6 @@ const IQ_SLOTS: usize = 16;
 const IQ_BLOCK: usize = 16384;
 
 const FFT_N: usize = 2048;
-const CENTER_HZ: u32 = 91_000_000;
 
 fn main() -> Result<(), CustomError> {
     // ── Device discovery ────────────────────────────────────────────────────
@@ -48,17 +52,37 @@ fn main() -> Result<(), CustomError> {
     // A consumer for tui
     let consumer_iq = producer_iq.subscribe();
 
+    // For controller
+    let (ctrl_tx, ctrl_rx) = channel::<CtrlSignal>();
+
     // Speaker
-    let speaker = Speaker::new(consumer_sp);
+    let speaker = Speaker::new::<RING_SLOTS, RING_BLOCK>(consumer_sp);
     let rtl_rate = speaker.rtl_rate;
     speaker.play()?;
 
-    let source = Source::new(rtl_rate, CENTER_HZ);
-    let source_handle = source.start_receive(producer_sp, producer_iq)?;
+    // States of app
+    let app_states = AppStates::new( 
+        rtl_rate,
+        500_000,
+        91_000_000,
+        40,
+        300_000,
+        0);
 
-    let tui = Tui::<IQ_SLOTS, IQ_BLOCK, FFT_N>::new(consumer_iq, CENTER_HZ as f32, rtl_rate as f32);
+    let source = Source::new(
+        app_states.sample_rate.get(), 
+        app_states.center_freq.get(), 
+        app_states.bandwidth.get(),
+        ctrl_rx);
+    let (source_handle, ctrl_handle) = source.start_receive(producer_sp, producer_iq)?;
+
+    let tui = Tui::<IQ_SLOTS, IQ_BLOCK, FFT_N>::new(
+        app_states,
+        consumer_iq, 
+        ctrl_tx);
     let _ = tui.run();
 
     let _ = source_handle.join();
+    let _ = ctrl_handle.join();
     Ok(())
 }

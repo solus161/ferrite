@@ -1,8 +1,10 @@
 use std::{sync::Arc, thread::{self, JoinHandle}};
+use std::sync::mpsc::{channel, Receiver};
 
 use rtlsdr_mt::{Controller, Reader};
 
 use crate::{exceptions::CustomError, spmc::RingProducer};
+use crate::tui::control_signal::CtrlSignal;
 
 /// RTL sample rate = audio sample rate × this. 50 keeps both 48k and 44.1k in
 /// the RTL's valid range (2.4 MS/s and 2.205 MS/s). Also the boxcar decimation
@@ -34,24 +36,66 @@ const IQ_SLOTS: usize = 16;
 const IQ_BLOCK: usize = 16384;
 
 pub struct Source {
-    ctl: Controller,
+    /// rtl lib
+    // ctl: Controller,
     reader: Reader,
+
+    /// Handle for control signal threat
+    ctrl_handle: JoinHandle<()>,
+
+    sample_rate: u32,
 }
 
 impl Source {
-    pub fn new(sample_rate: u32, center_freq: u32) -> Self {
+    pub fn new(sample_rate: u32, center_freq: u32, bandwidth: u32, ctrl_rx: Receiver<CtrlSignal>) -> Self {
         // ── SDR setup (librtlsdr via rtlsdr_mt) ─────────────────────────────────
-        let (mut ctl, reader) = rtlsdr_mt::open(0).expect("rtlsdr: failed to open device 0");
+        let (mut ctl, reader) = rtlsdr_mt::open(0)
+            .expect(&CustomError::RtlOpenDevice(0).to_string());
         ctl.set_center_freq(center_freq)
-            .expect("rtlsdr: set_center_freq failed");
-        // This is for listening mode only
-        ctl.set_bandwidth(300_000).expect("rtlsdr: set_bandwidth failed");
-        ctl.set_sample_rate(sample_rate)
-            .expect("rtlsdr: set_sample_rate failed");
-        ctl.enable_agc().expect("rtlsdr: enable_agc failed"); // FC0013: auto gain for first sound
-        ctl.reset_buffer().expect("rtlsdr: reset_buffer failed"); // flush stale USB buffers before streaming
+            .expect(&CustomError::RtlSetFreq(center_freq).to_string());
 
-        Self { ctl, reader }
+        // This is for listening mode only
+        ctl.set_bandwidth(bandwidth)
+            .expect(&CustomError::RtlSetBandwidth(bandwidth).to_string());
+        ctl.set_sample_rate(sample_rate)
+            .expect(&CustomError::RtlSetSampleRate(sample_rate).to_string());
+        // FC0013: auto gain for first sound
+        ctl.enable_agc().expect(&CustomError::RtlEnableAgc.to_string());
+        
+        // Flush stale USB buffers before streaming
+        ctl.reset_buffer().expect(&CustomError::RtlResetBuffer.to_string());
+
+        let sample_rate = ctl.sample_rate();
+        
+        // Start a thread to receive control signal
+        // better than checking within read_async 
+        let ctrl_handle = thread::spawn(move || {
+            while let Ok(sig) = ctrl_rx.recv() {
+                // TODO: handle error, should not expect()
+                match sig {
+                    CtrlSignal::CenterHz(freq) => {
+                        ctl.set_center_freq(freq).expect(&CustomError::RtlSetFreq(freq).to_string());
+                        // ctl.reset_buffer().expect(&CustomError::RtlResetBuffer.to_string());
+                    },
+                    CtrlSignal::Bandwidth(bw) => ctl.set_bandwidth(bw)
+                        .expect(&CustomError::RtlSetBandwidth(bw).to_string()),
+                    // librtlsdr takes tenths of a dB, and only the discrete
+                    // values `tuner_gains()` reports are legal — it snaps to the
+                    // nearest rather than failing. Also silently disables AGC.
+                    CtrlSignal::Gain(db) => ctl.set_tuner_gain(db as i32 * 10)
+                        .expect(&CustomError::RtlSetGain(db).to_string()),
+                    CtrlSignal::Ppm(ppm) => ctl.set_ppm(ppm as i32)
+                        .expect(&CustomError::RtlSetPpm(ppm).to_string()),
+                    CtrlSignal::Quit => {
+                        ctl.cancel_async_read();
+                        break
+                    },
+                }
+            }
+        });
+       
+        Self { reader, ctrl_handle, sample_rate }
+
     }
 
     /// Start receiving from USB, send the self to another thread
@@ -60,7 +104,7 @@ impl Source {
         mut self,
         mut producer_sp: RingProducer<f32, RING_SLOTS, RING_BLOCK>,
         mut producer_iq: RingProducer<u8, IQ_SLOTS, IQ_BLOCK>,
-    ) -> Result<JoinHandle<()>, CustomError> {
+    ) -> Result<(JoinHandle<()>, JoinHandle<()>), CustomError> {
         // ── DSP: runs inside librtlsdr's async read callback ────────────────────
         // read_async blocks this (main) thread and invokes the closure per USB
         // buffer, on this same thread. cpal's callback runs on its own thread, so
@@ -76,7 +120,7 @@ impl Source {
         // Ask the device for its rate rather than trusting the requested one:
         // librtlsdr snaps to what the 28.8 MHz crystal can actually divide down
         // to, so the two are close but not equal.
-        let iq_rate = self.ctl.sample_rate() as f32 / IQ_DECIM as f32;
+        let iq_rate = self.sample_rate as f32 / IQ_DECIM as f32;
 
         // Phase step at full deviation, at the rate the discriminator now runs.
         // 2π·75k/240k = 1.96 rad — still under π, but that shrinking headroom is
@@ -168,6 +212,6 @@ impl Source {
                 .expect("rtlsdr: read_async failed");
             });
 
-        Ok(handle)
+        Ok((handle, self.ctrl_handle))
     }
 }

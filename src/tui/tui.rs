@@ -2,50 +2,61 @@ use std::io;
 use std::rc::Rc;
 use std::cell::Cell;
 use std::time::{Duration, Instant};
+use std::sync::mpsc::Sender;
 
 use ratatui::crossterm::event::{self, Event, KeyCode};
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::text::Line;
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::widgets::Block;
 use ratatui::{DefaultTerminal, Frame};
 
-use rust_radio::fft::Fft;
-use rust_radio::spmc::RingConsumer;
+use crate::spmc::RingConsumer;
+use crate::tui::stats_view::StatsView;
+use crate::tui::{fft::Fft, control_signal::CtrlSignal};
 
-use super::signal_view::SignalView;
+use super::{app_states::AppStates, signal_view::SignalView};
 
 /// 30 fps is good enough
 const FRAME: Duration = Duration::from_millis(33);
 
 pub struct Tui<const SLOTS: usize, const BLOCK: usize, const N: usize> {
+    states: AppStates,
     consumer: RingConsumer<u8, SLOTS, BLOCK>,
     fft: Fft<N>,
+
+    // Views/panel
     signal_view: SignalView,
+    stats_view: StatsView,
 
     // IQ stream buffer
     block: [u8; BLOCK],
 
-    center_hz: Rc<Cell<f32>>,
-    sample_rate: Rc<Cell<f32>>,
+    /// Sender of CtrlSignal
+    ctrl_tx: Sender<CtrlSignal>,
 }
 
 impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N> {
     pub fn new(
+        app_states: AppStates,
         consumer: RingConsumer<u8, SLOTS, BLOCK>,
-        center_hz: f32,
-        sample_rate: f32,
+        ctrl_tx: Sender<CtrlSignal>,
     ) -> Self {
         // Block size must be x*window size
         const { assert!(BLOCK % (2*N) == 0)};
 
-        let center_hz = Rc::new(Cell::new(center_hz));
-        let sample_rate = Rc::new(Cell::new(sample_rate));
+        let center_freq = app_states.center_freq.clone();
+        let sample_rate = app_states.sample_rate.clone();
+        let step = app_states.step.clone();
+        let gain_db = app_states.gain_db.clone();
+        let bw = app_states.bandwidth.clone();
+        let ppm = app_states.ppm.clone();
 
         Self { 
+            states: app_states,
             consumer, fft: Fft::new(),
-            signal_view: SignalView::new(N, 256, center_hz.clone(), sample_rate.clone()),
+            signal_view: SignalView::new(N, 256, center_freq.clone(), sample_rate),
+            stats_view: StatsView::new(center_freq, step, gain_db, bw, ppm),
             block: [0u8; BLOCK],
-            center_hz, sample_rate
+            ctrl_tx,
         }
     }
 
@@ -69,9 +80,26 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
                 };
                 if let Event::Key(k) = event::read()? {
                     match k.code {
-                        KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
-                        KeyCode::Up => self.signal_view.floor_db += 2.0,
-                        KeyCode::Down => self.signal_view.floor_db -= 2.0,
+                        KeyCode::Char('q') | KeyCode::Esc => {
+                            if let Ok(()) = self.ctrl_tx.send(CtrlSignal::Quit) {
+                                return Ok(())
+                            };
+                        },
+                        KeyCode::Up => self.stats_view.select(-1),
+                        KeyCode::Down => self.stats_view.select(1),
+                        KeyCode::Left | KeyCode::Right => {
+                            let dir = if k.code == KeyCode::Right { 1 } else { -1 };
+                            // `None` means the field never leaves the UI (Step)
+                            // — it has already written itself into the shared
+                            // cell either way.
+                            if let Some(sig) = self.stats_view.adjust(dir) {
+                                let _ = self.ctrl_tx.send(sig);
+                            }
+                        }
+                        // Display floor, moved off the arrows now that those
+                        // drive the tuner fields.
+                        KeyCode::Char(']') => self.signal_view.floor_db += 2.0,
+                        KeyCode::Char('[') => self.signal_view.floor_db -= 2.0,
                         _ => {}
                     }
                 }
@@ -118,17 +146,6 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
     fn render_signal_view(&self, frame: &mut Frame, r: Rect) {
         let block = Block::bordered().title("Spectrogram");
         frame.render_widget(block, r);
-
-        // post_process rotates DC to the middle, so the display spans
-        // center ± sample_rate/2. Three labels aligned to thirds rather than
-        // evenly spaced ticks: no manual padding, and they cannot collide.
-        // let half = self.sample_rate / 2.0;
-        // let mhz = |hz: f32| format!("{:.3} MHz", hz / 1e6);
-        // let cols = Layout::horizontal([Constraint::Ratio(1, 3); 3]).split(r);
-        //
-        // frame.render_widget(Line::from(mhz(self.center_hz - half)).left_aligned(), cols[0]);
-        // frame.render_widget(Line::from(mhz(self.center_hz)).centered(), cols[1]);
-        // frame.render_widget(Line::from(mhz(self.center_hz + half)).right_aligned(), cols[2]);
     }
 
     /// Waterfall filling the frame, with a one-row frequency axis beneath it.
@@ -140,22 +157,8 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
         ]).areas(frame.area());
 
         // Stats
-        let block_stats = Block::bordered().title("Stats");
-        frame.render_widget(block_stats, area_stats);
-
+        frame.render_widget(&self.stats_view, area_stats);
         frame.render_widget(&self.signal_view, area_view);
-        // self.render_signal_view(frame, main);
-
-        // post_process rotates DC to the middle, so the display spans
-        // center ± sample_rate/2. Three labels aligned to thirds rather than
-        // evenly spaced ticks: no manual padding, and they cannot collide.
-        // let half = self.sample_rate / 2.0;
-        // let mhz = |hz: f32| format!("{:.3} MHz", hz / 1e6);
-        // let cols = Layout::horizontal([Constraint::Ratio(1, 3); 3]).split(axis);
-        //
-        // frame.render_widget(Line::from(mhz(self.center_hz - half)).left_aligned(), cols[0]);
-        // frame.render_widget(Line::from(mhz(self.center_hz)).centered(), cols[1]);
-        // frame.render_widget(Line::from(mhz(self.center_hz + half)).right_aligned(), cols[2]);
     }
 }
 

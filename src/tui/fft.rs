@@ -16,6 +16,11 @@ pub struct Fft<const N: usize> {
     output: [f32; N],
     freq: [f32; N],
     indexes_rev: [usize; N],
+    /// Real-valued: a window scales magnitude without rotating phase, so
+    /// storing it as `ComplexF32` would pay a full complex product (4 mul,
+    /// 2 add) per sample to multiply by a zero imaginary part.
+    hann_window: [f32; N],
+    window_sum: f32,        // depends on type of window
 }
 
 impl<const N: usize> Fft<N> {
@@ -39,6 +44,24 @@ impl<const N: usize> Fft<N> {
             .iter_mut()
             .for_each(|x| *x = x.reverse_bits() >> usize::BITS - N.trailing_zeros());
 
+        // Precomputed Hann window
+        // https://www.mathworks.com/help/signal/ref/hann.html
+        //
+        // Periodic (DFT-even) form: the denominator is N, and k stops at N-1.
+        // MATLAB's `hann(L)` is the *symmetric* window — denominator L-1, L
+        // points — which is right for filter design and wrong here: it repeats
+        // its endpoint in the DFT's implied periodic extension and leaves a
+        // residue in every bin. `hann(L,'periodic')` is this one.
+        let hann_window: [f32; N] = array::from_fn(|k| {
+            0.5*(1.0 - (2.0*core::f32::consts::PI*k as f32 / N as f32).cos())
+        });
+
+        // Coherent gain. Normalising by this instead of N is what keeps an
+        // on-bin full-scale tone reading 0 dBFS — a window that averages 0.5
+        // would otherwise cost a flat 6 dB. Summed rather than hardcoded to
+        // 2/N so swapping in Hamming or Blackman-Harris needs no other change.
+        let window_sum: f32 = hann_window.iter().sum();
+
         Self {
             samples,
             offset: 0,
@@ -46,6 +69,8 @@ impl<const N: usize> Fft<N> {
             output,
             freq,
             indexes_rev,
+            hann_window,
+            window_sum,
         }
     }
 
@@ -109,7 +134,8 @@ impl<const N: usize> Fft<N> {
         // We need 2 bufs for this step
         // - one for reversed samples
         // - another for calculation, as inplace modification will break the calculation
-        let mut buf_a: [ComplexF32; N] = array::from_fn(|i| self.samples[self.indexes_rev[i]]);
+        let mut buf_a: [ComplexF32; N] = array::from_fn(|i| 
+            self.samples[self.indexes_rev[i]] * self.hann_window[self.indexes_rev[i]]);
         let mut buf_b: [ComplexF32; N] = array::from_fn(|_| ComplexF32::default());
 
         // This is for swapping two bufs when done
@@ -155,7 +181,8 @@ impl<const N: usize> Fft<N> {
     pub fn post_process(&mut self) {
         self.output.rotate_left(N/2);
 
-        let scale = 1.0/(N as f32);
+        // let scale = 1.0/(N as f32);
+        let scale = 1.0/self.window_sum;
         self.output.iter_mut().for_each(|o| {
             *o = 20.0 * (*o*scale + 1e-12).log10();
         });
@@ -210,6 +237,17 @@ impl Mul for ComplexF32 {
             self.real * rhs.real - self.img * rhs.img,
             self.real * rhs.img + self.img * rhs.real,
         )
+    }
+}
+
+/// Scaling by a real. Two multiplies where the complex product would take four
+/// and two adds — worth having its own impl on a path that runs N times per
+/// transform.
+impl Mul<f32> for ComplexF32 {
+    type Output = Self;
+
+    fn mul(self, rhs: f32) -> Self::Output {
+        Self::new(self.real * rhs, self.img * rhs)
     }
 }
 
@@ -311,16 +349,63 @@ mod tests {
     #[test]
     fn energy_is_confined_to_the_tone() {
         // A bin-centred exponential is analytically zero in every other bin
-        // under a rectangular window, so what remains is 8-bit quantisation
-        // noise spread over N bins — around -83 dBFS. -40 leaves wide margin
-        // while still catching a broken twiddle or a botched butterfly.
+        // under a *rectangular* window. The Hann window trades that for a
+        // three-bin main lobe: its coefficients are 0.25 / 0.5 / 0.25, so the
+        // two immediate neighbours sit at exactly 20*log10(0.5) = -6.02 dB and
+        // everything beyond them is 8-bit quantisation noise spread over N bins
+        // — around -83 dBFS. -40 leaves wide margin while still catching a
+        // broken twiddle or a botched butterfly.
+        //
+        // Asserting the -6.02 rather than merely skipping the neighbours is
+        // what pins the window down: a mis-parenthesised or symmetric-instead-
+        // of-periodic Hann changes those two bins and nothing else visible.
         let spectrum = analyse(256.0, 1.0, 4096);
         let peak = shifted(256);
         for (bin, &db) in spectrum.iter().enumerate() {
-            if bin == peak {
-                continue;
+            match bin as i32 - peak as i32 {
+                0 => continue,
+                -1 | 1 => assert!(
+                    (db + 6.02).abs() < 0.1,
+                    "bin {bin} is a Hann skirt, expected ~-6.02 dB, got {db}"
+                ),
+                _ => assert!(db < -40.0, "bin {bin} should be noise floor, got {db}"),
             }
-            assert!(db < -40.0, "bin {bin} should be noise floor, got {db}");
+        }
+    }
+
+    #[test]
+    fn off_bin_tone_does_not_smear_across_the_display() {
+        // The test the window exists for. Every other case here uses a
+        // bin-centred tone, where a rectangular window is already near-perfect
+        // — none of them would fail if the window were removed entirely.
+        //
+        // 256.5 bins is the worst case: exactly halfway between two bins, so
+        // the analysis sees a truncated sinusoid whose ends do not match, and
+        // the discontinuity is what radiates across the spectrum.
+        //
+        // Measured worst bin beyond a given distance from the peak:
+        //
+        //     beyond +-   rectangular    Hann
+        //          4        -23.0 dB   -48.7 dB
+        //          8        -28.5 dB   -66.4 dB
+        //        100        -49.9 dB   -69.0 dB  <- quantisation floor
+        //        300        -58.2 dB   -69.0 dB
+        //
+        // Rectangular rolls off at 6 dB/octave and is still 58 dB up three
+        // hundred bins away, which is the whole width of the display; Hann
+        // rolls off at 18 dB/octave and has reached the 8-bit noise floor by
+        // +-12. The two thresholds below sit ~4 and ~6 dB under the Hann
+        // numbers, and 22 and 32 dB above the rectangular ones — so this fails
+        // loudly if the window is ever removed, mis-parenthesised, or built
+        // symmetric instead of periodic.
+        let spectrum = analyse(256.5, 1.0, 4096);
+        let peak = shifted(256) as i32;
+        for (bin, &db) in spectrum.iter().enumerate() {
+            match (bin as i32 - peak).abs() {
+                0..=4 => continue,
+                5..=8 => assert!(db < -45.0, "near skirt: bin {bin} leaked to {db}"),
+                _ => assert!(db < -60.0, "far skirt: bin {bin} leaked to {db}"),
+            }
         }
     }
 

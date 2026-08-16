@@ -51,12 +51,12 @@ pub struct SignalView {
     /// they are the knobs worth binding to keys.
     pub floor_db: f32,
     pub ceil_db: f32,
-    center_hz: Rc<Cell<f32>>,
-    sample_rate: Rc<Cell<f32>>,
+    center_hz: Rc<Cell<u32>>,
+    sample_rate: Rc<Cell<u32>>,
 }
 
 impl SignalView {
-   pub fn new(bins: usize, history: usize, center_hz: Rc<Cell<f32>>, sample_rate: Rc<Cell<f32>>) -> Self {
+   pub fn new(bins: usize, history: usize, center_hz: Rc<Cell<u32>>, sample_rate: Rc<Cell<u32>>) -> Self {
         Self {
             bins,
             rows: VecDeque::with_capacity(history),
@@ -65,8 +65,8 @@ impl SignalView {
             has_pending: false,
             floor_db: -90.0,
             ceil_db: -20.0,
-            center_hz: center_hz,
-            sample_rate: sample_rate,
+            center_hz,
+            sample_rate,
         }
     }
 
@@ -144,18 +144,37 @@ impl SignalView {
         let center_hz = self.center_hz.get();
         let witdh = area.width;
 
-        let half = sample_rate / 2.0;
-        let mhz = |hz: f32| format!("{:.1}", hz / 1e6);
-        let cols = Layout::horizontal([Constraint::Ratio(1, 3); 3]).split(area);
+        // FFT size of 2048 is represented by area.with, for example 100 columns
+        // and splitted into 10 bins
+        for i in 0..10 {
 
-        let line_left = Line::from(mhz(center_hz - half)).left_aligned();
-        line_left.render(cols[0], buf);
+        }
 
-        let line_center = Line::from(mhz(center_hz)).centered();
-        line_center.render(cols[1], buf);
+        let half = self.sample_rate.get() / 2;
+        let mhz = |hz: u32| format!("{:.1}", hz as f32 / 1e6);
+        
+        // 5 bins total
+        let cols = Layout::horizontal([Constraint::Ratio(1, 5); 5]).split(area);
+        let bin_range = self.sample_rate.get()/5;
 
-        let line_right = Line::from(mhz(center_hz + half)).right_aligned();
-        line_right.render(cols[2], buf);
+        let freqs = [
+            center_hz - 2*bin_range, center_hz - bin_range,
+            center_hz,
+            center_hz + bin_range, center_hz + 2*bin_range];
+
+        cols.iter().zip(freqs).for_each(|(c, f)| {
+            let line = Line::from(mhz(f)).centered();
+            line.render(*c, buf);
+        });
+
+        // let line_left = Line::from(mhz(center_hz - half)).left_aligned();
+        // line_left.render(cols[0], buf);
+        //
+        // let line_center = Line::from(mhz(center_hz)).centered();
+        // line_center.render(cols[1], buf);
+        //
+        // let line_right = Line::from(mhz(center_hz + half)).right_aligned();
+        // line_right.render(cols[2], buf);
     }
     
     fn render_spectrum(&self, area: Rect, buf: &mut Buffer) {
@@ -228,7 +247,7 @@ impl SignalView {
 impl Widget for &SignalView {
     fn render(self, area: Rect, buf: &mut Buffer) {
         // Signal view, include spectrum and waterfall
-        let block = Block::bordered().title("Spectrogram");
+        let block = Block::bordered().title("Spectrogram MHz");
         let inner = block.inner(area);
         block.render(area, buf);
 
