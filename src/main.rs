@@ -4,7 +4,7 @@ mod speaker;
 
 use rust_radio::{
     exceptions::CustomError,
-    source::Source,
+    source::source::Source,
     spmc::RingProducer,
     tui::{control_signal::CtrlSignal, tui::Tui, app_states::AppStates},
 };

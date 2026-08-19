@@ -3,7 +3,9 @@ use std::sync::mpsc::{channel, Receiver};
 
 use rtlsdr_mt::{Controller, Reader};
 
-use crate::{exceptions::CustomError, spmc::RingProducer};
+use super::utils::{IqDcBlocker, FmDiscriminator, AmEnvelope, Deemphasis};
+
+use crate::{exceptions::CustomError, source::utils::Decim, spmc::RingProducer};
 use crate::tui::control_signal::CtrlSignal;
 
 /// RTL sample rate = audio sample rate × this. 50 keeps both 48k and 44.1k in
@@ -37,7 +39,6 @@ const IQ_BLOCK: usize = 16384;
 
 pub struct Source {
     /// rtl lib
-    // ctl: Controller,
     reader: Reader,
 
     /// Handle for control signal threat
@@ -77,6 +78,7 @@ impl Source {
                         ctl.set_center_freq(freq).expect(&CustomError::RtlSetFreq(freq).to_string());
                         // ctl.reset_buffer().expect(&CustomError::RtlResetBuffer.to_string());
                     },
+
                     CtrlSignal::Bandwidth(bw) => ctl.set_bandwidth(bw)
                         .expect(&CustomError::RtlSetBandwidth(bw).to_string()),
                     // librtlsdr takes tenths of a dB, and only the discrete
@@ -109,28 +111,12 @@ impl Source {
         // read_async blocks this (main) thread and invokes the closure per USB
         // buffer, on this same thread. cpal's callback runs on its own thread, so
         // only finished audio crosses the ring.
-        let (mut iacc, mut qacc) = (0.0f32, 0.0f32); // stage 1 boxcar, on the IQ
-        let mut iq_n = 0u32;
-        let (mut prev_i, mut prev_q) = (0.0f32, 0.0f32); // FM discriminator state
-        let mut acc = 0.0f32; // stage 2 boxcar, on the demodulated signal
-        let mut acc_n = 0u32;
-        let mut deemph = 0.0f32; // one-pole de-emphasis state
         let volume = 0.3f32;
 
         // Ask the device for its rate rather than trusting the requested one:
         // librtlsdr snaps to what the 28.8 MHz crystal can actually divide down
         // to, so the two are close but not equal.
         let iq_rate = self.sample_rate as f32 / IQ_DECIM as f32;
-
-        // Phase step at full deviation, at the rate the discriminator now runs.
-        // 2π·75k/240k = 1.96 rad — still under π, but that shrinking headroom is
-        // why stage 1 cannot decimate much further than 240 kS/s. Normalising by
-        // π instead would treat the deviation as ±fs/2 and lose ~24 dB.
-        let full_scale = 2.0 * std::f32::consts::PI * FM_DEVIATION / iq_rate;
-
-        // One-pole RC lowpass; alpha = 1 - exp(-T/tau) is the step-invariant
-        // discretisation of the analogue de-emphasis network.
-        let deemph_a = 1.0 - (-1.0 / (iq_rate * DEEMPHASIS_TAU)).exp();
 
         // Samples go straight into the open ring slot via `push`, which publishes
         // once RING_BLOCK of them have accumulated. No staging array: this producer
@@ -142,6 +128,40 @@ impl Source {
         // with transfer edges — the fill position lives in the producer and the
         // decimation accumulator carries across callbacks, which is what makes that
         // harmless.
+        //
+        // High-pass filter for this
+        let mut highpass_filter = IqDcBlocker::new();
+
+        // For decimation
+        let mut decim = Decim::<IQ_DECIM, POST_DECIM>::new();
+        
+        // For Demphasis
+        let mut deemp = Deemphasis::new(iq_rate, DEEMPHASIS_TAU);
+
+        // FM and AM demod
+        let mut fm_demod = FmDiscriminator::new(iq_rate, FM_DEVIATION);
+        let mut am_demod = AmEnvelope::new(iq_rate, 20.0);
+
+        // ── TEMPORARY INSTRUMENTATION — delete once the silence is diagnosed ──
+        // Goes to a file, not stderr: ratatui owns the terminal. Watch with
+        //     tail -f /tmp/ferrite-dsp.log
+        let mut dbg_log = std::fs::File::create("/tmp/ferrite-dsp.log").ok();
+        if let Some(f) = dbg_log.as_mut() {
+            use std::io::Write;
+            let _ = writeln!(
+                f,
+                "sample_rate={} iq_rate={} full_scale={} deemph_alpha={}",
+                self.sample_rate,
+                iq_rate,
+                2.0 * std::f32::consts::PI * FM_DEVIATION / iq_rate,
+                1.0 - (-1.0 / (iq_rate * DEEMPHASIS_TAU)).exp(),
+            );
+        }
+        let mut dbg_n = 0u64;
+        let mut dbg_peak = 0.0f32;
+        let mut dbg_sumsq = 0.0f64;
+        let mut dbg_err = 0u64;
+        let mut dbg_at = std::time::Instant::now();
 
         let handle = thread::spawn(move || {
             self.reader
@@ -152,62 +172,57 @@ impl Source {
                         // u8 → centered f32 in ~[-1, 1]
                         let i = (pair[0] as f32 - 127.5) * (1.0 / 127.5);
                         let q = (pair[1] as f32 - 127.5) * (1.0 / 127.5);
+                        
+                        // Apply the high-pass filter
+                        let (i, q) = highpass_filter.process(i, q);
 
-                        // Stage 1 — channel filter. Averaging I and Q *before*
-                        // atan2 is the whole point: the discriminator is
-                        // nonlinear, so any adjacent station still present when
-                        // it runs intermodulates and can never be unmixed again.
-                        iacc += i;
-                        qacc += q;
-                        iq_n += 1;
-                        if iq_n < IQ_DECIM {
+                        // First phase of decimation
+                        let Some((i, q)) = decim.iq_decim(i, q) else {
                             continue;
-                        }
-                        let (i, q) = (iacc / IQ_DECIM as f32, qacc / IQ_DECIM as f32);
-                        iacc = 0.0;
-                        qacc = 0.0;
-                        iq_n = 0;
+                        };
 
                         // FM demod at 240 kS/s: angle of cur × conj(prev).
                         // Instantaneous frequency.
-                        let re = i * prev_i + q * prev_q;
-                        let im = q * prev_i - i * prev_q;
-                        let demod = im.atan2(re); // ∈ [-π, π]
-                        prev_i = i;
-                        prev_q = q;
-
-                        // De-emphasis here rather than at 48 kHz does double
-                        // duty: it is the required equalisation *and* the
-                        // anti-alias filter for stage 2. At 240 kS/s it puts the
-                        // 38 kHz stereo subcarrier ~21 dB down before decimation
-                        // can fold it to 10 kHz; applied afterwards it would be
-                        // too late, the alias already inside the audio band.
-                        deemph += deemph_a * (demod / full_scale - deemph);
+                        let demod = fm_demod.process(i, q);
+                        let audio = deemp.process(demod);
 
                         // Stage 2 — decimate 240 kS/s → audio_rate.
-                        acc += deemph;
-                        acc_n += 1;
-                        if acc_n == POST_DECIM {
-                            // Clamped last, and only last: nothing guarantees the
-                            // deviation stays within spec — noise on a weak signal
-                            // and over-modulated stations both push past it — but
-                            // clamping before the filters would distort what they
-                            // are about to shape.
-                            let sample = ((acc / POST_DECIM as f32) * volume).clamp(-1.0, 1.0);
-                            acc = 0.0;
-                            acc_n = 0;
-
-                            if let Err(e) = producer_sp.push(sample) {
-                                eprintln!("ring push failed: {e:?}");
-                            }
+                        let Some(sample) = decim.post_decim(audio, volume) else {
+                            continue;
+                        };
+                        if producer_sp.push(sample).is_err() {
+                            dbg_err += 1;
                         }
+
+                        // TEMPORARY
+                        dbg_n += 1;
+                        dbg_peak = dbg_peak.max(sample.abs());
+                        dbg_sumsq += (sample as f64) * (sample as f64);
                     };
 
-                    // Feed TUI
-                    for blk in bytes.chunks_exact(IQ_BLOCK) {
-                        // TODO: silenced error
-                        let _ = producer_iq.write(blk);
+                    // ── TEMPORARY INSTRUMENTATION ────────────────────────────
+                    if dbg_at.elapsed() >= std::time::Duration::from_secs(1) {
+                        use std::io::Write;
+                        let rms = (dbg_sumsq / dbg_n.max(1) as f64).sqrt();
+                        if let Some(f) = dbg_log.as_mut() {
+                            let _ = writeln!(
+                                f,
+                                "{:>6} samples/s   peak {:.5}   rms {:.6}   push_err {}",
+                                dbg_n, dbg_peak, rms, dbg_err
+                            );
+                        }
+                        dbg_n = 0;
+                        dbg_peak = 0.0;
+                        dbg_sumsq = 0.0;
+                        dbg_err = 0;
+                        dbg_at = std::time::Instant::now();
                     }
+
+                    // Feed TUI the raw bytes: one USB buffer is exactly one
+                    // IQ_BLOCK, and centering is the FFT's job — doing it here
+                    // would only move work into this real-time callback.
+                    // TODO: silenced error
+                    let _ = producer_iq.write(bytes);
                 })
                 .expect("rtlsdr: read_async failed");
             });

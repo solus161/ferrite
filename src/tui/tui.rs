@@ -27,7 +27,7 @@ pub struct Tui<const SLOTS: usize, const BLOCK: usize, const N: usize> {
     signal_view: SignalView,
     stats_view: StatsView,
 
-    // IQ stream buffer
+    // Raw interleaved IQ bytes, centered by the FFT on push
     block: [u8; BLOCK],
 
     /// Sender of CtrlSignal
@@ -41,7 +41,7 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
         ctrl_tx: Sender<CtrlSignal>,
     ) -> Self {
         // Block size must be x*window size
-        const { assert!(BLOCK % (2*N) == 0)};
+        const { assert!(BLOCK.is_multiple_of(2*N))};
 
         let center_freq = app_states.center_freq.clone();
         let sample_rate = app_states.sample_rate.clone();
@@ -52,7 +52,7 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
 
         Self { 
             states: app_states,
-            consumer, fft: Fft::new(),
+            consumer, fft: Fft::<N>::new(),
             signal_view: SignalView::new(N, 256, center_freq.clone(), sample_rate),
             stats_view: StatsView::new(center_freq, step, gain_db, bw, ppm),
             block: [0u8; BLOCK],

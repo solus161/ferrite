@@ -1,6 +1,7 @@
 use core::array;
 use core::ops::{Add, Mul};
 
+use crate::source::utils::IqDcBlocker;
 /// Calculating the discrete Fourier Transform over a sliding window of N samples.
 ///
 /// The input is not fed all at once, but in pieces of f32 which add up to N,
@@ -21,6 +22,7 @@ pub struct Fft<const N: usize> {
     /// 2 add) per sample to multiply by a zero imaginary part.
     hann_window: [f32; N],
     window_sum: f32,        // depends on type of window
+    highpass_filter: IqDcBlocker,
 }
 
 impl<const N: usize> Fft<N> {
@@ -42,7 +44,7 @@ impl<const N: usize> Fft<N> {
         let mut indexes_rev: [usize; N] = array::from_fn(|i| i);
         indexes_rev
             .iter_mut()
-            .for_each(|x| *x = x.reverse_bits() >> usize::BITS - N.trailing_zeros());
+            .for_each(|x| *x = x.reverse_bits() >> (usize::BITS - N.trailing_zeros()));
 
         // Precomputed Hann window
         // https://www.mathworks.com/help/signal/ref/hann.html
@@ -71,6 +73,7 @@ impl<const N: usize> Fft<N> {
             indexes_rev,
             hann_window,
             window_sum,
+            highpass_filter: IqDcBlocker::new(),
         }
     }
 
