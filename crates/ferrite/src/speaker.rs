@@ -6,12 +6,13 @@ use cpal::{
 };
 
 use sdr_core::{
-    dsp::{DecimationWFM, Demodulation, windowed_sinc_resample, PartialWriter},
+    dsp::{DecimationWFM, Demodulation, windowed_sinc_resample, Deemphasis, PartialWriter},
     spmc::{RingConsumer, RingProducer}};
 
 use crate::source::source::{AUDIO_DECIM, IQ_BLOCK, IQ_SLOTS, COMPLEX_BLOCK};
 
 const FRAME_BLOCK: usize = 512;
+const FM_DEVIATION: f32 = 75_000.0;
 const DEEMPHASIS_TAU: f32 = 50e-6;
 
 pub struct Speaker {
@@ -51,38 +52,26 @@ impl Speaker {
             buffer_size: cpal::BufferSize::Default,
         };
 
-        // Staging copy of one ring block. cpal asks for an arbitrary frame count
-        // per callback while the ring hands out fixed M-sample blocks, so the
-        // remainder has to survive between callbacks.
-        //
-        // Filled via `read_into`, which copies before releasing the slot. Doing
-        // it the other way round — `read()` then copy — leaves a window where the
-        // producer can overwrite the block mid-copy, and an audio callback is a
-        // prime candidate for being preempted inside it.
-        
-
-        // let mut std_iq_decim = [0.0f32, M]
-        let mut pos = IQ_BLOCK; // start "drained" so the first callback pulls a block
-
         // For decimation
         let mut decim = DecimationWFM::new();
 
         // Demodulation, outout 1024 300kHz
-        let mut demod = Demodulation::new();
+        let mut demod = Demodulation::new(FM_DEVIATION, 300_000.0_f32);
+        
+        // Deemphasis
+        let mut deemph = Deemphasis::new(DEEMPHASIS_TAU, audio_rate as f32);
 
         let mut bufs = Box::new(DspBuffers::new());
 
         // A ring from DSP to audio
-        let mut producer_audio = RingProducer::<f32, IQ_SLOTS, FRAME_BLOCK>::new(false);
+        let producer_audio = RingProducer::<f32, IQ_SLOTS, FRAME_BLOCK>::new(false);
         let consumer_audio = producer_audio.subscribe();
-        let mut output = [0.0f32; 512];     // store output, partial fill
         
         // Partial write
         let mut writer = PartialWriter::<512>::new(producer_audio);
         // A dedicated thread DSP
         let builder = thread::Builder::new().name("thread-dsp".to_string());
-        let handle = builder.spawn(move || {
-            let mut fill: usize = 0;
+        let _handle = builder.spawn(move || {
             loop {
                 match consumer.read_into(&mut bufs.stg) {
                     Ok(_) => {
@@ -104,6 +93,8 @@ impl Speaker {
                             &mut bufs.output,
                             32);
 
+                        deemph.process(&mut bufs.output);
+
                         let _write_count = writer.write(&mut bufs.output);
                     }
                     Err(_) => thread::park_timeout(Duration::from_millis(1)),
@@ -112,7 +103,7 @@ impl Speaker {
         });
 
         let mut staging = [0.0f32; FRAME_BLOCK];
-        let mut pos = FRAME_BLOCK; 
+        let mut pos = FRAME_BLOCK;
         let stream = device
             .build_output_stream(
                 config,
@@ -142,36 +133,29 @@ impl Speaker {
                     //   - SDR waits;
                     //   - cpal fires, get last 16,384 samples, convert to 512 samples
                     // println!("cpal data len {}", data.len());
-                    // for frame in data.chunks_mut(channels) {
+                    for frame in data.chunks_mut(channels) {
                         if pos == FRAME_BLOCK {
                             match consumer_audio.read_into(&mut staging) {
                                 Ok(_) => {
-                                    // pos = 0;
-                                    for (i, d) in staging.iter().enumerate() {
-                                        data[i * 2] = *d;
-                                        data[i * 2 + 1] = *d;
-                                    }
-                                    // for out in frame.iter_mut() {
-                                    //     *out = 0.0;
-                                    // }
+                                    pos = 0;
                                 },
                                 Err(_) => {
                                     // Ring empty — underrun. Emit silence for this
                                     // frame and retry on the next one, so a block
                                     // landing mid-callback is picked up immediately.
-                                    for out in data.iter_mut() {
+                                    for out in frame.iter_mut() {
                                         *out = 0.0;
                                     }
-                                    // continue;
+                                    continue;
                                 }
                             }
-                        // }
+                        }
 
-                        // let s = staging[pos ];
-                        // pos += 1;
-                        // for out in frame.iter_mut() {
-                        //     *out = s; // mono → every channel
-                        // }
+                        let s = staging[pos];
+                        pos += 1;
+                        for out in frame.iter_mut() {
+                            *out = s; // mono → every channel
+                        }
                     }
                 },
                 move |err| eprintln!("audio stream error: {err}"),

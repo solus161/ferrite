@@ -322,11 +322,13 @@ impl<const B: usize, const T: usize> FIRFilter<B, T> {
 pub struct Demodulation {
     prev_i: f32,
     prev_q: f32,
+    inv_deviation: f32,
 }
 
 impl Demodulation {
-    pub fn new() -> Self {
-        Self { prev_i: 0.0f32, prev_q: 0.0f32 }
+    pub fn new(deviation: f32, samples_rate: f32) -> Self {
+        let rads = std::f32::consts::TAU * deviation / samples_rate;
+        Self { prev_i: 0.0f32, prev_q: 0.0f32, inv_deviation: 1.0 / rads }
     }
 
     pub fn process<const N: usize>
@@ -335,16 +337,30 @@ impl Demodulation {
         i.iter().zip(q.iter()).zip(out.iter_mut()).for_each(|((&x, &y), o)| {
             let re = x * self.prev_i + y * self.prev_q;
             let im = y * self.prev_i - x * self.prev_q;
-            *o = im.atan2(re); // ∈ [-π, π]
+            *o = im.atan2(re) * self.inv_deviation; // ∈ [-π, π]
             self.prev_i = x;
             self.prev_q = y;
         });
     }
 }
 
-impl Default for Demodulation {
-    fn default() -> Self {
-        Self::new()
+pub struct Deemphasis {
+    alpha: f32,
+    last_out: f32,   // carries across blocks
+}
+
+impl Deemphasis {
+    pub fn new(tau: f32, sample_rate: f32) -> Self {
+      let dt = 1.0 / sample_rate;
+      Self { alpha: dt / (tau + dt), last_out: 0.0 }
+    }
+
+    pub fn process(&mut self, buf: &mut [f32]) {
+        for x in buf.iter_mut() {
+          *x = self.alpha * *x + (1.0 - self.alpha) *
+        self.last_out;
+          self.last_out = *x;
+        }
     }
 }
 
@@ -372,17 +388,26 @@ pub fn windowed_sinc_resample(
     let output_len = (input.len() as f32 / ratio) as usize;
     assert_eq!(output_len, output.len());
 
+    let cutoff = 15_000.0_f32.min(output_rate / 2.0);
+    let fc = 2.0 * cutoff / input_rate;
+    let span = (half_taps as f32 / fc) as i32;
+
     for n in 0..output_len {
         let pos = n as f32 * ratio;
         let mut sum = 0.0f32;
 
-        for k in -(half_taps as i32)..=(half_taps as i32) {
+        // The sweep must cover the *widened* kernel. Leaving it at ±half_taps
+        // truncates a kernel that now needs ±span, which is a rectangular
+        // window on top of the Hann one and puts the sidelobes back.
+        for k in -span..=span {
             let i = pos as i32 + k;
             if i < 0 || i >= input.len() as i32 { continue; }
 
             let t = pos - i as f32;
-            // Sinc × window — the low-pass interpolation kernel
-            sum += input[i as usize] * sinc(t) * hann(t, half_taps as f32);
+            // `fc * sinc(fc * t)` is the lowpass kernel at cutoff `fc/2`
+            // cycles/sample; it sums to exactly 1 at DC, so gain is unity.
+            // `sinc(t)` alone would cut at the *input* Nyquist — no filtering.
+            sum += input[i as usize] * fc * sinc(fc * t) * hann(t, span as f32);
         }
         output[n] = sum;
     }
