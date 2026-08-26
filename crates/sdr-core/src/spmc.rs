@@ -201,7 +201,7 @@ impl<T: Copy + Default, const N: usize, const M: usize> RingProducer<T, N, M> {
 
     /// Wake every consumer — including after a refusal, since a consumer
     /// draining a slot is exactly what unblocks the next write.
-    fn wake(&self) {
+    pub fn wake(&self) {
         self.consumers.iter().for_each(|(h, _)| h.thread().unpark());
     }
 

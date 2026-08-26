@@ -1,10 +1,14 @@
-use std::{sync::Arc, thread::{self, JoinHandle}};
+use std::{array, thread::{self, JoinHandle}, usize};
 use std::sync::mpsc::{channel, Receiver};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 
 use rtlsdr_mt::{Controller, Reader};
 
-use crate::{exceptions::CustomError, spmc::RingProducer};
-use crate::tui::control_signal::CtrlSignal;
+use sdr_core::{exceptions::CustomError, spmc::RingProducer};
+use sdr_core::control_signal::CtrlSignal;
+
+use sdr_core::dsp::{center_iq, IqDcBlocker};
 
 /// RTL sample rate = audio sample rate × this. 50 keeps both 48k and 44.1k in
 /// the RTL's valid range (2.4 MS/s and 2.205 MS/s). Also the boxcar decimation
@@ -29,11 +33,11 @@ const DEEMPHASIS_TAU: f32 = 50e-6;
 /// modulated" means for the discriminator, and therefore what maps to ±1.0 at
 /// the output — the discriminator's own ±π range corresponds to ±fs/2, which no
 /// broadcast signal comes anywhere near.
-const FM_DEVIATION: f32 = 75_000.0;
-const RING_SLOTS: usize = 16;
+const FM_DEVIATION: f32 = 75_000.0; const RING_SLOTS: usize = 16;
 const RING_BLOCK: usize = 512;
-const IQ_SLOTS: usize = 16;
-const IQ_BLOCK: usize = 16384;
+pub const IQ_SLOTS: usize = 16;
+pub const IQ_BLOCK: usize = 16384;
+pub const COMPLEX_BLOCK: usize = IQ_BLOCK/2;
 
 pub struct Source {
     /// rtl lib
@@ -44,6 +48,8 @@ pub struct Source {
     ctrl_handle: JoinHandle<()>,
 
     sample_rate: u32,
+    center_freq: Arc<AtomicU32>,
+    tuned_freq: Arc<AtomicU32>,
 }
 
 impl Source {
@@ -66,15 +72,21 @@ impl Source {
         ctl.reset_buffer().expect(&CustomError::RtlResetBuffer.to_string());
 
         let sample_rate = ctl.sample_rate();
+
+        let tuned_freq = Arc::new(AtomicU32::new(center_freq));
+        let center_freq = Arc::new(AtomicU32::new(center_freq));
+        
         
         // Start a thread to receive control signal
         // better than checking within read_async 
+        let center_freq_clone = center_freq.clone();
         let ctrl_handle = thread::spawn(move || {
             while let Ok(sig) = ctrl_rx.recv() {
                 // TODO: handle error, should not expect()
                 match sig {
                     CtrlSignal::CenterHz(freq) => {
                         ctl.set_center_freq(freq).expect(&CustomError::RtlSetFreq(freq).to_string());
+                        center_freq_clone.store(freq, Ordering::Release);
                         // ctl.reset_buffer().expect(&CustomError::RtlResetBuffer.to_string());
                     },
                     CtrlSignal::Bandwidth(bw) => ctl.set_bandwidth(bw)
@@ -94,7 +106,8 @@ impl Source {
             }
         });
        
-        Self { reader, ctrl_handle, sample_rate }
+        // TODO: let skip tuned_freq for now
+        Self { reader, ctrl_handle, sample_rate, center_freq, tuned_freq }
 
     }
 
@@ -102,8 +115,7 @@ impl Source {
     /// so this will not block UI
     pub fn start_receive(
         mut self,
-        mut producer_sp: RingProducer<f32, RING_SLOTS, RING_BLOCK>,
-        mut producer_iq: RingProducer<u8, IQ_SLOTS, IQ_BLOCK>,
+        mut producer: RingProducer<f32, IQ_SLOTS, IQ_BLOCK>,
     ) -> Result<(JoinHandle<()>, JoinHandle<()>), CustomError> {
         // ── DSP: runs inside librtlsdr's async read callback ────────────────────
         // read_async blocks this (main) thread and invokes the closure per USB
@@ -143,74 +155,30 @@ impl Source {
         // decimation accumulator carries across callbacks, which is what makes that
         // harmless.
 
-        let handle = thread::spawn(move || {
+        // High-pass filter
+        let mut highpass_filter = IqDcBlocker::<IQ_BLOCK>::new(self.sample_rate);
+
+        let mut buf: [f32; IQ_BLOCK] = array::from_fn(|_| 0.0f32 );
+        let builder = thread::Builder::new().name("thread-sdr".to_string());
+        let handle = builder.spawn(move || {
             self.reader
-                .read_async(15, 16384, move |bytes| {
+                .read_async(15, IQ_BLOCK as u32, move |bytes| {
                     // bytes: interleaved u8 IQ [I0,Q0,I1,Q1,...] at rtl_rate
                     // Feed cpal first
-                    for pair in bytes.chunks_exact(2) {
+                    for (idx, pair) in bytes.chunks_exact(2).enumerate() {
                         // u8 → centered f32 in ~[-1, 1]
-                        let i = (pair[0] as f32 - 127.5) * (1.0 / 127.5);
-                        let q = (pair[1] as f32 - 127.5) * (1.0 / 127.5);
+                        let (i, q) = center_iq(pair[0], pair[1]);
 
-                        // Stage 1 — channel filter. Averaging I and Q *before*
-                        // atan2 is the whole point: the discriminator is
-                        // nonlinear, so any adjacent station still present when
-                        // it runs intermodulates and can never be unmixed again.
-                        iacc += i;
-                        qacc += q;
-                        iq_n += 1;
-                        if iq_n < IQ_DECIM {
-                            continue;
-                        }
-                        let (i, q) = (iacc / IQ_DECIM as f32, qacc / IQ_DECIM as f32);
-                        iacc = 0.0;
-                        qacc = 0.0;
-                        iq_n = 0;
-
-                        // FM demod at 240 kS/s: angle of cur × conj(prev).
-                        // Instantaneous frequency.
-                        let re = i * prev_i + q * prev_q;
-                        let im = q * prev_i - i * prev_q;
-                        let demod = im.atan2(re); // ∈ [-π, π]
-                        prev_i = i;
-                        prev_q = q;
-
-                        // De-emphasis here rather than at 48 kHz does double
-                        // duty: it is the required equalisation *and* the
-                        // anti-alias filter for stage 2. At 240 kS/s it puts the
-                        // 38 kHz stereo subcarrier ~21 dB down before decimation
-                        // can fold it to 10 kHz; applied afterwards it would be
-                        // too late, the alias already inside the audio band.
-                        deemph += deemph_a * (demod / full_scale - deemph);
-
-                        // Stage 2 — decimate 240 kS/s → audio_rate.
-                        acc += deemph;
-                        acc_n += 1;
-                        if acc_n == POST_DECIM {
-                            // Clamped last, and only last: nothing guarantees the
-                            // deviation stays within spec — noise on a weak signal
-                            // and over-modulated stations both push past it — but
-                            // clamping before the filters would distort what they
-                            // are about to shape.
-                            let sample = ((acc / POST_DECIM as f32) * volume).clamp(-1.0, 1.0);
-                            acc = 0.0;
-                            acc_n = 0;
-
-                            if let Err(e) = producer_sp.push(sample) {
-                                eprintln!("ring push failed: {e:?}");
-                            }
-                        }
+                        // Apply high-pass filter
+                        let (i, q) = highpass_filter.process(i, q);
+                        
+                        (buf[idx], buf[idx + 1]) = (i, q);
                     };
-
-                    // Feed TUI
-                    for blk in bytes.chunks_exact(IQ_BLOCK) {
-                        // TODO: silenced error
-                        let _ = producer_iq.write(blk);
-                    }
+                    let _ = producer.write(&buf);
+                    producer.wake();
                 })
                 .expect("rtlsdr: read_async failed");
-            });
+            }).unwrap();
 
         Ok((handle, self.ctrl_handle))
     }

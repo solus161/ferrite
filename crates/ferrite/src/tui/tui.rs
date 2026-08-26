@@ -9,9 +9,10 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::widgets::Block;
 use ratatui::{DefaultTerminal, Frame};
 
-use crate::spmc::RingConsumer;
+use sdr_core::spmc::RingConsumer;
+use sdr_core::{fft::Fft, control_signal::CtrlSignal};
+
 use crate::tui::stats_view::StatsView;
-use crate::tui::{fft::Fft, control_signal::CtrlSignal};
 
 use super::{app_states::AppStates, signal_view::SignalView};
 
@@ -20,15 +21,15 @@ const FRAME: Duration = Duration::from_millis(33);
 
 pub struct Tui<const SLOTS: usize, const BLOCK: usize, const N: usize> {
     states: AppStates,
-    consumer: RingConsumer<u8, SLOTS, BLOCK>,
+    consumer: RingConsumer<f32, SLOTS, BLOCK>,
     fft: Fft<N>,
 
     // Views/panel
     signal_view: SignalView,
     stats_view: StatsView,
 
-    // IQ stream buffer
-    block: [u8; BLOCK],
+    // IQ stream buffer, after centered and high-pass filter
+    block: [f32; BLOCK],
 
     /// Sender of CtrlSignal
     ctrl_tx: Sender<CtrlSignal>,
@@ -37,7 +38,7 @@ pub struct Tui<const SLOTS: usize, const BLOCK: usize, const N: usize> {
 impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N> {
     pub fn new(
         app_states: AppStates,
-        consumer: RingConsumer<u8, SLOTS, BLOCK>,
+        consumer: RingConsumer<f32, SLOTS, BLOCK>,
         ctrl_tx: Sender<CtrlSignal>,
     ) -> Self {
         // Block size must be x*window size
@@ -55,7 +56,7 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
             consumer, fft: Fft::new(),
             signal_view: SignalView::new(N, 256, center_freq.clone(), sample_rate),
             stats_view: StatsView::new(center_freq, step, gain_db, bw, ppm),
-            block: [0u8; BLOCK],
+            block: [0.0f32; BLOCK],
             ctrl_tx,
         }
     }

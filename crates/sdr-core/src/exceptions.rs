@@ -41,8 +41,9 @@ impl From<Box<dyn std::error::Error>> for CustomError {
     }
 }
 
-impl From<cpal::Error> for CustomError {
-    fn from(_: cpal::Error) -> Self {
-        Self::Speaker
-    }
-}
+// There is deliberately no `From<cpal::Error>` here: this crate must not depend
+// on cpal, and the orphan rule forbids the binary from adding the impl itself
+// (both `CustomError` and `cpal::Error` would be foreign to it). Nothing used
+// it — `Speaker::play` surfaces `Box<dyn Error>`, which the impl above covers.
+// If a real cpal conversion is ever needed, give `Speaker` a payload here or
+// let the binary define its own error type wrapping this one.

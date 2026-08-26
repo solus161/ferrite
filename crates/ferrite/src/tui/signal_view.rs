@@ -64,7 +64,7 @@ impl SignalView {
             pending: vec![f32::NEG_INFINITY; bins].into_boxed_slice(),
             has_pending: false,
             floor_db: -90.0,
-            ceil_db: -20.0,
+            ceil_db: 0.0,
             center_hz,
             sample_rate,
         }
@@ -253,7 +253,7 @@ impl Widget for &SignalView {
 
         let [mhz_axis, area_spec, area_water] = Layout::vertical([
             Constraint::Length(1),
-            Constraint::Percentage(30),
+            Constraint::Percentage(20),
             Constraint::Fill(1),
         ]).areas(inner);
 

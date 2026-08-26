@@ -7,7 +7,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Widget};
 
-use super::control_signal::CtrlSignal;
+use sdr_core::control_signal::CtrlSignal;
 
 pub struct StatsView {
     tuner_view: TunerView,

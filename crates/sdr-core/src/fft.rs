@@ -1,5 +1,6 @@
 use core::array;
-use core::ops::{Add, Mul};
+
+use crate::complex::ComplexF32;
 
 /// Calculating the discrete Fourier Transform over a sliding window of N samples.
 ///
@@ -75,10 +76,10 @@ impl<const N: usize> Fft<N> {
     }
 
     /// Continuously copy array to fill samples, return coeffs array when samples filled
-    /// `iq` is stream of IQ u8
+    /// `iq` is stream of IQ f32
     /// `iq` length must be even and all `iq` must make up the the samples size,
     /// Consumers may still work, but you'll lose data
-    pub fn push(&mut self, iq: &[u8]) -> Option<&[f32]> {
+    pub fn push(&mut self, iq: &[f32]) -> Option<&[f32]> {
         // let src_len = src.len();
         // let max_index = N.min(self.offset + src_len/2);
         // for i in self.offset..max_index {
@@ -89,8 +90,8 @@ impl<const N: usize> Fft<N> {
         // }
         for pair in iq.chunks_exact(2) {
             self.samples[self.offset] = ComplexF32 { 
-                real: (pair[0] as f32 - 127.5)*(1.0/127.5),
-                img: (pair[1] as f32 - 127.5)*(1.0/127.5)
+                real: pair[0],
+                img: pair[1],
             };
             self.offset += 1;
         }
@@ -135,7 +136,8 @@ impl<const N: usize> Fft<N> {
         // - one for reversed samples
         // - another for calculation, as inplace modification will break the calculation
         let mut buf_a: [ComplexF32; N] = array::from_fn(|i| 
-            self.samples[self.indexes_rev[i]] * self.hann_window[self.indexes_rev[i]]);
+            self.samples[self.indexes_rev[i]] * self.hann_window[self.indexes_rev[i]]
+            );
         let mut buf_b: [ComplexF32; N] = array::from_fn(|_| ComplexF32::default());
 
         // This is for swapping two bufs when done
@@ -197,60 +199,6 @@ impl<const N: usize> Fft<N> {
         });
     }
 }
-
-/// A struct for complex number, using f32 by default
-#[derive(Copy, Clone, Default)]
-#[repr(C)]
-struct ComplexF32 {
-    pub real: f32,
-    pub img: f32,
-}
-
-impl ComplexF32 {
-    pub const fn new(real: f32, img: f32) -> Self {
-        Self { real, img }
-    }
-
-    pub fn cis(theta: f32) -> Self {
-        let (img, real) = theta.sin_cos();
-        Self { real, img }
-    }
-
-    pub fn norm(self) -> f32 {
-        self.real.hypot(self.img)
-    }
-}
-
-impl Add for ComplexF32 {
-    type Output = Self;
-
-    fn add(self, rhs: Self) -> Self::Output {
-        Self::new(self.real + rhs.real, self.img + rhs.img)
-    }
-}
-
-impl Mul for ComplexF32 {
-    type Output = Self;
-
-    fn mul(self, rhs: Self) -> Self::Output {
-        Self::new(
-            self.real * rhs.real - self.img * rhs.img,
-            self.real * rhs.img + self.img * rhs.real,
-        )
-    }
-}
-
-/// Scaling by a real. Two multiplies where the complex product would take four
-/// and two adds — worth having its own impl on a path that runs N times per
-/// transform.
-impl Mul<f32> for ComplexF32 {
-    type Output = Self;
-
-    fn mul(self, rhs: f32) -> Self::Output {
-        Self::new(self.real * rhs, self.img * rhs)
-    }
-}
-
 
 /// Testing the FFT
 ///

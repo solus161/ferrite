@@ -23,7 +23,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use rust_radio::spmc::{RingConsumer, RingProducer};
+use sdr_core::spmc::{RingConsumer, RingProducer};
 
 /// Mirrors RING_BLOCK / RING_SLOTS in `main.rs`.
 const BLOCK: usize = 512;
