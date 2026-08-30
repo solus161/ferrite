@@ -1,43 +1,25 @@
-use std::{array, thread::{self, JoinHandle}, usize};
-use std::sync::mpsc::{channel, Receiver};
+use std::{array, thread::{self, JoinHandle}};
+use std::sync::mpsc::Receiver;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
-use rtlsdr_mt::{Controller, Reader};
+use rtlsdr_mt::Reader;
 
 use sdr_core::{exceptions::CustomError, spmc::RingProducer};
 use sdr_core::control_signal::CtrlSignal;
 
-use sdr_core::dsp::{center_iq, IqDcBlocker};
+use sdr_core::dsp::center_iq;
+
+use super::dsp::DSPFlow;
 
 /// RTL sample rate = audio sample rate × this. 50 keeps both 48k and 44.1k in
-/// the RTL's valid range (2.4 MS/s and 2.205 MS/s). Also the boxcar decimation
-/// factor — see the DSP callback.
+/// the RTL's valid range (2.4 MS/s and 2.205 MS/s). The DSP chain realises it
+/// as 4 × 2 × 25/4 — see [`DSPFlow`].
 pub const AUDIO_DECIM: u32 = 50;
 
-/// Decimation stage 1, 2.4 MS/s -> 240 kS/s. Runs on I and Q *before* the
-/// discriminator: 240 kHz is the lowest rate that still holds a 200 kHz FM
-/// channel, and the boxcar's first null lands exactly there.
-const IQ_DECIM: u32 = 10;
-
-/// Decimation stage 2, 240 kS/s -> 48 kHz, on the demodulated signal.
-const POST_DECIM: u32 = AUDIO_DECIM/IQ_DECIM;
-
-/// De-emphasis time constant. 50 µs everywhere except the Americas and South
-/// Korea, which use 75 µs. Broadcast FM pre-emphasises treble by up to ~14 dB
-/// at 15 kHz; undoing it is what removes the hiss, because the discriminator's
-/// own noise floor rises at 6 dB/octave and this cuts it back down.
-const DEEMPHASIS_TAU: f32 = 50e-6;
-
-/// Peak frequency deviation of broadcast FM, in Hz. This is what "fully
-/// modulated" means for the discriminator, and therefore what maps to ±1.0 at
-/// the output — the discriminator's own ±π range corresponds to ±fs/2, which no
-/// broadcast signal comes anywhere near.
-const FM_DEVIATION: f32 = 75_000.0; const RING_SLOTS: usize = 16;
-const RING_BLOCK: usize = 512;
+pub const CPAL_BLOCK: usize = 164;  // ceil(8192 / 50) — the block is 163 or 164
 pub const IQ_SLOTS: usize = 16;
 pub const IQ_BLOCK: usize = 16384;
-pub const COMPLEX_BLOCK: usize = IQ_BLOCK/2;
 
 pub struct Source {
     /// rtl lib
@@ -115,67 +97,55 @@ impl Source {
     /// so this will not block UI
     pub fn start_receive(
         mut self,
-        mut producer: RingProducer<f32, IQ_SLOTS, IQ_BLOCK>,
+        mut producer_sp: RingProducer<f32, IQ_SLOTS, CPAL_BLOCK>,
+        mut producer_fft: RingProducer<f32, IQ_SLOTS, IQ_BLOCK>,
     ) -> Result<(JoinHandle<()>, JoinHandle<()>), CustomError> {
         // ── DSP: runs inside librtlsdr's async read callback ────────────────────
         // read_async blocks this (main) thread and invokes the closure per USB
         // buffer, on this same thread. cpal's callback runs on its own thread, so
         // only finished audio crosses the ring.
-        let (mut iacc, mut qacc) = (0.0f32, 0.0f32); // stage 1 boxcar, on the IQ
-        let mut iq_n = 0u32;
-        let (mut prev_i, mut prev_q) = (0.0f32, 0.0f32); // FM discriminator state
-        let mut acc = 0.0f32; // stage 2 boxcar, on the demodulated signal
-        let mut acc_n = 0u32;
-        let mut deemph = 0.0f32; // one-pole de-emphasis state
-        let volume = 0.3f32;
-
-        // Ask the device for its rate rather than trusting the requested one:
-        // librtlsdr snaps to what the 28.8 MHz crystal can actually divide down
-        // to, so the two are close but not equal.
-        let iq_rate = self.sample_rate as f32 / IQ_DECIM as f32;
-
-        // Phase step at full deviation, at the rate the discriminator now runs.
-        // 2π·75k/240k = 1.96 rad — still under π, but that shrinking headroom is
-        // why stage 1 cannot decimate much further than 240 kS/s. Normalising by
-        // π instead would treat the deviation as ±fs/2 and lose ~24 dB.
-        let full_scale = 2.0 * std::f32::consts::PI * FM_DEVIATION / iq_rate;
-
-        // One-pole RC lowpass; alpha = 1 - exp(-T/tau) is the step-invariant
-        // discretisation of the analogue de-emphasis network.
-        let deemph_a = 1.0 - (-1.0 / (iq_rate * DEEMPHASIS_TAU)).exp();
-
-        // Samples go straight into the open ring slot via `push`, which publishes
-        // once RING_BLOCK of them have accumulated. No staging array: this producer
-        // computes one sample at a time, so `write` would mean filling a local
-        // buffer and then copying the whole thing in.
         //
-        // One USB buffer yields 16384/2/AUDIO_DECIM ≈ 164 samples, so a block fills
-        // every ~3.1 callbacks. The 164 is fractional, so block edges never align
-        // with transfer edges — the fill position lives in the producer and the
-        // decimation accumulator carries across callbacks, which is what makes that
-        // harmless.
+        // Audio goes into the ring one sample at a time via `push`, which
+        // publishes once CPAL_BLOCK of them have accumulated. No staging array:
+        // a block is 163 or 164 samples so it never aligns with a USB transfer,
+        // and `push` keeps the fill position in the producer — which is exactly
+        // what makes the misalignment harmless.
 
-        // High-pass filter
-        let mut highpass_filter = IqDcBlocker::<IQ_BLOCK>::new(self.sample_rate);
+        // TODO: an IqDcBlocker here measured 57→62 dB SNR at a = 0.99999.
+        // let mut highpass_filter = IqDcBlocker::<IQ_BLOCK>::new(self.sample_rate);
 
-        let mut buf: [f32; IQ_BLOCK] = array::from_fn(|_| 0.0f32 );
-        let builder = thread::Builder::new().name("thread-sdr".to_string());
+        // Multi phase decimator
+        let mut dsp = DSPFlow::new_boxed();
+
+        let mut buf: [f32; IQ_BLOCK] = array::from_fn(|_| 0.0f32);
+        let mut buf_i: [f32; 8192] = array::from_fn(|_| 0.0f32);
+        let mut buf_q: [f32; 8192] = array::from_fn(|_| 0.0f32);
+
+        let builder = thread::Builder::new().stack_size(8 << 20)
+            .name("thread-sdr".to_string());
         let handle = builder.spawn(move || {
             self.reader
                 .read_async(15, IQ_BLOCK as u32, move |bytes| {
                     // bytes: interleaved u8 IQ [I0,Q0,I1,Q1,...] at rtl_rate
-                    // Feed cpal first
+                    // DSP right here
                     for (idx, pair) in bytes.chunks_exact(2).enumerate() {
                         // u8 → centered f32 in ~[-1, 1]
                         let (i, q) = center_iq(pair[0], pair[1]);
-
-                        // Apply high-pass filter
-                        let (i, q) = highpass_filter.process(i, q);
-                        
-                        (buf[idx], buf[idx + 1]) = (i, q);
+                        (buf[2 * idx], buf[2 * idx + 1]) = (i, q);
+                        buf_i[idx] = i;
+                        buf_q[idx] = q;
                     };
-                    let _ = producer.write(&buf);
-                    producer.wake();
+                    // 2.4 MHz -> 300 kHz, demodulate, resample to 48 kHz.
+                    // Returns 163 or 164 live samples.
+                    let n = dsp.process(&buf_i, &buf_q);
+
+                    // Feed speaker
+                    dsp.out[..n].iter().for_each(|x| {
+                        let _ = producer_sp.push(*x);
+                    });
+
+                    // Feed FFT
+                    let _ = producer_fft.write(&buf);
                 })
                 .expect("rtlsdr: read_async failed");
             }).unwrap();

@@ -278,6 +278,7 @@ impl<T: Copy + Default, const N: usize, const M: usize> RingProducer<T, N, M> {
             return Ok(false);
         }
 
+        // println!("ring full {}", &self.fill);
         self.fill = 0;
         self.ring.publish();
         self.wake();

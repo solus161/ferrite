@@ -1,6 +1,4 @@
-use std::array;
-
-use std::cell::UnsafeCell;
+use std::{array, usize};
 
 use crate::complex::{ComplexF32};
 use crate::fir_taps::{TAPS_27, TAPS_69};
@@ -58,6 +56,327 @@ impl<const N: usize> DcBlocker<N> {
         y
     }
 }
+
+/// FIR (Finite Impulse Responsive) Filters are used filter out a range of frequency
+/// by applying a convolution over time-domain window of signal, (instead of frequency domain).
+/// A correctly apply filter will make signal, in the frequency domain, at both end of a window
+/// settled to zero.
+///
+/// In frequency domain, filtering out a range of frequency is quite easy as it only required to
+/// multiply the FFT array by a rectangular function/mask of, ideadly, 1 (for keep) or 0 (for remove).
+/// The time-domain version of this mask is the sinc function `sinc(x) = sin(πx)/(πx)`.
+/// However, this ideal mask cannot be applied to finite samples.
+/// So windowed sinc is used instead: `h[k] = sinc(2·fc·(k - M)) · w[k]`
+/// where:
+///   k  = tap index, 0 to N-1
+///   M  = (N-1)/2  — center of the filter (makes it symmetric)
+///   fc = cutoff frequency normalized to 0..0.5  (fc = cutoff_hz / sample_rate)
+///   w[k] = window function value at tap k
+///
+/// `w[k]` could be from different window funtions: Hann, Hamming, Blackman, Kaiser
+pub enum Window {
+    Hann,
+    Hamming,
+    Blackman,
+    Kaiser,
+}
+
+pub enum FilterType {
+    Lowpass,
+    Highpass,
+}
+
+/// A sinc function to reconstruct continuous sample from discrete one
+pub fn sinc(x: f32) -> f32 {
+    if x.abs() < 1e-6 { 1.0 }
+    else { (std::f32::consts::PI * x).sin() / (std::f32::consts::PI * x) }
+}
+
+/// Modified Bessel function I₀ — needed for Kaiser window
+/// Series expansion, converges quickly for β < 20
+fn bessel_i0(x: f32) -> f32 {
+    let mut sum = 1.0f32;
+    let mut term = 1.0f32;
+    for k in 1..=20 {
+        term *= (x / 2.0) / k as f32;
+        term *= (x / 2.0) / k as f32;
+        sum += term;
+        if term < 1e-10 { break; }
+    }
+    sum
+}
+
+/// Create taps according to different window types
+/// Feeded cutoff and sample rate are non-normalized
+pub fn create_taps<const N: usize>(
+    filter_type: FilterType,
+    cutoff: f32,
+    sample_rate: f32,
+    window: Window,
+    beta: Option<f32>) -> [f32; N]
+{
+    // Normalize
+    let fc = cutoff/sample_rate;
+    let alpha = ((N - 1)/2) as f32;
+    let mut w = [0.0f32; N];
+    let mut output = [0.0f32; N];
+    let d = |k: f32| 2.0 * std::f32::consts::PI * k/(N as f32 - 1.0);
+    match window {
+        Window::Hann => {
+            w.iter_mut().enumerate().for_each(|(k, x)| {
+                *x = 0.5 * (1.0 - d(k as f32).cos());
+            }); 
+        }
+        Window::Hamming => {
+            w.iter_mut().enumerate().for_each(|(k, x)| {
+                *x = 0.53 - 0.46 * d(k as f32).cos();
+            });
+        }
+        Window::Blackman => {
+            w.iter_mut().enumerate().for_each(|(k, x)| {
+                *x = 0.42 - 0.5 * d(k as f32).cos() + 0.08 * (2.0 * d(k as f32)).cos();
+            })
+        }
+        Window::Kaiser => {
+            let beta = beta.unwrap_or(8.96); 
+            let j = (N - 1) as f32;
+            let i0_beta = bessel_i0(beta);
+            w.iter_mut().enumerate().for_each(|(k, x)| {
+                let ratio = (k as f32 - j / 2.0) / (j / 2.0);
+                *x = bessel_i0(beta * (1.0 - ratio * ratio).max(0.0).sqrt()) / i0_beta;
+            })
+        }
+    };
+
+    output.iter_mut().enumerate().for_each(|(k, h)| {
+        *h = sinc(2.0 * fc * (k as f32 - alpha))
+    });
+
+    // Highpass filter is lowpass filter inversed `h` 
+    match filter_type {
+        FilterType::Lowpass => {}
+        FilterType::Highpass => {
+            output.iter_mut().enumerate().for_each(|(k, h)| {
+                if k as f32 != alpha {
+                    *h = sinc(2.0 * fc * (k as f32 - alpha))
+                };
+            });
+            output[alpha as usize] = 1.0 - output[alpha as usize]
+        }
+    }
+    
+    output.iter_mut().zip(w.iter_mut()).for_each(|(o, w)| {
+        *o = *o * *w;
+    });
+
+    // Normalize dc gain = 1.0
+    let gain: f32 = output.iter().sum();
+    output.iter_mut().for_each(|o| *o /= gain);
+    output
+}
+
+/// A FIR filter for channel I, Q, applying over a block of I, Q
+/// This is a combination of downsampling and applying filter.
+/// Given window size of `N`, taps size of `T`, the working buf has `T-1` padding at the beginning.
+/// A normal FIR filter will convolute filter `T` over window `N`, with step size = 1,
+/// resulting output of size `N`.
+/// A decimating FIR will convolute with step size = `g`, `g` < `T`,
+/// resulting output of size N % g
+/// For example: a block size = 8192, T = 27, B = 8244
+pub struct DecimFIR<const P: usize, const N: usize, const T: usize> {
+    taps: [f32; T],
+    pub buf_i: [f32; P],
+    pub buf_q: [f32; P],
+    offset: usize,
+}
+
+impl<const P: usize, const N: usize, const T: usize> DecimFIR<P, N, T> {
+    pub fn new(taps: &[f32; T]) -> Self {
+        assert_eq!(P, N + T - 1);
+        Self {
+            taps: *taps,
+            buf_i: array::from_fn(|_| 0.0f32),
+            buf_q: array::from_fn(|_| 0.0f32),
+            offset: 0,
+        }
+    }
+
+    /// Copy into buf from index T - 1, this is the first step before processing
+    pub fn read_to_buf(&mut self, i: &[f32; N], q: &[f32; N]) {
+        // Copy inputs into buf first
+        // assert_eq!(N, i.len());
+        // assert_eq!(N, q.len());
+
+        // Copy from `T-1` as first `T` elements are padding at first
+        self.buf_i[T - 1..T - 1 + N].copy_from_slice(i);
+        self.buf_q[T - 1..T - 1 + N].copy_from_slice(q);
+    }
+
+    /// Apply filter over an input of predefined size.
+    /// Output size must be the same as input size.
+    /// No resampling here.
+    pub fn process(
+        &mut self,
+        step_size: usize,
+        out_i: &mut [f32],
+        out_q: &mut [f32],
+        )
+    {
+        let output_size = N / step_size;
+        assert_eq!(out_i.len(), output_size);
+        assert_eq!(out_q.len(), output_size);
+
+        // An input of 8192 with step 4 produces 2048 samples
+        let mut count = 0;
+
+        // Stop when remaining window having size less than T
+        // At this point, offset could have overpassed index N - 1 by k steps
+        // In other words, the last taps window needs k steps to be full
+        while self.offset < N {
+            let w = self.offset..self.offset + T;
+            out_i[count] = Self::convolve(&self.buf_i[w.clone()], &self.taps);
+            out_q[count] = Self::convolve(&self.buf_q[w.clone()], &self.taps);
+            count += 1;
+            self.offset += step_size;
+        };
+
+        // Carry leftover step into next block,
+        // offset step back N steps, because later we copy from N to last
+        // that includes items already processed in the last taps windows
+        self.offset -= N;
+
+        // Retain last T-1 samples for next process
+        self.buf_i.copy_within(N..N + T - 1, 0);
+        self.buf_q.copy_within(N..N + T - 1, 0);
+    }
+
+    
+    /// Apply convolution of `y` over `x`, given both having same lengthl
+    /// Any padding must be apply before this.
+    /// According to the definition of convolution, `y[k]` must be mapped to `x[N-k]`,
+    /// or `y` at `k` mapped to sample `x` delayed by `k`,
+    /// so `y` must be inversed first
+    /// https://brianmcfee.net/dstbook-site/content/ch03-convolution/Convolution.html
+    /// Written like this for vectorization with `target-cpu=native` build option
+    fn convolve(x: &[f32], y: &[f32]) -> f32 {
+        assert!(x.len() == y.len());
+        
+        let n = x.len();
+
+        let mut acc_0 = 0.0f32;
+        let mut acc_1 = 0.0f32;
+        let mut acc_2 = 0.0f32;
+        let mut acc_3 = 0.0f32;
+
+        let chunk = x.len()/4;
+        for i in 0..chunk {
+            let base = i*4;
+            acc_0 += x[base] * y[n - base - 1];
+            acc_1 += x[base + 1] * y[n - base - 2];
+            acc_2 += x[base + 2] * y[n - base - 3];
+            acc_3 += x[base + 3] * y[n - base - 4];
+        };
+
+        let mut acc_tail = 0.0f32;
+        let remainder_start = chunk * 4;
+        for i in remainder_start..x.len() {
+            acc_tail += x[i] * y[n - i - 1]
+        };
+
+        acc_0 + acc_1 + acc_2 + acc_3 + acc_tail
+    }
+
+    pub fn set_iq(&mut self, idx: usize, i: f32, q: f32) {
+        (self.buf_i[idx], self.buf_q[idx]) = (i, q);
+    }
+}
+
+/// Polyphase reampler
+/// For example: from 300kHz -> 48kHz, interp = 4, decim = 25
+pub struct PolyphaseResampler {
+    branches:   Vec<Vec<f32>>,  // [interp][taps_per_branch]
+    interp:     usize,
+    decim:      usize,
+    history:    Vec<f32>,       // last (taps_per_branch - 1) input samples
+    phase:      usize,          // current branch index, 0..interp
+    offset:     usize,          // carry from previous block
+}
+
+impl PolyphaseResampler {
+    pub fn new(interp: usize, decim: usize, taps: &[f32]) -> Self {
+        let taps_per_branch = (taps.len() + interp - 1) / interp;
+
+        // Split taps into interp branches
+        // tap k → branch (k % interp), position (k / interp)
+        let mut branches = vec![vec![0.0f32; taps_per_branch]; interp];
+        for (k, &tap) in taps.iter().enumerate() {
+            branches[k % interp][k / interp] = tap;
+        }
+
+        Self {
+            branches,
+            interp,
+            decim,
+            history: vec![0.0; taps_per_branch - 1],
+            phase: 0,
+            offset: 0,
+        }
+    }
+
+    pub fn process(&mut self, input: &[f32], output: &mut [f32]) -> usize {
+        assert!(output.len() >= (input.len() * self.interp).div_ceil(self.decim));
+        let taps_per_branch = self.branches[0].len();
+        let hist_len = taps_per_branch - 1;
+
+        // Build working buffer: history + new input
+        // history holds the last (taps_per_branch-1) samples from previous block
+        let mut buf = Vec::with_capacity(hist_len + input.len());
+        buf.extend_from_slice(&self.history);
+        buf.extend_from_slice(input);
+
+        let mut pos = self.offset;  // position in buf (not input)
+        let mut pos_out: usize = 0;
+    
+        while pos + taps_per_branch <= buf.len() {
+            // Dot product: branch[phase] against buf[pos..pos+taps_per_branch]
+            let branch = &self.branches[self.phase];
+            let window = &buf[pos..pos + taps_per_branch];
+            let out: f32 = branch.iter()
+                .zip(window.iter())
+                .map(|(h, x)| h * x)
+                .sum();
+            // output.push(out);
+            output[pos_out] = out;
+            pos_out += 1;
+
+            // Advance phase and position
+            self.phase += self.decim;
+            pos        += self.phase / self.interp;  // integer div = input samples to skip
+            self.phase  = self.phase % self.interp;
+        }
+
+        // Save carry: how far into next input block we already are
+        // pos is in buf coordinates (includes hist_len offset)
+        // convert back to input coordinates
+        // self.offset = pos.saturating_sub(hist_len + input.len());
+        self.offset = pos - input.len();
+
+        // Save history: last (taps_per_branch-1) samples of input
+        let keep_from = input.len().saturating_sub(hist_len);
+        self.history.clear();
+        // pad with zeros if input was shorter than history
+        for _ in input.len().min(hist_len)..hist_len {
+            self.history.push(0.0);
+        }
+        self.history.extend_from_slice(&input[keep_from..]);
+        pos_out
+    }
+}
+
+fn gcd(a: usize, b: usize) -> usize {
+    if b == 0 { a } else { gcd(b, a % b) }
+}
+
 
 /// That high-pass filter for both I & Q channel
 pub struct IqDcBlocker<const N: usize> {
@@ -130,195 +449,6 @@ impl Xlator {
     }
 }
 
-/// 3-stage decimation for WFM
-/// Input: [f32; 8192] ~ 2.4MHz
-/// Stage 1: 27 taps, step size 4, output of 2 [f32; 2048] ~ 600kHz
-/// Stage 2: 69 taps, step size 2, output of 2 [f32; 1024] ~ 300kHz
-/// Stage 3: 152 taps, step size 1, channel LFP (lowpass filter)
-pub struct DecimationWFM {
-    stage_1: FIRFilter<8218, 27>,   // 26 + 8192, 27 taps, 2048 output
-    stage_2: FIRFilter<2116, 69>,   // 68 + 2048, 69 taps, 1024 output
-    stage_3: FIRFilter<1175, 152>,   // 151 + 1024, 152 taps, 1024 output
-}
-
-impl DecimationWFM {
-    pub fn new() -> Self {
-        let lfp_taps = Self::lowpass::<152>(75_000_f32, 7_500_f32, 300_000_f32);
-        Self {
-            stage_1: FIRFilter::<8218, 27>::new(&TAPS_27, 8192),
-            stage_2: FIRFilter::<2116, 69>::new(&TAPS_69, 2048),
-            stage_3: FIRFilter::<1175, 152>::new(&lfp_taps, 1024),
-        }
-    }
-
-    pub fn process(
-        &mut self,
-        i: &[f32],
-        q: &[f32],
-        out_i: &mut [f32; 1024],
-        out_q: &mut [f32; 1024],
-    ) {
-        assert_eq!(8192, i.len());
-        assert_eq!(8192, q.len());
-        // Returned number of sample processed
-        self.stage_1.read_to_buf(i, q);
-
-        // Write output directly to next stage buf
-        let _sample_count_1 = self.stage_1.process(
-            4, 2048,
-            &mut self.stage_2.buf_i[68..],
-            &mut self.stage_2.buf_q[68..]
-            );
-        let _sample_count_2 = self.stage_2.process(
-            2, 1024,
-            &mut self.stage_3.buf_i[151..],
-            &mut self.stage_3.buf_q[151..]
-            );
-        let _sample_count_3 = self.stage_3.process(1, 1024, out_i, out_q);
-    }
-
-    fn sinc(x: f32) -> f32 {
-        if x == 0.0 { 1.0 } else { x.sin() / x }
-    }
-
-    fn nuttall(n: f32, big_n: f32) -> f32 {
-        use std::f32::consts::PI;
-        0.355768
-            - 0.487396 * (2.0 * PI * n / big_n).cos()
-            + 0.144232 * (4.0 * PI * n / big_n).cos()
-            - 0.012604 * (6.0 * PI * n / big_n).cos()
-    }
-
-    /// Create a lowpass taps
-    fn lowpass<const T: usize>(cutoff: f32, trans: f32, sample_rate: f32) -> [f32; T] {
-        let count = (3.8 * sample_rate / trans ) as usize;      // Nuttall main-lobe width
-        let omega = 2.0 * std::f32::consts::PI * cutoff / sample_rate;
-        let half  = count as f32 / 2.0;
-        let corr  = omega / std::f32::consts::PI;     // DC-gain normalization
-
-        array::from_fn(|i| {
-            let t = i as f32 - half + 0.5;            // half-sample offset
-            Self::sinc(t * omega) * Self::nuttall(t - half, count as f32) * corr
-        })
-    }
-}
-
-impl Default for DecimationWFM {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// A struct holding I and Q channel as separated array so vectorization is possible.
-/// A buffer channel I/Q of hold history of past
-/// For example:
-/// - Input channel I having size of 8192, output having size of 2048
-/// - Taps length is 27
-/// - History part having size 26, new input part having size of 8192,
-///   together they form an array of 26 + 8192
-/// - New input is written into buffer from index 26
-///
-/// In the signature of struct:
-/// - T: tap size, for example 27 26 + 8192
-/// - N: input size
-/// - B: T - 1 + input size
-pub struct FIRFilter<const B: usize, const T: usize> {
-    taps: [f32; T],
-    buf_i: [f32; B],
-    buf_q: [f32; B],
-    input_size: usize,
-    offset: usize,
-}
-
-impl<const B: usize, const T: usize> FIRFilter<B, T> {
-    pub fn new(taps: &[f32; T], input_size: usize) -> Self {
-        assert_eq!(B, T - 1 + input_size);
-        Self {
-            taps: *taps,
-            buf_i: array::from_fn(|_| 0.0f32),
-            buf_q: array::from_fn(|_| 0.0f32),
-            input_size,
-            offset: 0,
-        }
-    }
-
-    /// Copy into buf from index T - 1
-    pub fn read_to_buf(&mut self, i: &[f32], q: &[f32]) {
-        // Copy inputs into buf first
-        let hist = B - self.input_size;
-        self.buf_i[hist..hist + self.input_size].copy_from_slice(i);
-        self.buf_q[hist..hist + self.input_size].copy_from_slice(q);
-    }
-
-    /// Decimation includes multipliying a window with an array of taps,
-    /// then sum up to extract a sample
-    /// N is the input size, e.g. 8192, M is output size, e.g. 2048, T is taps size 27
-    pub fn process(
-        &mut self,
-        step_size: usize,
-        output_size: usize,
-        // i: &[f32],
-        // q: &[f32],
-        out_i: &mut [f32],
-        out_q: &mut [f32],
-        ) -> usize
-    {
-        // assert_eq!(self.input_size, out_i.len());
-        assert_eq!(output_size, out_i.len());
-        assert_eq!(output_size, out_q.len());
-        let hist = B - self.input_size;
-
-        // An input of 8192 with step 4 produces 2048 samples
-        let mut count = 0;
-        while self.offset < self.input_size {
-            let w = self.offset..self.offset + T;
-            out_i[count] = Self::dot(&self.buf_i[w.clone()], &self.taps);
-            out_q[count] = Self::dot(&self.buf_q[w.clone()], &self.taps);
-            count += 1;
-            self.offset += step_size;
-        };
-
-        // Carry leftover step into next block
-        self.offset -= self.input_size;
-
-        // Retain last T-1 samples for next process
-        self.buf_i.copy_within(self.input_size..self.input_size+hist, 0);
-        self.buf_q.copy_within(self.input_size..self.input_size+hist, 0);
-        count
-    }
-
-    /// Written like this for vectorization with `target-cpu=native` build option
-    fn dot(x: &[f32], y: &[f32]) -> f32 {
-        assert!(x.len() == y.len());
-        let mut acc_0 = 0.0f32;
-        let mut acc_1 = 0.0f32;
-        let mut acc_2 = 0.0f32;
-        let mut acc_3 = 0.0f32;
-
-        let chunk = x.len()/4;
-        for i in 0..chunk {
-            let base = i*4;
-            acc_0 += x[base] * y[base];
-            acc_1 += x[base + 1] * y[base + 1];
-            acc_2 += x[base + 2] * y[base + 2];
-            acc_3 += x[base + 3] * y[base + 3];
-        };
-
-        let mut acc_tail = 0.0f32;
-        let remainder_start = chunk * 4;
-        for i in remainder_start..x.len() {
-            acc_tail += x[i] * y[i]
-        };
-
-        acc_0 + acc_1 + acc_2 + acc_3 + acc_tail
-
-    }
-
-    pub fn set_iq(&mut self, idx: usize, i: f32, q: f32) {
-        (self.buf_i[idx], self.buf_q[idx]) = (i, q);
-    }
-}
-
 pub struct Demodulation {
     prev_i: f32,
     prev_q: f32,
@@ -362,13 +492,6 @@ impl Deemphasis {
           self.last_out = *x;
         }
     }
-}
-
-
-/// A sinc function to reconstruct continuous sample from discrete one
-pub fn sinc(x: f32) -> f32 {
-    if x.abs() < 1e-6 { 1.0 }
-    else { (std::f32::consts::PI * x).sin() / (std::f32::consts::PI * x) }
 }
 
 pub fn hann(x: f32, half_width: f32) -> f32 {
@@ -462,10 +585,41 @@ impl<const N: usize> PartialWriter<N> {
 mod tests {
     use super::*;
 
+    fn assert_filter(taps: &[f32]) {
+        // 1. DC gain should be 1.0 (sum of taps)
+        let dc_gain: f32 = taps.iter().sum();
+        println!("taps {:?}", taps);
+        println!("dc gain {dc_gain}");
+        assert!((dc_gain - 1.0).abs() < 1e-3);
+
+        // 2. Filter should be symmetric (linear phase)
+        let n = taps.len();
+        let max_asymmetry = (0..n/2)
+            .map(|k| (taps[k] - taps[n-1-k]).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_asymmetry.abs() < 1e-6);
+
+        // 3. Nyquist gain should be near 0 for low-pass
+        // Evaluate at Nyquist: alternating sum
+        // let nyquist_gain: f32 = taps.iter()
+        //     .enumerate()
+        //     .map(|(k, &h)| if k % 2 == 0 { h } else { -h })
+        //     .sum::<f32>()
+        //     .abs();
+        // println!("Nyquist gain: {:.6}  (should be ~0 for lowpass)", nyquist_gain);
+    }
+
     #[test]
     fn test_wrapped() {
         let size: usize = 16;
         assert_eq!(next_wrapped(1, size), 2usize);
         assert_eq!(next_wrapped(15, size), 0);
+    }
+
+    #[test]
+    fn test_filter() {
+        let sample_rate = 300_000.0_f32;
+        let filter_hann = create_taps::<51>(FilterType::Lowpass, 3000.0f32, sample_rate, Window::Hann, None);
+        assert_filter(&filter_hann);
     }
 }
