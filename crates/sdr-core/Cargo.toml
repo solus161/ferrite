@@ -1,0 +1,12 @@
+[package]
+name = "sdr-core"
+version.workspace = true
+edition.workspace = true
+
+# Deliberately empty. Nothing here may reach for cpal, ratatui or rtlsdr_mt —
+# the crate boundary is what enforces that, rather than discipline.
+[dependencies]
+
+[[bench]]
+name = "ring_vs_mutex"
+harness = false

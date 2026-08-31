@@ -3,7 +3,9 @@ use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
 };
 
-use rust_radio::{source::AUDIO_DECIM, spmc::RingConsumer};
+use sdr_core::spmc::RingConsumer;
+
+use crate::source::source::{AUDIO_DECIM, CPAL_BLOCK, IQ_SLOTS};
 
 pub struct Speaker {
     stream: Stream,
@@ -14,7 +16,7 @@ pub struct Speaker {
 impl Speaker {
     /// `T` is pinned to `f32` because the callback writes straight into cpal's
     /// `&mut [f32]` — there is no meaningful conversion from an arbitrary `T`.
-    pub fn new<const N: usize, const M: usize>(consumer: RingConsumer<f32, N, M>) -> Self {
+    pub fn new(consumer: RingConsumer<f32, IQ_SLOTS, CPAL_BLOCK>) -> Self {
         let host = cpal::default_host();
         let device = host
             .default_output_device()
@@ -27,6 +29,7 @@ impl Speaker {
             .default_output_config()
             .expect("Error getting config for default output");
         let channels = out_cfg.channels() as usize;
+        println!("channels {}", &channels);
         let audio_rate = out_cfg.sample_rate(); // u32 in cpal 0.18
         let rtl_rate = audio_rate * AUDIO_DECIM;
 
@@ -41,26 +44,31 @@ impl Speaker {
             buffer_size: cpal::BufferSize::Default,
         };
 
-        // Staging copy of one ring block. cpal asks for an arbitrary frame count
-        // per callback while the ring hands out fixed M-sample blocks, so the
-        // remainder has to survive between callbacks.
-        //
-        // Filled via `read_into`, which copies before releasing the slot. Doing
-        // it the other way round — `read()` then copy — leaves a window where the
-        // producer can overwrite the block mid-copy, and an audio callback is a
-        // prime candidate for being preempted inside it.
-        let mut staging = [0.0f32; M];
-        let mut pos = M; // start "drained" so the first callback pulls a block
-
-        // cpal drives this callback on its own real-time thread.
+        let mut staging = [0.0f32; CPAL_BLOCK];
+        let mut pos = CPAL_BLOCK;
         let stream = device
             .build_output_stream(
                 config,
                 move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                    // Rates, per second:
+                    // - the SDR delivers 16,384 bytes = 8192 IQ pairs per USB
+                    //   transfer at 2.4 MS/s: 293 transfers/s, 3.41 ms apart.
+                    //   Each yields 163 or 164 audio samples (8192/50 = 163.84),
+                    //   which `push` accumulates into CPAL_BLOCK-sized blocks.
+                    // - cpal asks for 512 frames at 48 kHz: 93.8 calls/s,
+                    //   10.7 ms apart, so one callback drains ~3.1 ring blocks.
+                    //
+                    // The 163.84 is fractional, so ring blocks never align with
+                    // USB transfers. That is harmless because `push` carries the
+                    // fill position in the producer: block edges and transfer
+                    // edges are independent, and the sample stream stays
+                    // contiguous across both.
                     for frame in data.chunks_mut(channels) {
-                        if pos == M {
+                        if pos == CPAL_BLOCK {
                             match consumer.read_into(&mut staging) {
-                                Ok(()) => pos = 0,
+                                Ok(_) => {
+                                    pos = 0;
+                                }
                                 Err(_) => {
                                     // Ring empty — underrun. Emit silence for this
                                     // frame and retry on the next one, so a block

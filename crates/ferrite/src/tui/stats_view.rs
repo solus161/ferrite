@@ -1,5 +1,5 @@
-use std::rc::Rc;
 use std::cell::Cell;
+use std::rc::Rc;
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -7,7 +7,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Widget};
 
-use super::control_signal::CtrlSignal;
+use sdr_core::control_signal::CtrlSignal;
 
 pub struct StatsView {
     tuner_view: TunerView,
@@ -23,12 +23,12 @@ impl StatsView {
         gain_db: Rc<Cell<u32>>,
         bw: Rc<Cell<u32>>,
         ppm: Rc<Cell<u32>>,
-        ) -> Self {
-        Self { 
+    ) -> Self {
+        Self {
             tuner_view: TunerView::new(center_freq, step, gain_db, bw, ppm),
             info_view: InfoView {},
             mode_view: ModeView {},
-            key_view: KeyView {}
+            key_view: KeyView {},
         }
     }
 
@@ -46,8 +46,8 @@ impl StatsView {
 
 impl Widget for &StatsView {
     fn render(self, area: Rect, buf: &mut Buffer)
-        where
-            Self: Sized
+    where
+        Self: Sized,
     {
         // Overall layout include tuner, info, mode, and key
         let [area_tuner, area_info, area_mode, area_key] = Layout::vertical([
@@ -55,15 +55,15 @@ impl Widget for &StatsView {
             Constraint::Percentage(25),
             Constraint::Percentage(25),
             Constraint::Percentage(25),
-        ]).areas(area);
-        
+        ])
+        .areas(area);
+
         self.tuner_view.render(area_tuner, buf);
         self.info_view.render(area_info, buf);
         self.mode_view.render(area_mode, buf);
-        self.key_view.render(area_key, buf); 
+        self.key_view.render(area_key, buf);
     }
 }
-
 
 /// R820T/R828D tuning range. Clamping here rather than letting the device
 /// reject the call keeps the display honest — an out-of-range value would
@@ -125,7 +125,11 @@ impl Field {
     fn adjust(self, v: &TunerView, dir: i32) -> Option<CtrlSignal> {
         match self {
             Field::Freq => {
-                let hz = offset(v.center_freq.get(), v.step.get() as i64 * dir as i64, FREQ_RANGE);
+                let hz = offset(
+                    v.center_freq.get(),
+                    v.step.get() as i64 * dir as i64,
+                    FREQ_RANGE,
+                );
                 v.center_freq.set(hz);
                 Some(CtrlSignal::CenterHz(hz))
             }
@@ -170,7 +174,11 @@ fn rung(ladder: &[u32], cur: u32, dir: i32) -> u32 {
         .min_by_key(|&i| ladder[i].abs_diff(cur))
         .unwrap_or(0);
 
-    let j = if dir > 0 { (i + 1).min(ladder.len() - 1) } else { i.saturating_sub(1) };
+    let j = if dir > 0 {
+        (i + 1).min(ladder.len() - 1)
+    } else {
+        i.saturating_sub(1)
+    };
     ladder[j]
 }
 
@@ -191,7 +199,7 @@ impl TunerView {
         gain_db: Rc<Cell<u32>>,
         bw: Rc<Cell<u32>>,
         ppm: Rc<Cell<u32>>,
-        ) -> Self {
+    ) -> Self {
         Self {
             center_freq,
             step,

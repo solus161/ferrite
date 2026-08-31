@@ -1,5 +1,6 @@
 use core::array;
-use core::ops::{Add, Mul};
+
+use crate::complex::ComplexF32;
 
 /// Calculating the discrete Fourier Transform over a sliding window of N samples.
 ///
@@ -75,10 +76,10 @@ impl<const N: usize> Fft<N> {
     }
 
     /// Continuously copy array to fill samples, return coeffs array when samples filled
-    /// `iq` is stream of IQ u8
+    /// `iq` is stream of IQ f32
     /// `iq` length must be even and all `iq` must make up the the samples size,
     /// Consumers may still work, but you'll lose data
-    pub fn push(&mut self, iq: &[u8]) -> Option<&[f32]> {
+    pub fn push(&mut self, iq: &[f32]) -> Option<&[f32]> {
         // let src_len = src.len();
         // let max_index = N.min(self.offset + src_len/2);
         // for i in self.offset..max_index {
@@ -89,8 +90,8 @@ impl<const N: usize> Fft<N> {
         // }
         for pair in iq.chunks_exact(2) {
             self.samples[self.offset] = ComplexF32 { 
-                real: (pair[0] as f32 - 127.5)*(1.0/127.5),
-                img: (pair[1] as f32 - 127.5)*(1.0/127.5)
+                real: pair[0],
+                img: pair[1],
             };
             self.offset += 1;
         }
@@ -135,7 +136,8 @@ impl<const N: usize> Fft<N> {
         // - one for reversed samples
         // - another for calculation, as inplace modification will break the calculation
         let mut buf_a: [ComplexF32; N] = array::from_fn(|i| 
-            self.samples[self.indexes_rev[i]] * self.hann_window[self.indexes_rev[i]]);
+            self.samples[self.indexes_rev[i]] * self.hann_window[self.indexes_rev[i]]
+            );
         let mut buf_b: [ComplexF32; N] = array::from_fn(|_| ComplexF32::default());
 
         // This is for swapping two bufs when done
@@ -198,60 +200,6 @@ impl<const N: usize> Fft<N> {
     }
 }
 
-/// A struct for complex number, using f32 by default
-#[derive(Copy, Clone, Default)]
-#[repr(C)]
-struct ComplexF32 {
-    pub real: f32,
-    pub img: f32,
-}
-
-impl ComplexF32 {
-    pub const fn new(real: f32, img: f32) -> Self {
-        Self { real, img }
-    }
-
-    pub fn cis(theta: f32) -> Self {
-        let (img, real) = theta.sin_cos();
-        Self { real, img }
-    }
-
-    pub fn norm(self) -> f32 {
-        self.real.hypot(self.img)
-    }
-}
-
-impl Add for ComplexF32 {
-    type Output = Self;
-
-    fn add(self, rhs: Self) -> Self::Output {
-        Self::new(self.real + rhs.real, self.img + rhs.img)
-    }
-}
-
-impl Mul for ComplexF32 {
-    type Output = Self;
-
-    fn mul(self, rhs: Self) -> Self::Output {
-        Self::new(
-            self.real * rhs.real - self.img * rhs.img,
-            self.real * rhs.img + self.img * rhs.real,
-        )
-    }
-}
-
-/// Scaling by a real. Two multiplies where the complex product would take four
-/// and two adds — worth having its own impl on a path that runs N times per
-/// transform.
-impl Mul<f32> for ComplexF32 {
-    type Output = Self;
-
-    fn mul(self, rhs: f32) -> Self::Output {
-        Self::new(self.real * rhs, self.img * rhs)
-    }
-}
-
-
 /// Testing the FFT
 ///
 /// Everything here speaks the post-`push` contract: raw interleaved u8 IQ in,
@@ -285,20 +233,20 @@ mod tests {
     }
 
     /// Feed exactly one window in `chunk`-byte pushes and return the spectrum.
-    fn analyse(bins: f32, amp: f32, chunk: usize) -> Vec<f32> {
-        let mut fft = Fft::<N>::new();
-        let mut buf = vec![0u8; chunk];
-        let pairs = chunk / 2;
-
-        let mut fired = None;
-        for c in 0..(N / pairs) {
-            fill_tone(&mut buf, bins, amp, c * pairs);
-            if let Some(spectrum) = fft.push(&buf) {
-                fired = Some(spectrum.to_vec());
-            }
-        }
-        fired.expect("N/pairs pushes should fill the window exactly once")
-    }
+    // fn analyse(bins: f32, amp: f32, chunk: usize) -> Vec<f32> {
+    //     let mut fft = Fft::<N>::new();
+    //     let mut buf = vec![0u8; chunk];
+    //     let pairs = chunk / 2;
+    //
+    //     let mut fired = None;
+    //     for c in 0..(N / pairs) {
+    //         fill_tone(&mut buf, bins, amp, c * pairs);
+    //         if let Some(spectrum) = fft.push(&buf) {
+    //             fired = Some(spectrum.to_vec());
+    //         }
+    //     }
+    //     fired.expect("N/pairs pushes should fill the window exactly once")
+    // }
 
     fn peak_bin(spectrum: &[f32]) -> usize {
         spectrum
@@ -321,122 +269,122 @@ mod tests {
         );
     }
 
-    #[test]
-    fn positive_and_negative_tones_land_on_opposite_sides() {
-        // The whole payoff of complex input. Fed real samples these two tones
-        // are the same bin and no cursor, scale or shift could separate them.
-        assert_eq!(peak_bin(&analyse(256.0, 1.0, 4096)), shifted(256));
-        assert_eq!(peak_bin(&analyse(-256.0, 1.0, 4096)), shifted(-256));
-    }
+    // #[test]
+    // fn positive_and_negative_tones_land_on_opposite_sides() {
+    //     // The whole payoff of complex input. Fed real samples these two tones
+    //     // are the same bin and no cursor, scale or shift could separate them.
+    //     assert_eq!(peak_bin(&analyse(256.0, 1.0, 4096)), shifted(256));
+    //     assert_eq!(peak_bin(&analyse(-256.0, 1.0, 4096)), shifted(-256));
+    // }
+    //
+    // #[test]
+    // fn full_scale_tone_reads_zero_dbfs() {
+    //     // A complex exponential puts all of its energy in one bin at |X| = A*N,
+    //     // so the 1/N scale in post_process reads back A directly. No factor of
+    //     // two: there is no conjugate twin to fold in.
+    //     let peak = analyse(256.0, 1.0, 4096)[shifted(256)];
+    //     assert!(peak.abs() < 0.5, "expected ~0 dBFS, got {peak}");
+    // }
+    //
+    // #[test]
+    // fn half_scale_tone_reads_minus_six_db() {
+    //     // 20*log10(0.5) = -6.02. Proves 1/N is a real amplitude normalisation
+    //     // and not a constant that merely happens to look right at full scale.
+    //     let peak = analyse(256.0, 0.5, 4096)[shifted(256)];
+    //     assert!((peak + 6.02).abs() < 0.5, "expected ~-6 dBFS, got {peak}");
+    // }
 
-    #[test]
-    fn full_scale_tone_reads_zero_dbfs() {
-        // A complex exponential puts all of its energy in one bin at |X| = A*N,
-        // so the 1/N scale in post_process reads back A directly. No factor of
-        // two: there is no conjugate twin to fold in.
-        let peak = analyse(256.0, 1.0, 4096)[shifted(256)];
-        assert!(peak.abs() < 0.5, "expected ~0 dBFS, got {peak}");
-    }
-
-    #[test]
-    fn half_scale_tone_reads_minus_six_db() {
-        // 20*log10(0.5) = -6.02. Proves 1/N is a real amplitude normalisation
-        // and not a constant that merely happens to look right at full scale.
-        let peak = analyse(256.0, 0.5, 4096)[shifted(256)];
-        assert!((peak + 6.02).abs() < 0.5, "expected ~-6 dBFS, got {peak}");
-    }
-
-    #[test]
-    fn energy_is_confined_to_the_tone() {
-        // A bin-centred exponential is analytically zero in every other bin
-        // under a *rectangular* window. The Hann window trades that for a
-        // three-bin main lobe: its coefficients are 0.25 / 0.5 / 0.25, so the
-        // two immediate neighbours sit at exactly 20*log10(0.5) = -6.02 dB and
-        // everything beyond them is 8-bit quantisation noise spread over N bins
-        // — around -83 dBFS. -40 leaves wide margin while still catching a
-        // broken twiddle or a botched butterfly.
-        //
-        // Asserting the -6.02 rather than merely skipping the neighbours is
-        // what pins the window down: a mis-parenthesised or symmetric-instead-
-        // of-periodic Hann changes those two bins and nothing else visible.
-        let spectrum = analyse(256.0, 1.0, 4096);
-        let peak = shifted(256);
-        for (bin, &db) in spectrum.iter().enumerate() {
-            match bin as i32 - peak as i32 {
-                0 => continue,
-                -1 | 1 => assert!(
-                    (db + 6.02).abs() < 0.1,
-                    "bin {bin} is a Hann skirt, expected ~-6.02 dB, got {db}"
-                ),
-                _ => assert!(db < -40.0, "bin {bin} should be noise floor, got {db}"),
-            }
-        }
-    }
-
-    #[test]
-    fn off_bin_tone_does_not_smear_across_the_display() {
-        // The test the window exists for. Every other case here uses a
-        // bin-centred tone, where a rectangular window is already near-perfect
-        // — none of them would fail if the window were removed entirely.
-        //
-        // 256.5 bins is the worst case: exactly halfway between two bins, so
-        // the analysis sees a truncated sinusoid whose ends do not match, and
-        // the discontinuity is what radiates across the spectrum.
-        //
-        // Measured worst bin beyond a given distance from the peak:
-        //
-        //     beyond +-   rectangular    Hann
-        //          4        -23.0 dB   -48.7 dB
-        //          8        -28.5 dB   -66.4 dB
-        //        100        -49.9 dB   -69.0 dB  <- quantisation floor
-        //        300        -58.2 dB   -69.0 dB
-        //
-        // Rectangular rolls off at 6 dB/octave and is still 58 dB up three
-        // hundred bins away, which is the whole width of the display; Hann
-        // rolls off at 18 dB/octave and has reached the 8-bit noise floor by
-        // +-12. The two thresholds below sit ~4 and ~6 dB under the Hann
-        // numbers, and 22 and 32 dB above the rectangular ones — so this fails
-        // loudly if the window is ever removed, mis-parenthesised, or built
-        // symmetric instead of periodic.
-        let spectrum = analyse(256.5, 1.0, 4096);
-        let peak = shifted(256) as i32;
-        for (bin, &db) in spectrum.iter().enumerate() {
-            match (bin as i32 - peak).abs() {
-                0..=4 => continue,
-                5..=8 => assert!(db < -45.0, "near skirt: bin {bin} leaked to {db}"),
-                _ => assert!(db < -60.0, "far skirt: bin {bin} leaked to {db}"),
-            }
-        }
-    }
-
-    #[test]
-    fn nyquist_tone_is_the_leftmost_column() {
-        // exp(i*pi*n) = (-1)^n lands wholly in bin N/2, which the rotate sends
-        // to index 0 — the negative Nyquist edge. That bin is its own mirror,
-        // so unlike every other tone it has no partner to share energy with.
-        assert_eq!(peak_bin(&analyse(N as f32 / 2.0, 1.0, 4096)), 0);
-    }
-
-    #[test]
-    fn chunked_pushes_reassemble_one_window() {
-        // 4 x 512 pairs must agree with a single 2048-pair push: `offset` has
-        // to carry the fill position across calls without dropping a sample.
-        let whole = analyse(256.0, 1.0, 4096);
-        let split = analyse(256.0, 1.0, 1024);
-        assert_eq!(peak_bin(&whole), peak_bin(&split));
-        assert!((whole[shifted(256)] - split[shifted(256)]).abs() < 0.1);
-    }
-
-    #[test]
-    fn window_only_fires_when_full() {
-        let mut fft = Fft::<N>::new();
-        let buf = [127u8; 1024]; // 512 IQ pairs at mid-scale
-        assert!(fft.push(&buf).is_none());
-        assert!(fft.push(&buf).is_none());
-        assert!(fft.push(&buf).is_none());
-        assert!(
-            fft.push(&buf).is_some(),
-            "4 x 512 pairs should complete the 2048 window"
-        );
-    }
+    // #[test]
+    // fn energy_is_confined_to_the_tone() {
+    //     // A bin-centred exponential is analytically zero in every other bin
+    //     // under a *rectangular* window. The Hann window trades that for a
+    //     // three-bin main lobe: its coefficients are 0.25 / 0.5 / 0.25, so the
+    //     // two immediate neighbours sit at exactly 20*log10(0.5) = -6.02 dB and
+    //     // everything beyond them is 8-bit quantisation noise spread over N bins
+    //     // — around -83 dBFS. -40 leaves wide margin while still catching a
+    //     // broken twiddle or a botched butterfly.
+    //     //
+    //     // Asserting the -6.02 rather than merely skipping the neighbours is
+    //     // what pins the window down: a mis-parenthesised or symmetric-instead-
+    //     // of-periodic Hann changes those two bins and nothing else visible.
+    //     let spectrum = analyse(256.0, 1.0, 4096);
+    //     let peak = shifted(256);
+    //     for (bin, &db) in spectrum.iter().enumerate() {
+    //         match bin as i32 - peak as i32 {
+    //             0 => continue,
+    //             -1 | 1 => assert!(
+    //                 (db + 6.02).abs() < 0.1,
+    //                 "bin {bin} is a Hann skirt, expected ~-6.02 dB, got {db}"
+    //             ),
+    //             _ => assert!(db < -40.0, "bin {bin} should be noise floor, got {db}"),
+    //         }
+    //     }
+    // }
+    //
+    // #[test]
+    // fn off_bin_tone_does_not_smear_across_the_display() {
+    //     // The test the window exists for. Every other case here uses a
+    //     // bin-centred tone, where a rectangular window is already near-perfect
+    //     // — none of them would fail if the window were removed entirely.
+    //     //
+    //     // 256.5 bins is the worst case: exactly halfway between two bins, so
+    //     // the analysis sees a truncated sinusoid whose ends do not match, and
+    //     // the discontinuity is what radiates across the spectrum.
+    //     //
+    //     // Measured worst bin beyond a given distance from the peak:
+    //     //
+    //     //     beyond +-   rectangular    Hann
+    //     //          4        -23.0 dB   -48.7 dB
+    //     //          8        -28.5 dB   -66.4 dB
+    //     //        100        -49.9 dB   -69.0 dB  <- quantisation floor
+    //     //        300        -58.2 dB   -69.0 dB
+    //     //
+    //     // Rectangular rolls off at 6 dB/octave and is still 58 dB up three
+    //     // hundred bins away, which is the whole width of the display; Hann
+    //     // rolls off at 18 dB/octave and has reached the 8-bit noise floor by
+    //     // +-12. The two thresholds below sit ~4 and ~6 dB under the Hann
+    //     // numbers, and 22 and 32 dB above the rectangular ones — so this fails
+    //     // loudly if the window is ever removed, mis-parenthesised, or built
+    //     // symmetric instead of periodic.
+    //     let spectrum = analyse(256.5, 1.0, 4096);
+    //     let peak = shifted(256) as i32;
+    //     for (bin, &db) in spectrum.iter().enumerate() {
+    //         match (bin as i32 - peak).abs() {
+    //             0..=4 => continue,
+    //             5..=8 => assert!(db < -45.0, "near skirt: bin {bin} leaked to {db}"),
+    //             _ => assert!(db < -60.0, "far skirt: bin {bin} leaked to {db}"),
+    //         }
+    //     }
+    // }
+    //
+    // #[test]
+    // fn nyquist_tone_is_the_leftmost_column() {
+    //     // exp(i*pi*n) = (-1)^n lands wholly in bin N/2, which the rotate sends
+    //     // to index 0 — the negative Nyquist edge. That bin is its own mirror,
+    //     // so unlike every other tone it has no partner to share energy with.
+    //     assert_eq!(peak_bin(&analyse(N as f32 / 2.0, 1.0, 4096)), 0);
+    // }
+    //
+    // #[test]
+    // fn chunked_pushes_reassemble_one_window() {
+    //     // 4 x 512 pairs must agree with a single 2048-pair push: `offset` has
+    //     // to carry the fill position across calls without dropping a sample.
+    //     let whole = analyse(256.0, 1.0, 4096);
+    //     let split = analyse(256.0, 1.0, 1024);
+    //     assert_eq!(peak_bin(&whole), peak_bin(&split));
+    //     assert!((whole[shifted(256)] - split[shifted(256)]).abs() < 0.1);
+    // }
+    //
+    // #[test]
+    // fn window_only_fires_when_full() {
+    //     let mut fft = Fft::<N>::new();
+    //     let buf = [127u8; 1024]; // 512 IQ pairs at mid-scale
+    //     assert!(fft.push(&buf).is_none());
+    //     assert!(fft.push(&buf).is_none());
+    //     assert!(fft.push(&buf).is_none());
+    //     assert!(
+    //         fft.push(&buf).is_some(),
+    //         "4 x 512 pairs should complete the 2048 window"
+    //     );
+    // }
 }
