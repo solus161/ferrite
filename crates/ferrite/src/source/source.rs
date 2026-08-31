@@ -52,21 +52,38 @@ pub const IQ_BLOCK: usize = 16384;
 /// back to 0 Hz on the stage-1 decimation, undoing the whole exercise.
 pub const OFFSET_TUNING_HZ: u32 = 350_000;
 
-/// Snap a whole-dB request to the nearest gain the tuner actually supports,
-/// returning librtlsdr's tenths-of-a-dB units.
+/// The tuner's IF filter width for a given channel width.
+///
+/// The filter is centred on the LO, which offset tuning parks
+/// [`OFFSET_TUNING_HZ`] *below* the station, so it has to reach past the offset
+/// to the far edge of the channel rather than merely span the channel:
+/// `2 × (350k + 150k)` = 1.0 MHz for a 300 kHz channel. Both the initial setup
+/// and the retune path go through here, because applying a channel width raw
+/// sets a filter narrower than the offset and mutes the radio.
+fn tuner_bandwidth(channel_hz: u32) -> u32 {
+    2 * (OFFSET_TUNING_HZ + channel_hz / 2)
+}
+
+/// Snap a request in librtlsdr's tenths of a dB to the nearest gain the tuner
+/// actually supports.
 ///
 /// The supported set is discrete and tuner-specific (an R820T offers 29 steps
-/// from 0 to 49.6 dB, an FC0013 far fewer), so an arbitrary dB value is not
-/// generally settable. librtlsdr does not reject an unsupported value — it
-/// quietly applies something else — so snapping here is what makes the number
-/// the UI shows the number the hardware is using.
-fn snap_gain(gains: &[i32], db: u32) -> i32 {
-    let want = db as i32 * 10;
+/// from 0 to 49.6 dB, an FC0013 23 in three clusters with ~11 dB gaps), so an
+/// arbitrary value is not generally settable. librtlsdr does not reject an
+/// unsupported one — it quietly applies something else — so snapping here is
+/// what makes the number the UI shows the number the hardware is using.
+fn snap_gain_tenths(gains: &[i32], want: i32) -> i32 {
     gains
         .iter()
         .copied()
         .min_by_key(|g| (g - want).abs())
         .unwrap_or(want)
+}
+
+/// Whole dB, for the startup request that comes from a config rather than from
+/// the table.
+fn snap_gain(gains: &[i32], db: u32) -> i32 {
+    snap_gain_tenths(gains, db as i32 * 10)
 }
 
 pub struct Source {
@@ -84,6 +101,12 @@ pub struct Source {
     /// The gain the tuner actually accepted, in librtlsdr's tenths of a dB.
     /// Not necessarily what was asked for — see [`snap_gain`].
     pub applied_gain_tenths: i32,
+
+    /// Every gain this tuner offers, tenths of a dB, ascending. Handed to the
+    /// Control panel so its Gain row steps the real table instead of whole dB —
+    /// on an FC0013 most whole-dB steps land in an ~11 dB dead zone and change
+    /// nothing.
+    pub gain_table: Vec<i32>,
 }
 
 impl Source {
@@ -103,10 +126,7 @@ impl Source {
         ctl.set_center_freq(lo)
             .expect(&CustomError::RtlSetFreq(lo).to_string());
 
-        // The tuner's IF filter is centred on the LO, so it must reach past the
-        // offset to the far edge of the channel — not just span the channel.
-        // 2 * (350k + 150k) = 1.0 MHz for a 300 kHz channel.
-        let tuner_bw = 2 * (OFFSET_TUNING_HZ + bandwidth / 2);
+        let tuner_bw = tuner_bandwidth(bandwidth);
         ctl.set_bandwidth(tuner_bw)
             .expect(&CustomError::RtlSetBandwidth(tuner_bw).to_string());
         ctl.set_sample_rate(sample_rate)
@@ -126,10 +146,17 @@ impl Source {
             .expect(&CustomError::RtlDisableAgc.to_string());
 
         let mut gain_buf: rtlsdr_mt::TunerGains = [0; 32];
-        let gains: Vec<i32> = ctl.tuner_gains(&mut gain_buf).to_vec();
+        let mut gains: Vec<i32> = ctl.tuner_gains(&mut gain_buf).to_vec();
+        // The Control panel steps this by index, so ascending order is load
+        // bearing, not cosmetic. librtlsdr's tables happen to be sorted; a
+        // tuner whose table is not would otherwise make the Gain row jump
+        // around.
+        gains.sort_unstable();
+        let gains_for_ui = gains.clone();
+
         let gain = snap_gain(&gains, gain_db);
         ctl.set_tuner_gain(gain)
-            .expect(&CustomError::RtlSetGain(gain_db).to_string());
+            .expect(&CustomError::RtlSetGain(gain).to_string());
 
         println!(
             "tuner gain: {:.1} dB (asked {} dB) | supported: {}",
@@ -155,6 +182,9 @@ impl Source {
         // better than checking within read_async
         let center_freq_clone = center_freq.clone();
         let ctrl_handle = thread::spawn(move || {
+            // Every arm logs rather than printing: stdout is the TUI's once
+            // `ratatui::init()` runs. This thread is not on a deadline path, so
+            // it is allowed to (see `crate::log`).
             while let Ok(sig) = ctrl_rx.recv() {
                 // TODO: handle error, should not expect()
                 match sig {
@@ -167,17 +197,51 @@ impl Source {
                         center_freq_clone.store(freq, Ordering::Release);
                         // ctl.reset_buffer().expect(&CustomError::RtlResetBuffer.to_string());
                     }
-                    CtrlSignal::Bandwidth(bw) => ctl
-                        .set_bandwidth(bw)
-                        .expect(&CustomError::RtlSetBandwidth(bw).to_string()),
+
+                    // The UI sends a *channel* width; the tuner's IF filter is
+                    // centred on the LO and has to reach past the offset to the
+                    // far edge of the channel. Applying the channel width raw
+                    // here — as this arm used to — sets a filter narrower than
+                    // the offset itself and cuts the station out entirely.
+                    CtrlSignal::Bandwidth(bw) => {
+                        let tuner_bw = tuner_bandwidth(bw);
+                        ctl.set_bandwidth(tuner_bw)
+                            .expect(&CustomError::RtlSetBandwidth(tuner_bw).to_string());
+                        log_info!(
+                            "IF filter {:.0} kHz for a {:.0} kHz channel",
+                            tuner_bw as f32 / 1e3,
+                            bw as f32 / 1e3
+                        );
+                    }
+
                     // Snapped against the same table `new` used, so the TUI and
                     // the hardware never disagree about the current gain.
-                    CtrlSignal::Gain(db) => ctl
-                        .set_tuner_gain(snap_gain(&gains, db))
-                        .expect(&CustomError::RtlSetGain(db).to_string()),
+                    // `disable_agc` first because this signal means "manual, at
+                    // this value" — see `CtrlSignal::GainTenths`.
+                    CtrlSignal::GainTenths(tenths) => {
+                        let g = snap_gain_tenths(&gains, tenths);
+                        ctl.disable_agc()
+                            .expect(&CustomError::RtlDisableAgc.to_string());
+                        ctl.set_tuner_gain(g)
+                            .expect(&CustomError::RtlSetGain(g).to_string());
+                        if g != tenths {
+                            log_warn!(
+                                "tuner took {:.1} dB, not {:.1} dB",
+                                g as f32 / 10.0,
+                                tenths as f32 / 10.0
+                            );
+                        }
+                    }
+
+                    CtrlSignal::AgcOn => {
+                        ctl.enable_agc()
+                            .expect(&CustomError::RtlEnableAgc.to_string());
+                    }
+
                     CtrlSignal::Ppm(ppm) => ctl
-                        .set_ppm(ppm as i32)
+                        .set_ppm(ppm)
                         .expect(&CustomError::RtlSetPpm(ppm).to_string()),
+
                     CtrlSignal::Quit => {
                         ctl.cancel_async_read();
                         break;
@@ -194,7 +258,14 @@ impl Source {
             center_freq,
             tuned_freq,
             applied_gain_tenths: gain,
+            gain_table: gains_for_ui,
         }
+    }
+
+    /// What librtlsdr's divider actually rounded the requested rate to. Not
+    /// generally the value passed to [`new`](Self::new).
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate
     }
 
     /// Start receiving from USB, send the self to another thread

@@ -7,12 +7,16 @@
 use std::cell::Cell;
 use std::collections::VecDeque;
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::Ordering::Relaxed;
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::Color;
+use ratatui::style::{Color, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Widget};
+
+use crate::tui::app_states::AppStates;
 
 /// Upper-half block. The foreground paints the top half of the cell and the
 /// background the bottom, so every terminal row carries two waterfall lines.
@@ -40,20 +44,23 @@ pub struct SignalView {
     /// render, so several fold into the one row a frame is allowed to commit.
     pending: Box<[f32]>,
     has_pending: bool,
-    /// Colour range. These two decide whether the display looks like anything;
-    /// they are the knobs worth binding to keys.
-    pub floor_db: f32,
-    pub ceil_db: f32,
-    center_hz: Rc<Cell<u32>>,
-    sample_rate: Rc<Cell<u32>>,
+    /// Colour range. These two decide whether the display looks like anything.
+    /// Shared with the Control panel, which is where they are edited — a copied
+    /// `f32` would let the two drift.
+    floor_db: Rc<Cell<f32>>,
+    ceil_db: Rc<Cell<f32>>,
+    /// Read for the frequency axis only; the spectra themselves arrive through
+    /// `push`.
+    app: Arc<AppStates>,
 }
 
 impl SignalView {
     pub fn new(
         bins: usize,
         history: usize,
-        center_hz: Rc<Cell<u32>>,
-        sample_rate: Rc<Cell<u32>>,
+        app: Arc<AppStates>,
+        floor_db: Rc<Cell<f32>>,
+        ceil_db: Rc<Cell<f32>>,
     ) -> Self {
         Self {
             bins,
@@ -61,10 +68,9 @@ impl SignalView {
             history,
             pending: vec![f32::NEG_INFINITY; bins].into_boxed_slice(),
             has_pending: false,
-            floor_db: -90.0,
-            ceil_db: 0.0,
-            center_hz,
-            sample_rate,
+            floor_db,
+            ceil_db,
+            app,
         }
     }
 
@@ -107,8 +113,9 @@ impl SignalView {
 
     /// dB to RGB across `[floor_db, ceil_db]`, clamped at both ends.
     fn color(&self, db: f32) -> Color {
-        let span = (self.ceil_db - self.floor_db).max(f32::EPSILON);
-        let t = ((db - self.floor_db) / span).clamp(0.0, 1.0);
+        let (floor, ceil) = (self.floor_db.get(), self.ceil_db.get());
+        let span = (ceil - floor).max(f32::EPSILON);
+        let t = ((db - floor) / span).clamp(0.0, 1.0);
 
         let s = t * (STOPS.len() - 1) as f32;
         let i = (s as usize).min(STOPS.len() - 2);
@@ -136,47 +143,33 @@ impl SignalView {
             .fold(f32::NEG_INFINITY, f32::max)
     }
 
-    /// Render the MHz axis on top
+    /// Frequency axis, one row, shared by the spectrum above and the waterfall
+    /// below.
+    ///
+    /// `post_process` rotates DC to the middle, so the display spans
+    /// `center ± sample_rate/2`. Five labels centred in five equal columns
+    /// rather than evenly spaced ticks: the column centres fall on ∓0.4, ∓0.2
+    /// and 0 of that span, no manual padding is needed, and they cannot
+    /// collide.
+    ///
+    /// Signed arithmetic throughout — the low end of the span goes negative on
+    /// a wide sample rate at the bottom of the tuning range, and unsigned would
+    /// wrap it into the gigahertz.
     fn render_mhz_axis(&self, area: Rect, buf: &mut Buffer) {
-        // post_process rotates DC to the middle, so the display spans
-        // center ± sample_rate/2. Three labels aligned to thirds rather than
-        // evenly spaced ticks: no manual padding, and they cannot collide.
-        let sample_rate = self.sample_rate.get();
-        let center_hz = self.center_hz.get();
-        let witdh = area.width;
+        let center_hz = self.app.center_freq.load(Relaxed) as i64;
+        let fifth = self.app.sample_rate.load(Relaxed) as i64 / 5;
 
-        // FFT size of 2048 is represented by area.with, for example 100 columns
-        // and splitted into 10 bins
-        for i in 0..10 {}
-
-        let half = self.sample_rate.get() / 2;
-        let mhz = |hz: u32| format!("{:.1}", hz as f32 / 1e6);
-
-        // 5 bins total
         let cols = Layout::horizontal([Constraint::Ratio(1, 5); 5]).split(area);
-        let bin_range = self.sample_rate.get() / 5;
 
-        let freqs = [
-            center_hz - 2 * bin_range,
-            center_hz - bin_range,
-            center_hz,
-            center_hz + bin_range,
-            center_hz + 2 * bin_range,
-        ];
-
-        cols.iter().zip(freqs).for_each(|(c, f)| {
-            let line = Line::from(mhz(f)).centered();
-            line.render(*c, buf);
-        });
-
-        // let line_left = Line::from(mhz(center_hz - half)).left_aligned();
-        // line_left.render(cols[0], buf);
-        //
-        // let line_center = Line::from(mhz(center_hz)).centered();
-        // line_center.render(cols[1], buf);
-        //
-        // let line_right = Line::from(mhz(center_hz + half)).right_aligned();
-        // line_right.render(cols[2], buf);
+        for (i, col) in cols.iter().enumerate() {
+            let hz = center_hz + (i as i64 - 2) * fifth;
+            Line::styled(
+                format!("{:.3}", hz as f64 / 1e6),
+                Style::new().fg(Color::DarkGray),
+            )
+            .centered()
+            .render(*col, buf);
+        }
     }
 
     fn render_spectrum(&self, area: Rect, buf: &mut Buffer) {
@@ -186,39 +179,39 @@ impl SignalView {
         let width = area.width as usize;
         let height = area.height as usize;
 
-        if let Some(row) = self.rows.get(0) {
-            for x in 0..width {
-                // Get the db, capped it by ceil, get value from floor, get abs
-                let db = self.column(row, x, width);
-                let db_abs = (db.clamp(self.floor_db, self.ceil_db) - self.floor_db).abs();
+        let Some(row) = self.rows.front() else { return };
 
-                // Generate the bar for drawing
-                // TODO: this value needs be computed only when resizing
-                let db_per_row = (self.ceil_db - self.floor_db) / height as f32;
+        let (floor, ceil) = (self.floor_db.get(), self.ceil_db.get());
+        // Height is in whole cells but the blocks give eighths, so the bar is
+        // measured in eighths throughout and split at the end. Doing it the
+        // other way — cells, then a leftover in dB — needs a second division
+        // and lands the partial block off by one.
+        let eighths_per_db = (height * 8) as f32 / (ceil - floor).max(f32::EPSILON);
 
-                let rows_whole = (db_abs / db_per_row) as usize;
-                let db_remained = db_abs - (rows_whole as f32 * db_per_row);
-                let top_char_idx = (db_remained / (db_per_row / 8f32)) as usize;
+        for x in 0..width {
+            let db = self.column(row, x, width);
+            let eighths = ((db.clamp(floor, ceil) - floor) * eighths_per_db) as usize;
 
-                for i in 0..rows_whole {
-                    if let Some(cell) =
-                        buf.cell_mut((area.x + x as u16, area.y + height as u16 - 1 - i as u16))
-                    {
-                        cell.set_char(EIGHT_BLOCK[7]).set_fg(self.color(db));
-                    };
+            let (whole, part) = (eighths / 8, eighths % 8);
+            let color = self.color(db);
+            let bottom = area.y + area.height - 1;
+
+            for i in 0..whole.min(height) {
+                if let Some(cell) = buf.cell_mut((area.x + x as u16, bottom - i as u16)) {
+                    cell.set_char(EIGHT_BLOCK[7]).set_fg(color);
                 }
-
-                if top_char_idx > 0 {
-                    if let Some(cell) = buf.cell_mut((
-                        area.x + x as u16,
-                        area.y + height as u16 - 1 - (rows_whole as u16 - 1),
-                    )) {
-                        cell.set_char(EIGHT_BLOCK[top_char_idx])
-                            .set_fg(self.color(db));
-                    };
-                };
             }
-        };
+
+            // The partial block sits *above* the full stack, not on top of the
+            // highest one, and `part` counts eighths from 1 while the table is
+            // indexed from 0 — both off-by-ones cost the bar up to a full row.
+            if part > 0
+                && whole < height
+                && let Some(cell) = buf.cell_mut((area.x + x as u16, bottom - whole as u16))
+            {
+                cell.set_char(EIGHT_BLOCK[part - 1]).set_fg(color);
+            }
+        }
     }
 
     fn render_waterfall(&self, area: Rect, buf: &mut Buffer) {
@@ -250,25 +243,22 @@ impl SignalView {
 
 impl Widget for &SignalView {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        // Signal view, include spectrum and waterfall
-        let block = Block::bordered().title("Spectrogram MHz");
+        let block = Block::bordered().title("Spectrum \u{b7} MHz");
         let inner = block.inner(area);
         block.render(area, buf);
 
-        let [mhz_axis, area_spec, area_water] = Layout::vertical([
+        // Axis on the seam rather than above everything: both panels share one
+        // frequency scale, and putting it where they meet is what every SDR
+        // display does, because each label then touches the thing it labels.
+        let [area_spec, mhz_axis, area_water] = Layout::vertical([
+            Constraint::Percentage(30),
             Constraint::Length(1),
-            Constraint::Percentage(20),
             Constraint::Fill(1),
         ])
         .areas(inner);
 
-        // MHz axis
-        self.render_mhz_axis(mhz_axis, buf);
-
-        // Spectrum
         self.render_spectrum(area_spec, buf);
-
-        // Waterfall
+        self.render_mhz_axis(mhz_axis, buf);
         self.render_waterfall(area_water, buf);
     }
 }

@@ -13,8 +13,10 @@ pub enum CustomError {
     RtlSetFreq(u32),
     RtlSetBandwidth(u32),
     RtlSetSampleRate(u32),
-    RtlSetGain(u32),
-    RtlSetPpm(u32),
+    /// Tenths of a dB, as librtlsdr counts them.
+    RtlSetGain(i32),
+    /// Signed: most dongles need a negative correction.
+    RtlSetPpm(i32),
     RtlEnableAgc,
     RtlDisableAgc,
     RtlResetBuffer,
@@ -26,13 +28,19 @@ impl Display for CustomError {
             Self::RtlOpenDevice(id) => write!(f, "RTL-SDR: Failed to open device {}", &id),
             Self::RtlSetFreq(freq) => write!(f, "RTL-SDR: Failed to set center freq {}", &freq),
             Self::RtlSetBandwidth(bw) => write!(f, "RTL-SDR: Failed to set bandwidth {}", &bw),
-            Self::RtlSetSampleRate(rate) => write!(f, "RTL-SDR: Failed to set sample rate {}", &rate),
-            Self::RtlSetGain(db) => write!(f, "RTL-SDR: Failed to set tuner gain {} dB", &db),
+            Self::RtlSetSampleRate(rate) => {
+                write!(f, "RTL-SDR: Failed to set sample rate {}", &rate)
+            }
+            Self::RtlSetGain(tenths) => write!(
+                f,
+                "RTL-SDR: Failed to set tuner gain {:.1} dB",
+                *tenths as f32 / 10.0
+            ),
             Self::RtlSetPpm(ppm) => write!(f, "RTL-SDR: Failed to set ppm correction {}", &ppm),
             Self::RtlEnableAgc => write!(f, "RTL-SDR: Failed to enable AGC"),
             Self::RtlDisableAgc => write!(f, "RTL-SDR: Failed to disable AGC"),
             Self::RtlResetBuffer => write!(f, "RTL-SDR: Failed to reset buffer"),
-            _ => Ok(())
+            _ => Ok(()),
         }
     }
 }

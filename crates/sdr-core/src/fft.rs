@@ -21,7 +21,7 @@ pub struct Fft<const N: usize> {
     /// storing it as `ComplexF32` would pay a full complex product (4 mul,
     /// 2 add) per sample to multiply by a zero imaginary part.
     hann_window: [f32; N],
-    window_sum: f32,        // depends on type of window
+    window_sum: f32, // depends on type of window
 }
 
 impl<const N: usize> Fft<N> {
@@ -54,7 +54,7 @@ impl<const N: usize> Fft<N> {
         // its endpoint in the DFT's implied periodic extension and leaves a
         // residue in every bin. `hann(L,'periodic')` is this one.
         let hann_window: [f32; N] = array::from_fn(|k| {
-            0.5*(1.0 - (2.0*core::f32::consts::PI*k as f32 / N as f32).cos())
+            0.5 * (1.0 - (2.0 * core::f32::consts::PI * k as f32 / N as f32).cos())
         });
 
         // Coherent gain. Normalising by this instead of N is what keeps an
@@ -89,7 +89,7 @@ impl<const N: usize> Fft<N> {
         //     self.samples[i] = ComplexF32 { real: src[i_idx] as f32, img: src[q_idx] as f32 };
         // }
         for pair in iq.chunks_exact(2) {
-            self.samples[self.offset] = ComplexF32 { 
+            self.samples[self.offset] = ComplexF32 {
                 real: pair[0],
                 img: pair[1],
             };
@@ -131,13 +131,13 @@ impl<const N: usize> Fft<N> {
     ///  First step: bit-reversed to get the deepest level
     ///  https://brianmcfee.net/dstbook-site/content/ch08-fft/FFT.html
     pub fn dft_fwd(&mut self) {
-        // Keep sample intact 
+        // Keep sample intact
         // We need 2 bufs for this step
         // - one for reversed samples
         // - another for calculation, as inplace modification will break the calculation
-        let mut buf_a: [ComplexF32; N] = array::from_fn(|i| 
+        let mut buf_a: [ComplexF32; N] = array::from_fn(|i| {
             self.samples[self.indexes_rev[i]] * self.hann_window[self.indexes_rev[i]]
-            );
+        });
         let mut buf_b: [ComplexF32; N] = array::from_fn(|_| ComplexF32::default());
 
         // This is for swapping two bufs when done
@@ -161,12 +161,12 @@ impl<const N: usize> Fft<N> {
                 }
                 // Move up sequence id
                 e_id += n;
-            };
+            }
 
             core::mem::swap(&mut src, &mut dst);
             n *= 2;
-        };
-        
+        }
+
         self.output
             .iter_mut()
             .zip(src.iter())
@@ -181,20 +181,20 @@ impl<const N: usize> Fft<N> {
     ///
     /// Then convert to decibel
     pub fn post_process(&mut self) {
-        self.output.rotate_left(N/2);
+        self.output.rotate_left(N / 2);
 
         // let scale = 1.0/(N as f32);
-        let scale = 1.0/self.window_sum;
+        let scale = 1.0 / self.window_sum;
         self.output.iter_mut().for_each(|o| {
-            *o = 20.0 * (*o*scale + 1e-12).log10();
+            *o = 20.0 * (*o * scale + 1e-12).log10();
         });
     }
 
     /// Update freq to match with center freq
     fn abs_freq(&mut self, center_freq: f32, sample_rate: f32) {
         self.freq.iter_mut().enumerate().for_each(|(i, f)| {
-            let offset = i as f32 - (N/2) as f32;
-            let freq = offset*(sample_rate/N as f32);
+            let offset = i as f32 - (N / 2) as f32;
+            let freq = offset * (sample_rate / N as f32);
             *f = center_freq + freq
         });
     }

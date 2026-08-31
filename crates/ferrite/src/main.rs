@@ -1,3 +1,5 @@
+use std::sync::Arc;
+use std::sync::atomic::Ordering::Relaxed;
 use std::sync::mpsc::channel;
 
 #[macro_use]
@@ -10,9 +12,18 @@ mod tui;
 use sdr_core::{control_signal::CtrlSignal, exceptions::CustomError, spmc::RingProducer};
 
 use crate::source::source::Source;
-use crate::source::source::{CPAL_BLOCK, IQ_BLOCK, IQ_SLOTS};
+use crate::source::source::{CPAL_BLOCK, IQ_BLOCK, IQ_SLOTS, OFFSET_TUNING_HZ};
 use crate::speaker::Speaker;
 use crate::tui::{app_states::AppStates, tui::Tui};
+
+/// Startup gain, in librtlsdr's tenths of a dB. Snapped to the tuner's own
+/// table at open, so this is a request, not a promise — 20 dB lands on the
+/// FC0013's 19.7 dB ceiling and near the top of an R820T's range.
+const DEFAULT_GAIN_TENTHS: i32 = 200;
+
+/// How far one `←`/`→` press moves the frequency at startup. 100 kHz is the
+/// spacing of the FM broadcast raster in most of the world.
+const DEFAULT_STEP_HZ: u32 = 100_000;
 
 /// Ring geometry lives with the producers: audio is `IQ_SLOTS × CPAL_BLOCK`,
 /// raw IQ is `IQ_SLOTS × IQ_BLOCK` (see `source::source`). A block only becomes
@@ -93,34 +104,72 @@ fn main() -> Result<(), CustomError> {
     // For controller
     let (ctrl_tx, ctrl_rx) = channel::<CtrlSignal>();
 
-    // Speaker
-    let speaker = Speaker::new(consumer_sp);
+    // ── Shared state ────────────────────────────────────────────────────────
+    // One `Arc` for everything the radio has an opinion about: the UI writes
+    // settings into it, the DSP and cpal read them, and measurements come back
+    // the other way. Purely visual state (cursor, colour range, log scroll)
+    // stays in `TuiStates`, on the UI thread, behind no synchronisation at all.
+    //
+    // The rates go in as zero because the *device* picks them: cpal reports the
+    // output rate it will actually run at, and librtlsdr the sample rate it
+    // rounded to. Seeding a nominal value here would put a number on screen
+    // that nothing had confirmed.
+    let app = Arc::new(AppStates::new(
+        0,          // sample rate — from librtlsdr, below
+        0,          // audio rate  — from cpal, below
+        91_000_000, // center
+        DEFAULT_GAIN_TENTHS,
+        300_000, // channel bandwidth
+        0,       // ppm
+    ));
+
+    // Speaker. Fills in both rates, since it is what asks cpal for one.
+    let speaker = Speaker::new(consumer_sp, app.clone());
     let rtl_rate = speaker.rtl_rate;
     speaker.play()?;
 
-    // States of app
-    let app_states = AppStates::new(rtl_rate, 500_000, 91_000_000, 40, 300_000, 0);
-
     let source = Source::new(
-        app_states.sample_rate.get(),
-        app_states.center_freq.get(),
-        app_states.bandwidth.get(),
-        app_states.gain_db.get(),
+        rtl_rate,
+        app.center_freq.load(Relaxed),
+        app.bandwidth.load(Relaxed),
+        (DEFAULT_GAIN_TENTHS / 10).max(0) as u32,
         ctrl_rx,
     );
 
     // The tuner's gain table is discrete and its ceiling is tuner-specific, so
-    // the request is rarely what lands. Reflect what the hardware took, or the
-    // TUI advertises a gain the device never had.
-    // NOTE: gain_db is u32 whole dB, so this rounds (19.7 -> 20) and cannot
-    // represent the negative settings some tuners offer.
-    app_states
-        .gain_db
-        .set(((source.applied_gain_tenths + 5) / 10).max(0) as u32);
+    // the request is rarely what lands. Reflect what the hardware took, and
+    // hand the table itself to the Control panel — its Gain row steps that
+    // table rather than whole dB, which is what keeps the displayed gain a gain
+    // the device actually has.
+    app.gain_tenths.store(source.applied_gain_tenths, Relaxed);
+    // librtlsdr rounds the requested rate to what its divider can make.
+    app.sample_rate.store(source.sample_rate(), Relaxed);
+    let gain_table = source.gain_table.clone();
+
+    log_info!(
+        "tuner gain {:.1} dB \u{b7} {} steps available",
+        source.applied_gain_tenths as f32 / 10.0,
+        gain_table.len()
+    );
+    log_info!(
+        "{:.3} MS/s \u{b7} LO {:.3} MHz \u{b7} offset tuning {} kHz",
+        source.sample_rate() as f64 / 1e6,
+        app.center_freq
+            .load(Relaxed)
+            .saturating_sub(OFFSET_TUNING_HZ) as f64
+            / 1e6,
+        OFFSET_TUNING_HZ / 1000
+    );
 
     let (source_handle, ctrl_handle) = source.start_receive(producer_sp, producer_fft)?;
 
-    let tui = Tui::<IQ_SLOTS, IQ_BLOCK, FFT_N>::new(app_states, consumer_fft, ctrl_tx);
+    let tui = Tui::<IQ_SLOTS, IQ_BLOCK, FFT_N>::new(
+        app,
+        gain_table,
+        DEFAULT_STEP_HZ,
+        consumer_fft,
+        ctrl_tx,
+    );
     let _ = tui.run();
 
     let _ = source_handle.join();

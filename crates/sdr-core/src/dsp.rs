@@ -1,6 +1,6 @@
 use std::{array, usize};
 
-use crate::complex::{ComplexF32};
+use crate::complex::ComplexF32;
 
 /// Next index + 1, but wrap around to 0 if reach max index
 /// size must be power of 2
@@ -10,13 +10,10 @@ pub fn next_wrapped(i: usize, size: usize) -> usize {
 }
 
 /// Center 2 bytes IQ to 127.4, clamped to [-1, 1)
-/// The offset of 127.4, not 127.5, is an empirical correction for the R820T's slight ADC bias. 
+/// The offset of 127.4, not 127.5, is an empirical correction for the R820T's slight ADC bias.
 /// Using 127.5 leaves a small residual DC.
 pub fn center_iq(i: u8, q: u8) -> (f32, f32) {
-    (
-        (i as f32 - 127.4) / 128.0,
-        (q as f32 - 127.4) / 128.0,
-    )
+    ((i as f32 - 127.4) / 128.0, (q as f32 - 127.4) / 128.0)
 }
 
 struct DcBlocker<const N: usize> {
@@ -25,7 +22,11 @@ struct DcBlocker<const N: usize> {
 }
 
 impl<const N: usize> DcBlocker<N> {
-    fn new(sample_rate: u32) -> Self { Self { rate: 50.0 / sample_rate as f32, offset: 0.0 }
+    fn new(sample_rate: u32) -> Self {
+        Self {
+            rate: 50.0 / sample_rate as f32,
+            offset: 0.0,
+        }
     }
 
     fn process(&mut self, x: f32) -> f32 {
@@ -66,8 +67,11 @@ pub enum FilterType {
 
 /// A sinc function to reconstruct continuous sample from discrete one
 pub fn sinc(x: f32) -> f32 {
-    if x.abs() < 1e-6 { 1.0 }
-    else { (std::f32::consts::PI * x).sin() / (std::f32::consts::PI * x) }
+    if x.abs() < 1e-6 {
+        1.0
+    } else {
+        (std::f32::consts::PI * x).sin() / (std::f32::consts::PI * x)
+    }
 }
 
 /// Modified Bessel function I₀ — needed for Kaiser window
@@ -79,7 +83,9 @@ fn bessel_i0(x: f32) -> f32 {
         term *= (x / 2.0) / k as f32;
         term *= (x / 2.0) / k as f32;
         sum += term;
-        if term < 1e-10 { break; }
+        if term < 1e-10 {
+            break;
+        }
     }
     sum
 }
@@ -91,32 +97,30 @@ pub fn create_taps<const N: usize>(
     cutoff: f32,
     sample_rate: f32,
     window: Window,
-    beta: Option<f32>) -> [f32; N]
-{
+    beta: Option<f32>,
+) -> [f32; N] {
     // Normalize
-    let fc = cutoff/sample_rate;
-    let alpha = ((N - 1)/2) as f32;
+    let fc = cutoff / sample_rate;
+    let alpha = ((N - 1) / 2) as f32;
     let mut w = [0.0f32; N];
     let mut output = [0.0f32; N];
-    let d = |k: f32| 2.0 * std::f32::consts::PI * k/(N as f32 - 1.0);
+    let d = |k: f32| 2.0 * std::f32::consts::PI * k / (N as f32 - 1.0);
     match window {
         Window::Hann => {
             w.iter_mut().enumerate().for_each(|(k, x)| {
                 *x = 0.5 * (1.0 - d(k as f32).cos());
-            }); 
+            });
         }
         Window::Hamming => {
             w.iter_mut().enumerate().for_each(|(k, x)| {
                 *x = 0.53 - 0.46 * d(k as f32).cos();
             });
         }
-        Window::Blackman => {
-            w.iter_mut().enumerate().for_each(|(k, x)| {
-                *x = 0.42 - 0.5 * d(k as f32).cos() + 0.08 * (2.0 * d(k as f32)).cos();
-            })
-        }
+        Window::Blackman => w.iter_mut().enumerate().for_each(|(k, x)| {
+            *x = 0.42 - 0.5 * d(k as f32).cos() + 0.08 * (2.0 * d(k as f32)).cos();
+        }),
         Window::Kaiser => {
-            let beta = beta.unwrap_or(8.96); 
+            let beta = beta.unwrap_or(8.96);
             let j = (N - 1) as f32;
             let i0_beta = bessel_i0(beta);
             w.iter_mut().enumerate().for_each(|(k, x)| {
@@ -126,11 +130,12 @@ pub fn create_taps<const N: usize>(
         }
     };
 
-    output.iter_mut().enumerate().for_each(|(k, h)| {
-        *h = sinc(2.0 * fc * (k as f32 - alpha))
-    });
+    output
+        .iter_mut()
+        .enumerate()
+        .for_each(|(k, h)| *h = sinc(2.0 * fc * (k as f32 - alpha)));
 
-    // Highpass filter is lowpass filter inversed `h` 
+    // Highpass filter is lowpass filter inversed `h`
     match filter_type {
         FilterType::Lowpass => {}
         FilterType::Highpass => {
@@ -142,7 +147,7 @@ pub fn create_taps<const N: usize>(
             output[alpha as usize] = 1.0 - output[alpha as usize]
         }
     }
-    
+
     output.iter_mut().zip(w.iter_mut()).for_each(|(o, w)| {
         *o = *o * *w;
     });
@@ -193,13 +198,7 @@ impl<const P: usize, const N: usize, const T: usize> DecimFIR<P, N, T> {
     /// Apply filter over an input of predefined size.
     /// Output size must be the same as input size.
     /// No resampling here.
-    pub fn process(
-        &mut self,
-        step_size: usize,
-        out_i: &mut [f32],
-        out_q: &mut [f32],
-        )
-    {
+    pub fn process(&mut self, step_size: usize, out_i: &mut [f32], out_q: &mut [f32]) {
         let output_size = N / step_size;
         assert_eq!(out_i.len(), output_size);
         assert_eq!(out_q.len(), output_size);
@@ -216,7 +215,7 @@ impl<const P: usize, const N: usize, const T: usize> DecimFIR<P, N, T> {
             out_q[count] = Self::convolve(&self.buf_q[w.clone()], &self.taps);
             count += 1;
             self.offset += step_size;
-        };
+        }
 
         // Carry leftover step into next block,
         // offset step back N steps, because later we copy from N to last
@@ -228,7 +227,6 @@ impl<const P: usize, const N: usize, const T: usize> DecimFIR<P, N, T> {
         self.buf_q.copy_within(N..N + T - 1, 0);
     }
 
-    
     /// Apply convolution of `y` over `x`, given both having same lengthl
     /// Any padding must be apply before this.
     /// According to the definition of convolution, `y[k]` must be mapped to `x[N-k]`,
@@ -238,7 +236,7 @@ impl<const P: usize, const N: usize, const T: usize> DecimFIR<P, N, T> {
     /// Written like this for vectorization with `target-cpu=native` build option
     fn convolve(x: &[f32], y: &[f32]) -> f32 {
         assert!(x.len() == y.len());
-        
+
         let n = x.len();
 
         let mut acc_0 = 0.0f32;
@@ -246,20 +244,20 @@ impl<const P: usize, const N: usize, const T: usize> DecimFIR<P, N, T> {
         let mut acc_2 = 0.0f32;
         let mut acc_3 = 0.0f32;
 
-        let chunk = x.len()/4;
+        let chunk = x.len() / 4;
         for i in 0..chunk {
-            let base = i*4;
+            let base = i * 4;
             acc_0 += x[base] * y[n - base - 1];
             acc_1 += x[base + 1] * y[n - base - 2];
             acc_2 += x[base + 2] * y[n - base - 3];
             acc_3 += x[base + 3] * y[n - base - 4];
-        };
+        }
 
         let mut acc_tail = 0.0f32;
         let remainder_start = chunk * 4;
         for i in remainder_start..x.len() {
             acc_tail += x[i] * y[n - i - 1]
-        };
+        }
 
         acc_0 + acc_1 + acc_2 + acc_3 + acc_tail
     }
@@ -272,12 +270,12 @@ impl<const P: usize, const N: usize, const T: usize> DecimFIR<P, N, T> {
 /// Polyphase reampler
 /// For example: from 300kHz -> 48kHz, interp = 4, decim = 25
 pub struct PolyphaseResampler {
-    branches:   Vec<Vec<f32>>,  // [interp][taps_per_branch]
-    interp:     usize,
-    decim:      usize,
-    history:    Vec<f32>,       // last (taps_per_branch - 1) input samples
-    phase:      usize,          // current branch index, 0..interp
-    offset:     usize,          // carry from previous block
+    branches: Vec<Vec<f32>>, // [interp][taps_per_branch]
+    interp: usize,
+    decim: usize,
+    history: Vec<f32>, // last (taps_per_branch - 1) input samples
+    phase: usize,      // current branch index, 0..interp
+    offset: usize,     // carry from previous block
 }
 
 impl PolyphaseResampler {
@@ -312,25 +310,22 @@ impl PolyphaseResampler {
         buf.extend_from_slice(&self.history);
         buf.extend_from_slice(input);
 
-        let mut pos = self.offset;  // position in buf (not input)
+        let mut pos = self.offset; // position in buf (not input)
         let mut pos_out: usize = 0;
-    
+
         while pos + taps_per_branch <= buf.len() {
             // Dot product: branch[phase] against buf[pos..pos+taps_per_branch]
             let branch = &self.branches[self.phase];
             let window = &buf[pos..pos + taps_per_branch];
-            let out: f32 = branch.iter()
-                .zip(window.iter())
-                .map(|(h, x)| h * x)
-                .sum();
+            let out: f32 = branch.iter().zip(window.iter()).map(|(h, x)| h * x).sum();
             // output.push(out);
             output[pos_out] = out;
             pos_out += 1;
 
             // Advance phase and position
             self.phase += self.decim;
-            pos        += self.phase / self.interp;  // integer div = input samples to skip
-            self.phase  = self.phase % self.interp;
+            pos += self.phase / self.interp; // integer div = input samples to skip
+            self.phase = self.phase % self.interp;
         }
 
         // Save carry: how far into next input block we already are
@@ -355,7 +350,6 @@ fn gcd(a: usize, b: usize) -> usize {
     if b == 0 { a } else { gcd(b, a % b) }
 }
 
-
 /// That high-pass filter for both I & Q channel
 pub struct IqDcBlocker<const N: usize> {
     i_blocker: DcBlocker<N>,
@@ -364,20 +358,16 @@ pub struct IqDcBlocker<const N: usize> {
 
 impl<const N: usize> IqDcBlocker<N> {
     pub fn new(sample_rate: u32) -> Self {
-        Self { 
+        Self {
             i_blocker: DcBlocker::<N>::new(sample_rate),
             q_blocker: DcBlocker::<N>::new(sample_rate),
         }
     }
 
     pub fn process(&mut self, i: f32, q: f32) -> (f32, f32) {
-        (
-            self.i_blocker.process(i),
-            self.q_blocker.process(q),
-        )
+        (self.i_blocker.process(i), self.q_blocker.process(q))
     }
 }
-
 
 /// Translate frequency
 /// RTL-SDR holds center frequency
@@ -392,18 +382,18 @@ pub struct Xlator {
     offset: f32,
     phase: ComplexF32,
     delta: ComplexF32,
-    n: u32
+    n: u32,
 }
 
 impl Xlator {
     pub fn new(offset: f32, sample_rate: f32) -> Self {
-        let w = -std::f32::consts::TAU * offset / sample_rate;   // note the minus
+        let w = -std::f32::consts::TAU * offset / sample_rate; // note the minus
         Self {
             sample_rate,
             offset,
             phase: ComplexF32::new(1.0, 0.0),
             delta: ComplexF32::new(w.cos(), w.sin()),
-            n: 0
+            n: 0,
         }
     }
 
@@ -458,44 +448,53 @@ pub struct Demodulation {
 impl Demodulation {
     pub fn new(deviation: f32, samples_rate: f32) -> Self {
         let rads = std::f32::consts::TAU * deviation / samples_rate;
-        Self { prev_i: 0.0f32, prev_q: 0.0f32, inv_deviation: 1.0 / rads }
+        Self {
+            prev_i: 0.0f32,
+            prev_q: 0.0f32,
+            inv_deviation: 1.0 / rads,
+        }
     }
 
-    pub fn process<const N: usize>
-        (&mut self, i: &[f32; N], q: &[f32; N], out: &mut [f32; N])
-    {
-        i.iter().zip(q.iter()).zip(out.iter_mut()).for_each(|((&x, &y), o)| {
-            let re = x * self.prev_i + y * self.prev_q;
-            let im = y * self.prev_i - x * self.prev_q;
-            *o = im.atan2(re) * self.inv_deviation; // ∈ [-π, π]
-            self.prev_i = x;
-            self.prev_q = y;
-        });
+    pub fn process<const N: usize>(&mut self, i: &[f32; N], q: &[f32; N], out: &mut [f32; N]) {
+        i.iter()
+            .zip(q.iter())
+            .zip(out.iter_mut())
+            .for_each(|((&x, &y), o)| {
+                let re = x * self.prev_i + y * self.prev_q;
+                let im = y * self.prev_i - x * self.prev_q;
+                *o = im.atan2(re) * self.inv_deviation; // ∈ [-π, π]
+                self.prev_i = x;
+                self.prev_q = y;
+            });
     }
 }
 
 pub struct Deemphasis {
     alpha: f32,
-    last_out: f32,   // carries across blocks
+    last_out: f32, // carries across blocks
 }
 
 impl Deemphasis {
     pub fn new(tau: f32, sample_rate: f32) -> Self {
-      let dt = 1.0 / sample_rate;
-      Self { alpha: dt / (tau + dt), last_out: 0.0 }
+        let dt = 1.0 / sample_rate;
+        Self {
+            alpha: dt / (tau + dt),
+            last_out: 0.0,
+        }
     }
 
     pub fn process(&mut self, buf: &mut [f32]) {
         for x in buf.iter_mut() {
-          *x = self.alpha * *x + (1.0 - self.alpha) *
-        self.last_out;
-          self.last_out = *x;
+            *x = self.alpha * *x + (1.0 - self.alpha) * self.last_out;
+            self.last_out = *x;
         }
     }
 }
 
 pub fn hann(x: f32, half_width: f32) -> f32 {
-    if x.abs() > half_width { return 0.0; }
+    if x.abs() > half_width {
+        return 0.0;
+    }
     0.5 * (1.0 + (std::f32::consts::PI * x / half_width).cos())
 }
 
@@ -504,9 +503,8 @@ pub fn windowed_sinc_resample(
     input_rate: f32,
     output_rate: f32,
     output: &mut [f32],
-    half_taps: usize,   // typically 8-32
-    )
-{
+    half_taps: usize, // typically 8-32
+) {
     let ratio = input_rate / output_rate;
     let output_len = (input.len() as f32 / ratio) as usize;
     assert_eq!(output_len, output.len());
@@ -524,7 +522,9 @@ pub fn windowed_sinc_resample(
         // window on top of the Hann one and puts the sidelobes back.
         for k in -span..=span {
             let i = pos as i32 + k;
-            if i < 0 || i >= input.len() as i32 { continue; }
+            if i < 0 || i >= input.len() as i32 {
+                continue;
+            }
 
             let t = pos - i as f32;
             // `fc * sinc(fc * t)` is the lowpass kernel at cutoff `fc/2`
@@ -563,18 +563,24 @@ mod xlator_tests {
     /// Getting this backwards moves the station to -2*OFF and you hear nothing.
     #[test]
     fn positive_offset_shifts_down() {
-        assert!(shifted_mean(OFF, OFF, 24000) > 0.99,
-            "a tone at +offset must land on DC");
-        assert!(shifted_mean(-OFF, OFF, 24000) < 0.01,
-            "a tone at -offset must NOT land on DC — that would be the wrong sign");
+        assert!(
+            shifted_mean(OFF, OFF, 24000) > 0.99,
+            "a tone at +offset must land on DC"
+        );
+        assert!(
+            shifted_mean(-OFF, OFF, 24000) < 0.01,
+            "a tone at -offset must NOT land on DC — that would be the wrong sign"
+        );
     }
 
     /// The LO spike sits at DC before the shift; afterwards it must be well
     /// away from the channel, not merely somewhere else.
     #[test]
     fn dc_spike_is_moved_clear_of_the_channel() {
-        assert!(shifted_mean(0.0, OFF, 24000) < 0.01,
-            "DC must not stay at DC");
+        assert!(
+            shifted_mean(0.0, OFF, 24000) < 0.01,
+            "DC must not stay at DC"
+        );
         // and it lands at exactly -OFF: undoing the shift brings it back.
         assert!(shifted_mean(0.0, 0.0, 24000) > 0.99);
     }
@@ -606,8 +612,8 @@ mod tests {
 
         // 2. Filter should be symmetric (linear phase)
         let n = taps.len();
-        let max_asymmetry = (0..n/2)
-            .map(|k| (taps[k] - taps[n-1-k]).abs())
+        let max_asymmetry = (0..n / 2)
+            .map(|k| (taps[k] - taps[n - 1 - k]).abs())
             .fold(0.0f32, f32::max);
         assert!(max_asymmetry.abs() < 1e-6);
 
@@ -631,7 +637,13 @@ mod tests {
     #[test]
     fn test_filter() {
         let sample_rate = 300_000.0_f32;
-        let filter_hann = create_taps::<51>(FilterType::Lowpass, 3000.0f32, sample_rate, Window::Hann, None);
+        let filter_hann = create_taps::<51>(
+            FilterType::Lowpass,
+            3000.0f32,
+            sample_rate,
+            Window::Hann,
+            None,
+        );
         assert_filter(&filter_hann);
     }
 }

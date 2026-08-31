@@ -1,32 +1,48 @@
-use std::cell::Cell;
 use std::io;
-use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::Ordering::Relaxed;
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
-use ratatui::crossterm::event::{self, Event, KeyCode};
-use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::widgets::Block;
+use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::layout::{Constraint, Layout};
 use ratatui::{DefaultTerminal, Frame};
 
 use sdr_core::spmc::RingConsumer;
 use sdr_core::{control_signal::CtrlSignal, fft::Fft};
 
-use crate::tui::stats_view::StatsView;
+use crate::tui::app_states::AppStates;
+use crate::tui::control_view::{self, ControlView};
+use crate::tui::info_view::{self, InfoView};
+use crate::tui::log_view::LogView;
+use crate::tui::status_bar::StatusBar;
+use crate::tui::tui_states::{Pane, TuiStates};
 
-use super::{app_states::AppStates, signal_view::SignalView};
+use super::signal_view::SignalView;
 
 /// 30 fps is good enough
 const FRAME: Duration = Duration::from_millis(33);
 
+/// Width of the left column, in columns.
+///
+/// A `Length`, not a `Percentage`: the panels hold short fixed-width readouts,
+/// so every column past what they need belongs to the waterfall, where
+/// resolution is the product. At 200 columns a 30 % split would spend 60 of
+/// them on `Freq 91.500 MHz`.
+const SIDEBAR: u16 = 30;
+
 pub struct Tui<const SLOTS: usize, const BLOCK: usize, const N: usize> {
-    states: AppStates,
+    app: Arc<AppStates>,
+    states: TuiStates,
     consumer: RingConsumer<f32, SLOTS, BLOCK>,
     fft: Fft<N>,
 
-    // Views/panel
+    // Panels
     signal_view: SignalView,
-    stats_view: StatsView,
+    control_view: ControlView,
+    info_view: InfoView,
+    log_view: LogView,
+    status_bar: StatusBar,
 
     // IQ stream buffer, after centered and high-pass filter
     block: [f32; BLOCK],
@@ -37,26 +53,28 @@ pub struct Tui<const SLOTS: usize, const BLOCK: usize, const N: usize> {
 
 impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N> {
     pub fn new(
-        app_states: AppStates,
+        app: Arc<AppStates>,
+        gain_table: Vec<i32>,
+        step: u32,
         consumer: RingConsumer<f32, SLOTS, BLOCK>,
         ctrl_tx: Sender<CtrlSignal>,
     ) -> Self {
         // Block size must be x*window size
         const { assert!(BLOCK % (2 * N) == 0) };
 
-        let center_freq = app_states.center_freq.clone();
-        let sample_rate = app_states.sample_rate.clone();
-        let step = app_states.step.clone();
-        let gain_db = app_states.gain_db.clone();
-        let bw = app_states.bandwidth.clone();
-        let ppm = app_states.ppm.clone();
+        let states = TuiStates::new(-90.0, 0.0);
+        let (floor, ceil) = (states.floor_db.clone(), states.ceil_db.clone());
 
         Self {
-            states: app_states,
+            signal_view: SignalView::new(N, 256, app.clone(), floor.clone(), ceil.clone()),
+            control_view: ControlView::new(app.clone(), gain_table, step, floor, ceil),
+            info_view: InfoView::new(app.clone()),
+            log_view: LogView,
+            status_bar: StatusBar,
+            app,
+            states,
             consumer,
             fft: Fft::new(),
-            signal_view: SignalView::new(N, 256, center_freq.clone(), sample_rate),
-            stats_view: StatsView::new(center_freq, step, gain_db, bw, ppm),
             block: [0.0f32; BLOCK],
             ctrl_tx,
         }
@@ -80,33 +98,103 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
                 if !event::poll(remain)? {
                     break;
                 };
-                if let Event::Key(k) = event::read()? {
-                    match k.code {
-                        KeyCode::Char('q') | KeyCode::Esc => {
-                            if let Ok(()) = self.ctrl_tx.send(CtrlSignal::Quit) {
-                                return Ok(());
-                            };
-                        }
-                        KeyCode::Up => self.stats_view.select(-1),
-                        KeyCode::Down => self.stats_view.select(1),
-                        KeyCode::Left | KeyCode::Right => {
-                            let dir = if k.code == KeyCode::Right { 1 } else { -1 };
-                            // `None` means the field never leaves the UI (Step)
-                            // — it has already written itself into the shared
-                            // cell either way.
-                            if let Some(sig) = self.stats_view.adjust(dir) {
-                                let _ = self.ctrl_tx.send(sig);
-                            }
-                        }
-                        // Display floor, moved off the arrows now that those
-                        // drive the tuner fields.
-                        KeyCode::Char(']') => self.signal_view.floor_db += 2.0,
-                        KeyCode::Char('[') => self.signal_view.floor_db -= 2.0,
-                        _ => {}
-                    }
+                if let Event::Key(k) = event::read()?
+                    && self.on_key(k)
+                {
+                    return Ok(());
                 }
             }
         }
+    }
+
+    /// Returns true when the app should exit.
+    fn on_key(&mut self, k: KeyEvent) -> bool {
+        // Crossterm reports Press *and* Release under the kitty keyboard
+        // protocol and on Windows; without this every keypress fires twice
+        // there and one arrow moves two steps.
+        if k.kind != KeyEventKind::Press {
+            return false;
+        }
+
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+
+        match k.code {
+            // Raw mode swallows SIGINT, so Ctrl-C has to be handled like any
+            // other key or `q` is the only way out.
+            KeyCode::Char('c') if ctrl => return self.quit(),
+            KeyCode::Char('q') | KeyCode::Esc => return self.quit(),
+
+            KeyCode::Tab | KeyCode::BackTab => {
+                self.states.focus = self.states.focus.next();
+                // A pane you scrolled back through should be showing the tail
+                // again next time you come to it.
+                self.states.log_scroll = 0;
+            }
+
+            KeyCode::Up => self.scroll(-1),
+            KeyCode::Down => self.scroll(1),
+
+            KeyCode::Left | KeyCode::Right => {
+                let dir = if k.code == KeyCode::Right { 1 } else { -1 };
+                // `None` means the setting never reaches the device — either
+                // the UI owns it outright (Step, the colour range) or the DSP
+                // reads it off an atomic (volume, mute, de-emphasis). Either
+                // way it has already written itself into the shared state.
+                if let Some(sig) = self.control_view.adjust(dir) {
+                    let _ = self.ctrl_tx.send(sig);
+                }
+                let (label, value) = self.control_view.focused();
+                self.states.set_status(format!("{label}  {value}"));
+            }
+
+            // Kept as global shortcuts even though both are now Control rows —
+            // the colour range is the one thing you reach for without wanting
+            // to move the cursor off the frequency.
+            KeyCode::Char(']') => self.nudge_floor(2.0),
+            KeyCode::Char('[') => self.nudge_floor(-2.0),
+
+            // Mute earns a global key for the same reason every media player
+            // gives it one.
+            KeyCode::Char('m') => {
+                let muted = !self.app.muted.load(Relaxed);
+                self.app.muted.store(muted, Relaxed);
+                self.states
+                    .set_status(if muted { "Muted" } else { "Unmuted" });
+            }
+
+            // Back to the tail of the log.
+            KeyCode::Char('g') => self.states.log_scroll = 0,
+
+            _ => {}
+        }
+        false
+    }
+
+    /// Leave only once the controller has been told: it owns the librtlsdr
+    /// handle and has to `cancel_async_read` before the reader thread can be
+    /// joined. A closed channel means that thread is already gone, so staying
+    /// would hang the UI on a radio that no longer exists.
+    fn quit(&mut self) -> bool {
+        let _ = self.ctrl_tx.send(CtrlSignal::Quit);
+        true
+    }
+
+    fn scroll(&mut self, dir: i32) {
+        match self.states.focus {
+            Pane::Control => self.control_view.select(dir),
+            // Up scrolls *back* through history, which is the direction the
+            // text moves.
+            Pane::Log => {
+                self.states.log_scroll =
+                    self.states.log_scroll.saturating_add_signed(-dir as isize);
+            }
+        }
+    }
+
+    fn nudge_floor(&mut self, db: f32) {
+        let floor = self.states.floor_db.get() + db;
+        self.states.floor_db.set(floor);
+        self.states.set_status(format!("Floor  {floor:.0} dB"));
     }
 
     /// Process one block -> spectrum & spectrogram
@@ -130,37 +218,45 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
         self.signal_view.commit();
     }
 
-    /// Overall layout for TUI
-    fn layout(frame: &mut Frame) -> (Rect, Rect) {
-        let [signal_view, stats_control] = Layout::vertical([
-            // Upper for spectrum and spectrogram/waterfall
-            Constraint::Percentage(70),
-            // Lower for stats and controls
-            Constraint::Percentage(30),
+    /// Left column of readouts, signal view filling the rest, one status row
+    /// across the bottom.
+    ///
+    /// The two panel heights come from the panels themselves, so adding a
+    /// control cannot silently clip the list. The log takes what is left; in a
+    /// terminal too short for all three each panel clips from its own bottom
+    /// rather than squeezing, which keeps the top of every list — the part you
+    /// steer with — on screen.
+    fn draw(&mut self, frame: &mut Frame) {
+        let [main, status] =
+            Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(frame.area());
+
+        let [sidebar, signal] =
+            Layout::horizontal([Constraint::Length(SIDEBAR), Constraint::Fill(1)]).areas(main);
+
+        let [area_control, area_info, area_log] = Layout::vertical([
+            Constraint::Length(control_view::HEIGHT),
+            Constraint::Length(info_view::HEIGHT),
+            Constraint::Fill(1),
         ])
-        .areas(frame.area());
+        .areas(sidebar);
 
-        // Render block around signal view
-        // Self::render_block_waterfall(frame, signal_view);
-        (signal_view, stats_control)
-    }
+        let focus = self.states.focus;
+        self.control_view
+            .render(area_control, frame.buffer_mut(), focus == Pane::Control);
+        self.info_view.render(area_info, frame.buffer_mut());
 
-    fn render_signal_view(&self, frame: &mut Frame, r: Rect) {
-        let block = Block::bordered().title("Spectrogram");
-        frame.render_widget(block, r);
-    }
+        // Clamped by the view, which is the only thing that knows how many
+        // lines fit — otherwise a held key winds the counter off past the end
+        // of the history and the pane goes blank.
+        self.states.log_scroll = self.log_view.render(
+            area_log,
+            frame.buffer_mut(),
+            self.states.log_scroll,
+            focus == Pane::Log,
+        );
 
-    /// Waterfall filling the frame, with a one-row frequency axis beneath it.
-    fn draw(&self, frame: &mut Frame) {
-        // Layout
-        let [area_stats, area_view] = Layout::horizontal([
-            Constraint::Percentage(30), // stats
-            Constraint::Fill(1),        // signal view
-        ])
-        .areas(frame.area());
-
-        // Stats
-        frame.render_widget(&self.stats_view, area_stats);
-        frame.render_widget(&self.signal_view, area_view);
+        frame.render_widget(&self.signal_view, signal);
+        self.status_bar
+            .render(status, frame.buffer_mut(), &self.states);
     }
 }
