@@ -4,9 +4,9 @@
 //! are stored at full bin resolution and folded onto columns at render time, so
 //! a terminal resize re-folds the existing history instead of discarding it.
 
-use std::rc::Rc;
 use std::cell::Cell;
 use std::collections::VecDeque;
+use std::rc::Rc;
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -18,14 +18,7 @@ use ratatui::widgets::{Block, Widget};
 /// background the bottom, so every terminal row carries two waterfall lines.
 const HALF: char = '\u{2580}';
 const EIGHT_BLOCK: [char; 8] = [
-    '\u{2581}', 
-    '\u{2582}',
-    '\u{2583}',
-    '\u{2584}',
-    '\u{2585}',
-    '\u{2586}',
-    '\u{2587}',
-    '\u{2588}',
+    '\u{2581}', '\u{2582}', '\u{2583}', '\u{2584}', '\u{2585}', '\u{2586}', '\u{2587}', '\u{2588}',
 ];
 
 /// Inferno-ish stops. Monotone in lightness, which is what keeps a weak signal
@@ -56,7 +49,12 @@ pub struct SignalView {
 }
 
 impl SignalView {
-   pub fn new(bins: usize, history: usize, center_hz: Rc<Cell<u32>>, sample_rate: Rc<Cell<u32>>) -> Self {
+    pub fn new(
+        bins: usize,
+        history: usize,
+        center_hz: Rc<Cell<u32>>,
+        sample_rate: Rc<Cell<u32>>,
+    ) -> Self {
         Self {
             bins,
             rows: VecDeque::with_capacity(history),
@@ -132,7 +130,10 @@ impl SignalView {
     fn column(&self, row: &[f32], x: usize, width: usize) -> f32 {
         let lo = x * self.bins / width;
         let hi = ((x + 1) * self.bins / width).max(lo + 1);
-        row[lo..hi].iter().copied().fold(f32::NEG_INFINITY, f32::max)
+        row[lo..hi]
+            .iter()
+            .copied()
+            .fold(f32::NEG_INFINITY, f32::max)
     }
 
     /// Render the MHz axis on top
@@ -146,21 +147,22 @@ impl SignalView {
 
         // FFT size of 2048 is represented by area.with, for example 100 columns
         // and splitted into 10 bins
-        for i in 0..10 {
-
-        }
+        for i in 0..10 {}
 
         let half = self.sample_rate.get() / 2;
         let mhz = |hz: u32| format!("{:.1}", hz as f32 / 1e6);
-        
+
         // 5 bins total
         let cols = Layout::horizontal([Constraint::Ratio(1, 5); 5]).split(area);
-        let bin_range = self.sample_rate.get()/5;
+        let bin_range = self.sample_rate.get() / 5;
 
         let freqs = [
-            center_hz - 2*bin_range, center_hz - bin_range,
+            center_hz - 2 * bin_range,
+            center_hz - bin_range,
             center_hz,
-            center_hz + bin_range, center_hz + 2*bin_range];
+            center_hz + bin_range,
+            center_hz + 2 * bin_range,
+        ];
 
         cols.iter().zip(freqs).for_each(|(c, f)| {
             let line = Line::from(mhz(f)).centered();
@@ -176,7 +178,7 @@ impl SignalView {
         // let line_right = Line::from(mhz(center_hz + half)).right_aligned();
         // line_right.render(cols[2], buf);
     }
-    
+
     fn render_spectrum(&self, area: Rect, buf: &mut Buffer) {
         if area.is_empty() || self.bins == 0 {
             return;
@@ -192,28 +194,31 @@ impl SignalView {
 
                 // Generate the bar for drawing
                 // TODO: this value needs be computed only when resizing
-                let db_per_row = (self.ceil_db - self.floor_db)/height as f32;
+                let db_per_row = (self.ceil_db - self.floor_db) / height as f32;
 
                 let rows_whole = (db_abs / db_per_row) as usize;
                 let db_remained = db_abs - (rows_whole as f32 * db_per_row);
                 let top_char_idx = (db_remained / (db_per_row / 8f32)) as usize;
 
                 for i in 0..rows_whole {
-                    if let Some(cell) = buf.cell_mut(
-                        (area.x + x as u16, area.y + height as u16 - 1 - i as u16)) {
+                    if let Some(cell) =
+                        buf.cell_mut((area.x + x as u16, area.y + height as u16 - 1 - i as u16))
+                    {
                         cell.set_char(EIGHT_BLOCK[7]).set_fg(self.color(db));
                     };
-                };
+                }
 
                 if top_char_idx > 0 {
-                    if let Some(cell) = buf.cell_mut(
-                        (area.x + x as u16, area.y + height as u16 - 1 - (rows_whole as u16 - 1))) {
-                        cell.set_char(EIGHT_BLOCK[top_char_idx]).set_fg(self.color(db));
+                    if let Some(cell) = buf.cell_mut((
+                        area.x + x as u16,
+                        area.y + height as u16 - 1 - (rows_whole as u16 - 1),
+                    )) {
+                        cell.set_char(EIGHT_BLOCK[top_char_idx])
+                            .set_fg(self.color(db));
                     };
                 };
             }
         };
-
     }
 
     fn render_waterfall(&self, area: Rect, buf: &mut Buffer) {
@@ -240,7 +245,6 @@ impl SignalView {
                 }
             }
         }
-
     }
 }
 
@@ -255,7 +259,8 @@ impl Widget for &SignalView {
             Constraint::Length(1),
             Constraint::Percentage(20),
             Constraint::Fill(1),
-        ]).areas(inner);
+        ])
+        .areas(inner);
 
         // MHz axis
         self.render_mhz_axis(mhz_axis, buf);

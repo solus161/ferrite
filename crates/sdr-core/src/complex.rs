@@ -1,5 +1,4 @@
 use core::ops::{Add, Mul};
-use std::array;
 
 /// A struct for complex number, using f32 by default
 #[derive(Copy, Clone, Default)]

@@ -1,8 +1,8 @@
+use std::cell::Cell;
 use std::io;
 use std::rc::Rc;
-use std::cell::Cell;
-use std::time::{Duration, Instant};
 use std::sync::mpsc::Sender;
+use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{self, Event, KeyCode};
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -10,7 +10,7 @@ use ratatui::widgets::Block;
 use ratatui::{DefaultTerminal, Frame};
 
 use sdr_core::spmc::RingConsumer;
-use sdr_core::{fft::Fft, control_signal::CtrlSignal};
+use sdr_core::{control_signal::CtrlSignal, fft::Fft};
 
 use crate::tui::stats_view::StatsView;
 
@@ -42,7 +42,7 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
         ctrl_tx: Sender<CtrlSignal>,
     ) -> Self {
         // Block size must be x*window size
-        const { assert!(BLOCK % (2*N) == 0)};
+        const { assert!(BLOCK % (2 * N) == 0) };
 
         let center_freq = app_states.center_freq.clone();
         let sample_rate = app_states.sample_rate.clone();
@@ -51,9 +51,10 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
         let bw = app_states.bandwidth.clone();
         let ppm = app_states.ppm.clone();
 
-        Self { 
+        Self {
             states: app_states,
-            consumer, fft: Fft::new(),
+            consumer,
+            fft: Fft::new(),
             signal_view: SignalView::new(N, 256, center_freq.clone(), sample_rate),
             stats_view: StatsView::new(center_freq, step, gain_db, bw, ppm),
             block: [0.0f32; BLOCK],
@@ -83,9 +84,9 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
                     match k.code {
                         KeyCode::Char('q') | KeyCode::Esc => {
                             if let Ok(()) = self.ctrl_tx.send(CtrlSignal::Quit) {
-                                return Ok(())
+                                return Ok(());
                             };
-                        },
+                        }
                         KeyCode::Up => self.stats_view.select(-1),
                         KeyCode::Down => self.stats_view.select(1),
                         KeyCode::Left | KeyCode::Right => {
@@ -104,10 +105,10 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
                         _ => {}
                     }
                 }
-            };
-        };
+            }
+        }
     }
-    
+
     /// Process one block -> spectrum & spectrogram
     fn sample(&mut self) {
         // ~10 blocks are published per frame and we read one, so we are lapped
@@ -116,29 +117,29 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
         self.consumer.seek_latest();
 
         // Nothing to read
-        if self.consumer.read_into(&mut self.block).is_err() { return; };
+        if self.consumer.read_into(&mut self.block).is_err() {
+            return;
+        };
 
-        for window in self.block.chunks_exact(2*N) {
+        for window in self.block.chunks_exact(2 * N) {
             if let Some(spectrum) = self.fft.push(window) {
                 self.signal_view.push(spectrum);
             }
-        };
+        }
 
         self.signal_view.commit();
     }
 
     /// Overall layout for TUI
     fn layout(frame: &mut Frame) -> (Rect, Rect) {
-        let [signal_view, stats_control] = Layout::vertical(
-            [
-                // Upper for spectrum and spectrogram/waterfall
-                Constraint::Percentage(70),
-                // Lower for stats and controls
-                Constraint::Percentage(30),
-            ])
-            .areas(frame.area());
-        
-        
+        let [signal_view, stats_control] = Layout::vertical([
+            // Upper for spectrum and spectrogram/waterfall
+            Constraint::Percentage(70),
+            // Lower for stats and controls
+            Constraint::Percentage(30),
+        ])
+        .areas(frame.area());
+
         // Render block around signal view
         // Self::render_block_waterfall(frame, signal_view);
         (signal_view, stats_control)
@@ -153,13 +154,13 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
     fn draw(&self, frame: &mut Frame) {
         // Layout
         let [area_stats, area_view] = Layout::horizontal([
-            Constraint::Percentage(30), // stats 
-            Constraint::Fill(1), // signal view
-        ]).areas(frame.area());
+            Constraint::Percentage(30), // stats
+            Constraint::Fill(1),        // signal view
+        ])
+        .areas(frame.area());
 
         // Stats
         frame.render_widget(&self.stats_view, area_stats);
         frame.render_widget(&self.signal_view, area_view);
     }
 }
-

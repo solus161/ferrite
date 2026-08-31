@@ -1,2 +1,2 @@
-pub mod source;
 mod dsp;
+pub mod source;

@@ -1,8 +1,6 @@
 use std::{array, usize};
 
 use crate::complex::{ComplexF32};
-use crate::fir_taps::{TAPS_27, TAPS_69};
-use crate::spmc::RingProducer;
 
 /// Next index + 1, but wrap around to 0 if reach max index
 /// size must be power of 2
@@ -21,26 +19,6 @@ pub fn center_iq(i: u8, q: u8) -> (f32, f32) {
     )
 }
 
-/// A high-pass filter for leaked energy at the center freq
-// struct DcBlocker {
-//     x_prev: f32,
-//     y_prev: f32,
-//     a: f32
-// }
-//
-// impl DcBlocker {
-//     fn new() -> Self {
-//         Self { x_prev: 0.0, y_prev: 0.0, a: 0.999999 }
-//     }
-//
-//     fn process(&mut self, x: f32) -> f32 {
-//         let y = x - self.x_prev + self.a*self.y_prev;
-//         self.x_prev = x;
-//         self.y_prev = y;
-//         y
-//     }
-// }
-
 struct DcBlocker<const N: usize> {
     rate: f32,
     offset: f32,
@@ -52,7 +30,7 @@ impl<const N: usize> DcBlocker<N> {
 
     fn process(&mut self, x: f32) -> f32 {
         let y = x - self.offset;
-        self.offset = y * self.rate;
+        self.offset += y * self.rate;
         y
     }
 }
@@ -437,15 +415,37 @@ impl Xlator {
     pub fn process(&mut self, buf: &mut [ComplexF32]) {
         buf.iter_mut().for_each(|x| {
             *x = *x * self.phase;
-            self.phase = self.phase * self.delta;
-            self.n += 1;
-            // TODO: what is 512 here
-            if self.n >= 512 {
-                // Normalize, as phase could drift after series of multiplication
-                self.phase.scale(1.0 / self.phase.norm());
-                self.n = 0;
-            }
+            self.advance();
         });
+    }
+
+    /// One sample at a time, for callers holding I and Q as separate arrays.
+    ///
+    /// The SDR callback centres and DC-blocks sample by sample already, so
+    /// going through a `ComplexF32` buffer would mean an extra pass over
+    /// 8192 samples purely to change container.
+    pub fn process_sample(&mut self, i: f32, q: f32) -> (f32, f32) {
+        // (i + jq)(pr + jpi)
+        let (pr, pi) = (self.phase.real, self.phase.img);
+        let out = (i * pr - q * pi, i * pi + q * pr);
+        self.advance();
+        out
+    }
+
+    /// Step the phasor, renormalising periodically.
+    ///
+    /// Repeated complex multiplication accumulates rounding error, and in f32
+    /// the magnitude drifts off 1.0 within a few thousand samples — which would
+    /// show up as slow amplitude modulation. 512 is simply often enough that
+    /// the drift stays far below the noise floor while the divide is amortised
+    /// to nothing.
+    fn advance(&mut self) {
+        self.phase = self.phase * self.delta;
+        self.n += 1;
+        if self.n >= 512 {
+            self.phase.scale(1.0 / self.phase.norm());
+            self.n = 0;
+        }
     }
 }
 
@@ -536,48 +536,60 @@ pub fn windowed_sinc_resample(
     }
 }
 
-/// A struct for partial filling output from DSP
-/// For a DSP output of size 163 and a cpal frames count of 512 (both channels is 1024),
-/// It takes more than 3 DSP output to fill one cpal frame
-pub struct PartialWriter<const N: usize> {
-    pub buf: [f32; N],
-    cursor: usize,
-    producer: RingProducer<f32, 16, N>
-}
+#[cfg(test)]
+mod xlator_tests {
+    use super::*;
 
-impl<const N: usize> PartialWriter<N> {
-    pub fn new(ring_producer: RingProducer<f32, 16, N>) -> Self {
-        Self { buf: [0.0f32; N], cursor: 0, producer: ring_producer }
-    }
+    const FS: f32 = 2_400_000.0;
+    const OFF: f32 = 350_000.0;
 
-    pub fn cursor(&self) -> usize {
-        self.cursor
-    }
-
-    pub fn write<const M: usize>(&mut self, src: &[f32; M]) -> usize {
-        let remained = N - self.cursor; 
-        if M <= remained {
-            // Having enough space in buf to write src
-            self.buf[self.cursor..self.cursor + M].copy_from_slice(src);
-            self.cursor += M;
-            M
-        } else {
-            // Not enough space in buf for the whole src
-            // Fill what it could
-            self.buf[self.cursor..].copy_from_slice(&src[..remained]);
-            
-            // Flush to producer
-            let _ = self.producer.write(&self.buf);
-
-            // println!("write to audio");
-            // println!("remained in buf: {}", M - remained);
-
-            // Save the rest to buf
-            self.buf[..M - remained].copy_from_slice(&src[remained..]);
-
-            self.cursor = M - remained;
-            remained
+    /// Generate `n` samples of a complex tone at `hz`, run them through an
+    /// Xlator set to `off`, and report the mean vector. A tone shifted to DC
+    /// has a mean of magnitude ~1; a tone left anywhere else averages to ~0.
+    fn shifted_mean(hz: f32, off: f32, n: usize) -> f32 {
+        let mut x = Xlator::new(off, FS);
+        let (mut sr, mut si) = (0.0f32, 0.0f32);
+        for k in 0..n {
+            let p = std::f32::consts::TAU * hz * k as f32 / FS;
+            let (i, q) = x.process_sample(p.cos(), p.sin());
+            sr += i;
+            si += q;
         }
+        ((sr / n as f32).powi(2) + (si / n as f32).powi(2)).sqrt()
+    }
+
+    /// The sign convention: a POSITIVE offset shifts DOWN. Offset tuning parks
+    /// the LO low so the station sits at +OFF, and this is what brings it to 0.
+    /// Getting this backwards moves the station to -2*OFF and you hear nothing.
+    #[test]
+    fn positive_offset_shifts_down() {
+        assert!(shifted_mean(OFF, OFF, 24000) > 0.99,
+            "a tone at +offset must land on DC");
+        assert!(shifted_mean(-OFF, OFF, 24000) < 0.01,
+            "a tone at -offset must NOT land on DC — that would be the wrong sign");
+    }
+
+    /// The LO spike sits at DC before the shift; afterwards it must be well
+    /// away from the channel, not merely somewhere else.
+    #[test]
+    fn dc_spike_is_moved_clear_of_the_channel() {
+        assert!(shifted_mean(0.0, OFF, 24000) < 0.01,
+            "DC must not stay at DC");
+        // and it lands at exactly -OFF: undoing the shift brings it back.
+        assert!(shifted_mean(0.0, 0.0, 24000) > 0.99);
+    }
+
+    /// The phasor is stepped by repeated complex multiplication, which drifts
+    /// in f32. `advance` renormalises every 512 samples; over a full USB
+    /// transfer the magnitude must stay put or the audio gets slow AM.
+    #[test]
+    fn phasor_magnitude_does_not_drift() {
+        let mut x = Xlator::new(OFF, FS);
+        for _ in 0..8192 {
+            x.process_sample(1.0, 0.0);
+        }
+        let m = (x.phase.real.powi(2) + x.phase.img.powi(2)).sqrt();
+        assert!((m - 1.0).abs() < 1e-4, "phasor magnitude drifted to {m}");
     }
 }
 

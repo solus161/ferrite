@@ -1,7 +1,7 @@
 use std::array;
 
 use sdr_core::dsp::{
-    DecimFIR, create_taps, PolyphaseResampler, FilterType, Window, Demodulation, Deemphasis,
+    DecimFIR, Deemphasis, Demodulation, FilterType, PolyphaseResampler, Window, create_taps,
 };
 
 /// De-emphasis time constant. 50 µs everywhere except the Americas and South
@@ -23,11 +23,11 @@ const DEEMPHASIS_TAU: f32 = 50e-6;
 /// this ends up inside two nested `move` closures on the SDR thread, and the
 /// intermediate copies of an inline version overflow a default stack in debug.
 pub struct DSPFlow {
-    stage_1: DecimFIR<8218, 8192, 27>,   // 26 + 8192, 27 taps, 2048 output
-    stage_2: DecimFIR<2116, 2048, 69>,   // 68 + 2048, 69 taps, 1024 output
+    stage_1: DecimFIR<8218, 8192, 27>, // 26 + 8192, 27 taps, 2048 output
+    stage_2: DecimFIR<2116, 2048, 69>, // 68 + 2048, 69 taps, 1024 output
     demod: Demodulation,
-    resampler: PolyphaseResampler,       // 1024, up 4 down 25
-    deemph: Deemphasis,                  // runs last, at 48 kHz
+    resampler: PolyphaseResampler, // 1024, up 4 down 25
+    deemph: Deemphasis,            // runs last, at 48 kHz
     out_i_decim: [f32; 1024],
     out_q_decim: [f32; 1024],
     out_demod: [f32; 1024],
@@ -45,9 +45,27 @@ impl DSPFlow {
         // [h0, 0, h2, 0, h4, 0, ..., h12, 0, 0.5, 0, h12, ..., h0]
         //                                       ↑ center tap = 0.5
         // So only 14 multiplication for 27 taps
-        let lpf_taps_1 = create_taps::<27>(FilterType::Lowpass, 100_000.0, 2_400_000.0, Window::Hann, None);
-        let lpf_taps_2 = create_taps::<69>(FilterType::Lowpass, 100_000.0, 600_000.0, Window::Hann, None);
-        let mut lpf_taps_resampler = create_taps::<1900>(FilterType::Lowpass, 15_000.0, 1_200_000.0, Window::Hann, None);
+        let lpf_taps_1 = create_taps::<27>(
+            FilterType::Lowpass,
+            100_000.0,
+            2_400_000.0,
+            Window::Hann,
+            None,
+        );
+        let lpf_taps_2 = create_taps::<69>(
+            FilterType::Lowpass,
+            100_000.0,
+            600_000.0,
+            Window::Hann,
+            None,
+        );
+        let mut lpf_taps_resampler = create_taps::<1900>(
+            FilterType::Lowpass,
+            15_000.0,
+            1_200_000.0,
+            Window::Hann,
+            None,
+        );
 
         // Resampler has 4 branch, each holds 1/4 of the original normalized DC gain of 1.0
         // so need to add DC gain for each branch
@@ -69,8 +87,7 @@ impl DSPFlow {
         Box::new(Self::new())
     }
 
-    pub fn process(&mut self, i: &[f32; 8192], q: &[f32; 8192]) -> usize
-    {
+    pub fn process(&mut self, i: &[f32; 8192], q: &[f32; 8192]) -> usize {
         assert_eq!(8192, i.len());
         assert_eq!(8192, q.len());
         // Returned number of sample processed
@@ -80,17 +97,15 @@ impl DSPFlow {
         self.stage_1.process(
             4,
             &mut self.stage_2.buf_i[68..],
-            &mut self.stage_2.buf_q[68..]
-            );
-        self.stage_2.process(
-            2,
-            &mut self.out_i_decim,
-            &mut self.out_q_decim,
-            );
-        
+            &mut self.stage_2.buf_q[68..],
+        );
+        self.stage_2
+            .process(2, &mut self.out_i_decim, &mut self.out_q_decim);
+
         // Demod must run before resampling
-        self.demod.process(&self.out_i_decim, &self.out_q_decim, &mut self.out_demod);
-        
+        self.demod
+            .process(&self.out_i_decim, &self.out_q_decim, &mut self.out_demod);
+
         // Resampler
         let resampler_count = self.resampler.process(&self.out_demod, &mut self.out);
 

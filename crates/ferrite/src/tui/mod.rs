@@ -1,4 +1,4 @@
-pub mod tui;
-mod stats_view;
-mod signal_view;
 pub mod app_states;
+mod signal_view;
+mod stats_view;
+pub mod tui;

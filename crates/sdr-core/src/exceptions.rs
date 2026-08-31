@@ -16,6 +16,7 @@ pub enum CustomError {
     RtlSetGain(u32),
     RtlSetPpm(u32),
     RtlEnableAgc,
+    RtlDisableAgc,
     RtlResetBuffer,
 }
 
@@ -29,6 +30,7 @@ impl Display for CustomError {
             Self::RtlSetGain(db) => write!(f, "RTL-SDR: Failed to set tuner gain {} dB", &db),
             Self::RtlSetPpm(ppm) => write!(f, "RTL-SDR: Failed to set ppm correction {}", &ppm),
             Self::RtlEnableAgc => write!(f, "RTL-SDR: Failed to enable AGC"),
+            Self::RtlDisableAgc => write!(f, "RTL-SDR: Failed to disable AGC"),
             Self::RtlResetBuffer => write!(f, "RTL-SDR: Failed to reset buffer"),
             _ => Ok(())
         }

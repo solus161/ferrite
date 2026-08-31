@@ -17,5 +17,3 @@ pub mod dsp;
 pub mod exceptions;
 pub mod fft;
 pub mod spmc;
-mod fir;
-mod fir_taps;

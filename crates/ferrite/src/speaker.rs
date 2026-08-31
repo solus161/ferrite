@@ -5,7 +5,7 @@ use cpal::{
 
 use sdr_core::spmc::RingConsumer;
 
-use crate::source::source::{AUDIO_DECIM, IQ_SLOTS, CPAL_BLOCK};
+use crate::source::source::{AUDIO_DECIM, CPAL_BLOCK, IQ_SLOTS};
 
 pub struct Speaker {
     stream: Stream,
@@ -68,7 +68,7 @@ impl Speaker {
                             match consumer.read_into(&mut staging) {
                                 Ok(_) => {
                                     pos = 0;
-                                },
+                                }
                                 Err(_) => {
                                     // Ring empty — underrun. Emit silence for this
                                     // frame and retry on the next one, so a block
