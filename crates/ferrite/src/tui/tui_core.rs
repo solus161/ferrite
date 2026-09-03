@@ -1,4 +1,3 @@
-use std::cell::Cell;
 use std::io;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -7,11 +6,13 @@ use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout};
+use ratatui::style::Style;
 use ratatui::{DefaultTerminal, Frame};
 
 use sdr_core::spmc::RingConsumer;
 use sdr_core::{control_signal::CtrlSignal, fft::Fft};
 
+use crate::tui::colors;
 use crate::tui::control_view::{self, ControlView};
 use crate::tui::info_view::{self, InfoView};
 use crate::tui::log_view::LogView;
@@ -155,7 +156,7 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
             KeyCode::Tab | KeyCode::BackTab => {
                 self.states
                     .focus
-                    .swap(&Cell::new(self.states.focus.get().next()));
+                    .set(self.states.focus.get().next());
                 // A pane you scrolled back through should be showing the tail
                 // again next time you come to it.
                 self.states.log_scroll.set(0);
@@ -175,6 +176,9 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
                 }
                 let (label, value) = self.control_view.focused();
                 self.set_status(format!("{label}  {value}"));
+
+                // Recompute axis mark labels
+                self.signal_view.gen_marked_labels();
             }
 
             // Kept as global shortcuts even though both are now Control rows —
@@ -193,6 +197,14 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
 
             // Back to the tail of the log.
             KeyCode::Char('g') => self.states.log_scroll.set(0),
+
+            // A/B the spectrum renderers. Which of blocks and braille reads
+            // better depends on the terminal font as much as on the signal, so
+            // it is a key rather than a decision taken in the source.
+            KeyCode::Char('v') => {
+                let style = self.signal_view.cycle_style();
+                self.set_status(format!("Spectrum  {}", style.label()));
+            }
 
             _ => {}
         }
@@ -262,6 +274,13 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
         self.signal_view.commit();
     }
 
+    /// This is called when a certain states changed
+    /// Recalculate axis mark labels
+    fn update_mark_labels(&mut self) {
+        self.signal_view.gen_mhz_xaxis_labels(false);
+        self.signal_view.gen_spec_yaxis_label(false);
+    }
+
     /// Left column of readouts, signal view filling the rest, one status row
     /// across the bottom.
     ///
@@ -271,8 +290,21 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
     /// rather than squeezing, which keeps the top of every list — the part you
     /// steer with — on screen.
     fn draw(&mut self, frame: &mut Frame) {
+        // Paint the ground before anything else. Without this the panels sit on
+        // whatever the terminal's own background happens to be, and a palette
+        // built around a dark teal surface reads as unrelated colours floating
+        // on someone else's theme.
+        //
+        // Cheap: one pass setting a `bg` on cells that are all about to be
+        // written anyway, and it costs no extra escape sequences — a cell
+        // carries its background whether or not we chose it.
+        let area = frame.area();
+        frame
+            .buffer_mut()
+            .set_style(area, Style::new().bg(colors::BG));
+
         let [main, status] =
-            Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(frame.area());
+            Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(area);
 
         let [sidebar, signal] =
             Layout::horizontal([Constraint::Length(SIDEBAR), Constraint::Fill(1)]).areas(main);
@@ -300,6 +332,8 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
         );
         self.states.log_scroll.set(scroll);
 
+        self.signal_view.waterfall_height = signal.height;
+        self.signal_view.gen_marked_labels();
         frame.render_widget(&self.signal_view, signal);
         self.status_bar
             .render(status, frame.buffer_mut(), &self.states, self.status());

@@ -17,12 +17,13 @@ use std::rc::Rc;
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Widget};
 
 use sdr_core::control_signal::CtrlSignal;
 
+use crate::tui::colors;
 use crate::tui::tui_states::{TuiStates, TunerMode};
 /// Widest tuning range across the tuners librtlsdr supports, not this device's.
 /// The FC0013 in hand covers roughly 22–1100 MHz (PLAN.md §8.0) and silently
@@ -339,6 +340,14 @@ impl ControlView {
     }
 
     fn render_row(&self, area: Rect, buf: &mut Buffer, field: Field, focused: bool) {
+        // The lift under the focused row runs the full width of the pane, so it
+        // has to be painted before the three columns are laid out — a per-span
+        // background would stop at the end of each string and leave the row
+        // looking ragged.
+        if focused {
+            buf.set_style(area, Style::new().bg(colors::BG_SELECTED));
+        }
+
         let [marker, label, value] = Layout::horizontal([
             Constraint::Length(2),
             Constraint::Length(8),
@@ -346,27 +355,32 @@ impl ControlView {
         ])
         .areas(area);
 
-        // Unfocused: label dimmed so the eye lands on the values, which are the
-        // part that changes while the radio runs. Focused: the whole row goes
-        // accent-coloured, since the marker alone is easy to lose against a
-        // waterfall running next to it.
+        // At rest the row is cyan label + neutral value, and the eye skips it.
+        // Focused, the whole row goes orange — the marker alone is easy to lose
+        // against a waterfall running next to it, and orange is reserved for
+        // exactly this so it stays findable at a glance.
         let (label_style, mut value_style) = if focused {
             (
-                Style::new().fg(Color::Yellow),
-                Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                Style::new().fg(colors::FOCUS),
+                Style::new()
+                    .fg(colors::FOCUS_BRIGHT)
+                    .add_modifier(Modifier::BOLD),
             )
         } else {
-            (Style::new().fg(Color::DarkGray), Style::new())
+            (
+                Style::new().fg(colors::LABEL),
+                Style::new().fg(colors::TEXT),
+            )
         };
 
         if field.inert(self) {
             value_style = value_style
-                .fg(Color::DarkGray)
+                .fg(colors::INERT)
                 .add_modifier(Modifier::CROSSED_OUT);
         }
 
         if focused {
-            Line::styled("\u{25b8}", Style::new().fg(Color::Yellow)).render(marker, buf);
+            Line::styled("\u{25b8}", Style::new().fg(colors::FOCUS_BRIGHT)).render(marker, buf);
         }
         Line::styled(field.label(), label_style).render(label, buf);
         Line::styled(field.value(self), value_style)
@@ -376,8 +390,10 @@ impl ControlView {
 
     pub fn render(&self, area: Rect, buf: &mut Buffer, focused_pane: bool) {
         let block = Block::bordered()
+            .style(colors::pane_card())
             .title("Control")
-            .border_style(pane_border(focused_pane));
+            .title_style(colors::pane_title())
+            .border_style(colors::pane_border(focused_pane));
         let inner = block.inner(area);
         block.render(area, buf);
 
@@ -402,7 +418,9 @@ impl ControlView {
                 let Some(r) = row(1) else { return };
                 Line::styled(
                     name,
-                    Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    Style::new()
+                        .fg(colors::SECTION)
+                        .add_modifier(Modifier::BOLD),
                 )
                 .render(r, buf);
             }
@@ -425,16 +443,6 @@ fn fmt_hz(hz: u32) -> String {
 
 fn on_off(b: bool) -> String {
     if b { "on".into() } else { "off".into() }
-}
-
-/// Border colour for a pane that may or may not have focus. Shared with the
-/// other panels so focus reads the same everywhere.
-pub fn pane_border(focused: bool) -> Style {
-    if focused {
-        Style::new().fg(Color::Yellow)
-    } else {
-        Style::new().fg(Color::DarkGray)
-    }
 }
 
 /// Shift and clamp. Widened to i64 so a downward step past zero saturates
@@ -482,19 +490,31 @@ mod test {
         assert_eq!(offset(1_000, -5_000, FREQ_RANGE), FREQ_RANGE.0);
     }
 
+    /// The panel's whole world, with the two knobs any test might care about.
+    ///
+    /// Everything else is a fixed plausible radio: 2.4 MS/s, 48 kHz audio,
+    /// 91 MHz, 100 kHz step, 300 kHz channel, no PPM correction.
+    ///
+    /// Note `TuiStates::new` starts AGC **on**, so a test about the gain path
+    /// has to say which it wants rather than lean on the default.
+    fn states(gain_tenths: i32, floor_db: f32, ceil_db: f32) -> Rc<TuiStates> {
+        Rc::new(TuiStates::new(
+            2_400_000,
+            48_000,
+            91_000_000,
+            100_000,
+            gain_tenths,
+            300_000,
+            0,
+            floor_db,
+            ceil_db,
+        ))
+    }
+
     /// Every field must be reachable, and the cursor must come back round.
     #[test]
     fn the_cursor_visits_every_field_once_per_cycle() {
-        let app = Arc::new(AppStates::new(
-            2_400_000, 48_000, 91_000_000, 197, 300_000, 0,
-        ));
-        let mut v = ControlView::new(
-            app,
-            vec![],
-            100_000,
-            Rc::new(Cell::new(-90.0)),
-            Rc::new(Cell::new(0.0)),
-        );
+        let mut v = ControlView::new(states(197, -90.0, 0.0), vec![]);
 
         let mut seen = vec![];
         for _ in 0..Field::ALL.len() {
@@ -513,16 +533,7 @@ mod test {
     /// height it asks `tui::draw` for is not a height it is guaranteed.
     #[test]
     fn a_pane_too_short_for_the_list_clips_instead_of_panicking() {
-        let app = Arc::new(AppStates::new(
-            2_400_000, 48_000, 91_000_000, 197, 300_000, 0,
-        ));
-        let v = ControlView::new(
-            app,
-            vec![58, 197],
-            100_000,
-            Rc::new(Cell::new(-90.0)),
-            Rc::new(Cell::new(0.0)),
-        );
+        let v = ControlView::new(states(197, -90.0, 0.0), vec![58, 197]);
 
         for height in 0..=HEIGHT + 4 {
             let area = Rect::new(0, 0, 30, height);
@@ -540,25 +551,81 @@ mod test {
         }
     }
 
+    /// The focused row is lifted by a background, not only by its foreground
+    /// colours, and the lift has to span the whole pane width — a per-span
+    /// background stops at the end of each string and leaves the row ragged.
+    #[test]
+    fn the_focused_row_is_lifted_across_the_full_width() {
+        let mut v = ControlView::new(states(197, -90.0, 0.0), vec![]);
+        v.select(1); // off the first row, so the test is not passing by accident
+
+        let area = Rect::new(0, 0, 30, HEIGHT);
+        let mut buf = Buffer::empty(area);
+        v.render(area, &mut buf, true);
+
+        // Find the lifted row, then check it is lifted edge to edge.
+        let lifted: Vec<u16> = (area.y..area.bottom())
+            .filter(|&y| buf.cell((1, y)).unwrap().bg == colors::BG_SELECTED)
+            .collect();
+
+        assert_eq!(lifted.len(), 1, "exactly one row carries the focus");
+        let y = lifted[0];
+        for x in (area.x + 1)..(area.right() - 1) {
+            assert_eq!(
+                buf.cell((x, y)).unwrap().bg,
+                colors::BG_SELECTED,
+                "column {x} of the focused row is not lifted"
+            );
+        }
+    }
+
+    /// An unfocused pane must lift nothing — otherwise both panes look focused
+    /// and `Tab` stops meaning anything.
+    #[test]
+    fn an_unfocused_pane_lifts_no_row() {
+        let v = ControlView::new(states(197, -90.0, 0.0), vec![]);
+
+        let area = Rect::new(0, 0, 30, HEIGHT);
+        let mut buf = Buffer::empty(area);
+        v.render(area, &mut buf, false);
+
+        assert!(
+            !buf.content().iter().any(|c| c.bg == colors::BG_SELECTED),
+            "an unfocused pane painted a selection"
+        );
+    }
+
+    /// The panel is a card: its ground covers border and inner alike, so it
+    /// floats on the app surface instead of being a frame with a hole in it.
+    #[test]
+    fn the_panel_paints_a_card_ground() {
+        let v = ControlView::new(states(197, -90.0, 0.0), vec![]);
+
+        let area = Rect::new(0, 0, 30, HEIGHT);
+        let mut buf = Buffer::empty(area);
+        v.render(area, &mut buf, false);
+
+        // A border corner and an interior cell: both belong to the card.
+        for (x, y) in [(area.x, area.y), (area.x + 1, area.y + 1)] {
+            assert_eq!(
+                buf.cell((x, y)).unwrap().bg,
+                colors::BG_CARD,
+                "cell ({x}, {y}) is not on the card ground"
+            );
+        }
+    }
+
     #[test]
     fn gain_steps_the_tuners_table_not_whole_db() {
         // The FC0013's three clusters — the ~11 dB gaps are why this matters.
         let table = vec![-99, -73, -65, 58, 61, 63, 179, 181, 197];
-        let app = Arc::new(AppStates::new(
-            2_400_000, 48_000, 91_000_000, 63, 300_000, 0,
-        ));
-        let v = ControlView::new(
-            app.clone(),
-            table,
-            100_000,
-            Rc::new(Cell::new(-90.0)),
-            Rc::new(Cell::new(0.0)),
-        );
+        let s = states(63, -90.0, 0.0);
+        let v = ControlView::new(s.clone(), table);
 
         assert_eq!(v.gain_step(1), 179, "steps across the gap, not by 1 dB");
         assert_eq!(v.gain_step(-1), 61);
 
-        app.gain_tenths.store(197, Relaxed);
+        s.gain_tenths.set(197);
         assert_eq!(v.gain_step(1), 197, "saturates at the ceiling");
     }
 
@@ -566,16 +633,7 @@ mod test {
     /// `min_by_key` or invent a gain the tuner never offered.
     #[test]
     fn gain_with_no_table_is_a_no_op() {
-        let app = Arc::new(AppStates::new(
-            2_400_000, 48_000, 91_000_000, 123, 300_000, 0,
-        ));
-        let v = ControlView::new(
-            app,
-            vec![],
-            100_000,
-            Rc::new(Cell::new(-90.0)),
-            Rc::new(Cell::new(0.0)),
-        );
+        let v = ControlView::new(states(123, -90.0, 0.0), vec![]);
         assert_eq!(v.gain_step(1), 123);
     }
 
@@ -583,45 +641,29 @@ mod test {
     /// letting the span collapse.
     #[test]
     fn the_display_range_cannot_collapse() {
-        let app = Arc::new(AppStates::new(
-            2_400_000, 48_000, 91_000_000, 197, 300_000, 0,
-        ));
-        let floor = Rc::new(Cell::new(-20.0));
-        let ceil = Rc::new(Cell::new(-12.0));
-        let v = ControlView::new(app, vec![], 100_000, floor.clone(), ceil.clone());
+        let s = states(197, -20.0, -12.0);
+        let v = ControlView::new(s.clone(), vec![]);
 
         Field::Floor.adjust(&v, 1);
-        assert_eq!(floor.get(), -18.0);
-        assert_eq!(ceil.get(), -8.0, "ceiling pushed up to keep the span");
+        assert_eq!(s.floor_db.get(), -18.0);
+        assert_eq!(s.ceil_db.get(), -8.0, "ceiling pushed up to keep the span");
 
         Field::Ceil.adjust(&v, -1);
-        assert_eq!(ceil.get(), -10.0);
-        assert_eq!(floor.get(), -20.0, "floor pushed down");
+        assert_eq!(s.ceil_db.get(), -10.0);
+        assert_eq!(s.floor_db.get(), -20.0, "floor pushed down");
     }
 
     /// Reaching for the gain hands control back to you; the device has to be
     /// told, or the tuner stays in auto and ignores the value on screen.
     #[test]
     fn adjusting_gain_while_agc_is_on_turns_agc_off() {
-        let app = Arc::new(AppStates::new(
-            2_400_000, 48_000, 91_000_000, 63, 300_000, 0,
-        ));
-        app.agc.store(true, Relaxed);
-        let v = ControlView::new(
-            app.clone(),
-            vec![58, 63, 179],
-            100_000,
-            Rc::new(Cell::new(-90.0)),
-            Rc::new(Cell::new(0.0)),
-        );
+        let s = states(63, -90.0, 0.0);
+        s.agc.set(true);
+        let v = ControlView::new(s.clone(), vec![58, 63, 179]);
 
         let sig = Field::Gain.adjust(&v, 1);
-        assert!(!app.agc.load(Relaxed));
-        assert_eq!(
-            app.gain_tenths.load(Relaxed),
-            179,
-            "and the gain still moved"
-        );
+        assert!(!s.agc.get());
+        assert_eq!(s.gain_tenths.get(), 179, "and the gain still moved");
         assert!(
             matches!(sig, Some(CtrlSignal::GainTenths(179))),
             "one signal carries both halves: manual mode, at this value"
@@ -632,22 +674,17 @@ mod test {
     /// and the tuner disagree about what the radio is doing.
     #[test]
     fn turning_agc_off_re_applies_the_panel_gain() {
-        let app = Arc::new(AppStates::new(
-            2_400_000, 48_000, 91_000_000, 63, 300_000, 0,
-        ));
-        let v = ControlView::new(
-            app.clone(),
-            vec![58, 63, 179],
-            100_000,
-            Rc::new(Cell::new(-90.0)),
-            Rc::new(Cell::new(0.0)),
-        );
+        let s = states(63, -90.0, 0.0);
+        // Explicitly off first: this test is about the off -> on -> off cycle,
+        // and `TuiStates::new` starts it on.
+        s.agc.set(false);
+        let v = ControlView::new(s.clone(), vec![58, 63, 179]);
 
         assert!(matches!(Field::Agc.adjust(&v, 1), Some(CtrlSignal::AgcOn)));
-        assert!(app.agc.load(Relaxed));
+        assert!(s.agc.get());
 
         let sig = Field::Agc.adjust(&v, 1);
-        assert!(!app.agc.load(Relaxed));
+        assert!(!s.agc.get());
         assert!(matches!(sig, Some(CtrlSignal::GainTenths(63))));
     }
 }

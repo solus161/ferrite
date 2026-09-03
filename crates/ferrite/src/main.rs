@@ -13,7 +13,7 @@ use sdr_core::{control_signal::CtrlSignal, exceptions::CustomError, spmc::RingPr
 use crate::source::source::Source;
 use crate::source::source::{CPAL_BLOCK, IQ_BLOCK, IQ_SLOTS, OFFSET_TUNING_HZ};
 use crate::speaker::Speaker;
-use crate::tui::{tui::Tui, tui_states::Health, tui_states::TuiStates};
+use crate::tui::{tui_core::Tui, tui_states::Health, tui_states::TuiStates};
 
 /// Startup gain, in librtlsdr's tenths of a dB. Snapped to the tuner's own
 /// table at open, so this is a request, not a promise — 20 dB lands on the

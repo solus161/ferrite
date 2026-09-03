@@ -15,6 +15,13 @@ use ratatui::style::{Color, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Widget};
 
+// The gradient lives in `colors` with the rest of the palette. All cyan:
+// orange is the accent, and a waterfall that borrowed it would paint a loud
+// carrier the same shade as a warning. Monotonicity in lightness — what keeps
+// a weak signal legible against the noise floor — is asserted by the tests
+// over there.
+use crate::tui::colors::{self, SPECTRUM_STOPS as STOPS};
+
 /// Upper-half block. The foreground paints the top half of the cell and the
 /// background the bottom, so every terminal row carries two waterfall lines.
 const HALF: char = '\u{2580}';
@@ -22,15 +29,64 @@ const EIGHT_BLOCK: [char; 8] = [
     '\u{2581}', '\u{2582}', '\u{2583}', '\u{2584}', '\u{2585}', '\u{2586}', '\u{2587}', '\u{2588}',
 ];
 
-/// Inferno-ish stops. Monotone in lightness, which is what keeps a weak signal
-/// legible against the noise floor and survives a grayscale screenshot.
-const STOPS: [[f32; 3]; 5] = [
-    [0.0, 0.0, 4.0],
-    [87.0, 16.0, 110.0],
-    [188.0, 55.0, 84.0],
-    [249.0, 142.0, 9.0],
-    [252.0, 255.0, 164.0],
+/// Braille dot bits, indexed `[row within the cell][column within the cell]`,
+/// row 0 at the top.
+///
+/// The numbering is the trap. Dots 1–3 run down the left column and 4–6 down
+/// the right, from the original six-dot cell; the fourth row was added later
+/// for eight-dot braille and is dots 7 and 8, so it does not continue the
+/// pattern. Deriving the bit arithmetically instead of tabulating it puts the
+/// bottom row in the wrong column and shears the whole trace.
+const BRAILLE_DOTS: [[u8; 2]; 4] = [
+    [0x01, 0x08],
+    [0x02, 0x10],
+    [0x04, 0x20],
+    [0x40, 0x80],
 ];
+
+/// U+2800 BRAILLE PATTERN BLANK. The 256 patterns are laid out so that the code
+/// point is the base plus the dot bits, which is why the table above can be
+/// OR-ed straight onto it.
+const BRAILLE_BASE: u32 = 0x2800;
+
+/// How the spectrum panel draws its trace.
+///
+/// A real trade rather than a preference, which is why all three stay in the
+/// tree and a keypress switches them:
+///
+/// - [`Blocks`](Self::Blocks) — one column per cell, eight vertical steps.
+///   Coarsest horizontally, finest vertically, and every cell can take its own
+///   colour.
+/// - Braille — 2×4 dots per cell: **twice** the horizontal resolution for
+///   **half** the vertical. Braille carries one foreground colour per cell, so
+///   the two sub-columns inside a cell have to share one.
+///
+/// Which looks better depends on the terminal font as much as on the signal —
+/// some fonts render braille dots small and faint, and there the blocks win.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SpectrumStyle {
+    Blocks,
+    BrailleFill,
+    BrailleTrace,
+}
+
+impl SpectrumStyle {
+    pub fn next(self) -> Self {
+        match self {
+            SpectrumStyle::Blocks => SpectrumStyle::BrailleFill,
+            SpectrumStyle::BrailleFill => SpectrumStyle::BrailleTrace,
+            SpectrumStyle::BrailleTrace => SpectrumStyle::Blocks,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SpectrumStyle::Blocks => "blocks",
+            SpectrumStyle::BrailleFill => "braille fill",
+            SpectrumStyle::BrailleTrace => "braille trace",
+        }
+    }
+}
 
 pub struct SignalView {
     bins: usize,
@@ -68,6 +124,19 @@ pub struct SignalView {
     /// Preallocated arrays labels for waterfall timelapse axis
     /// 5 segments, 6 values
     water_yaxis_labels: [f32; 6],
+
+    /// Rows the signal pane was last given, written by `tui_core::draw`.
+    ///
+    /// **Reconstructed, not recovered** — the field was lost with the
+    /// uncommitted work and only its write site survived. Declared `pub` and
+    /// zero-initialised to match how `draw` assigns it; the timelapse axis that
+    /// presumably consumes it is not wired up here, so nothing reads it yet.
+    pub waterfall_height: u16,
+
+    /// Which renderer the spectrum panel uses. Not in `TuiStates` — no other
+    /// widget reads it, so it stays with the panel that owns it, the same
+    /// reasoning that keeps the Control cursor beside `Field::ALL`.
+    style: SpectrumStyle,
 }
 
 impl SignalView {
@@ -98,7 +167,28 @@ impl SignalView {
             mhz_xaxis_labels: array::from_fn(|_| 0.0f32),
             spec_yaxis_labels: array::from_fn(|_| 0.0f32),
             water_yaxis_labels: array::from_fn(|_| 0.0f32),
+            waterfall_height: 0,
+            style: SpectrumStyle::BrailleFill,
         }
+    }
+
+    /// Cycle to the next renderer and report it, so the caller can say which
+    /// one is now on screen.
+    pub fn cycle_style(&mut self) -> SpectrumStyle {
+        self.style = self.style.next();
+        self.style
+    }
+
+    /// Recompute every axis' mark labels.
+    ///
+    /// **Reconstructed, not recovered** — `tui_core` called this and the
+    /// definition was lost with the uncommitted work. It is the obvious reading
+    /// of the two call sites: both `gen_*` helpers already skip the work when
+    /// their inputs have not changed, so calling this on any state change is
+    /// cheap and cannot leave an axis stale.
+    pub fn gen_marked_labels(&mut self) {
+        self.gen_mhz_xaxis_labels(false);
+        self.gen_spec_yaxis_label(false);
     }
 
     /// Fold one spectrum into the pending row.
@@ -208,7 +298,7 @@ impl SignalView {
     /// Computer waterfall mhz axis marks
     /// `force = true` means recalculate marks always
     /// else check for change before calculation
-    fn gen_mhz_xaxis_labels(&mut self, force: bool) {
+    pub fn gen_mhz_xaxis_labels(&mut self, force: bool) {
         let current_freq = self.center_freq.0.get();
         if force || current_freq != self.center_freq.1 {
             Self::gen_axis_labels_center(
@@ -257,7 +347,7 @@ impl SignalView {
             let hz = center_hz + (i as i64 - 2) * fifth;
             Line::styled(
                 format!("{:.3}", hz as f64 / 1e6),
-                Style::new().fg(Color::DarkGray),
+                Style::new().fg(colors::LABEL),
             )
             .centered()
             .render(*col, buf);
@@ -273,6 +363,98 @@ impl SignalView {
     }
 
     fn render_spectrum(&self, area: Rect, buf: &mut Buffer) {
+        match self.style {
+            SpectrumStyle::Blocks => self.render_spectrum_blocks(area, buf),
+            SpectrumStyle::BrailleFill => self.render_spectrum_braille(area, buf, false),
+            SpectrumStyle::BrailleTrace => self.render_spectrum_braille(area, buf, true),
+        }
+    }
+
+    /// The spectrum as braille dots: 2×4 per cell, so twice the frequency
+    /// resolution of the block renderer at half the vertical.
+    ///
+    /// `trace` draws the outline alone rather than filling to the floor. On a
+    /// noise floor the two look nearly identical; on a strong carrier the fill
+    /// reads as a solid tower and the trace as a curve, which is the whole
+    /// reason both are here.
+    fn render_spectrum_braille(&self, area: Rect, buf: &mut Buffer, trace: bool) {
+        if area.is_empty() || self.bins == 0 {
+            return;
+        }
+        let Some(row) = self.rows.front() else { return };
+
+        let (width, height) = (area.width as usize, area.height as usize);
+        let (sub_w, sub_h) = (width * 2, height * 4);
+
+        let (floor, ceil) = (self.floor_db.0.get(), self.ceil_db.0.get());
+        let span = (ceil - floor).max(f32::EPSILON);
+
+        // Per sub-column: the peak dB, and the sub-row its bar reaches. Heights
+        // are measured *from the top* because that is how the dot table is
+        // indexed, and converting once here beats flipping the axis inside the
+        // per-dot test.
+        let mut tops = Vec::with_capacity(sub_w);
+        let mut dbs = Vec::with_capacity(sub_w);
+        for sx in 0..sub_w {
+            let db = self.column(row, sx, sub_w);
+            let filled = ((db.clamp(floor, ceil) - floor) / span * sub_h as f32).round() as usize;
+            // Clamped to the last sub-row rather than past it: a bar sitting at
+            // the floor then draws a one-dot baseline instead of nothing, which
+            // is what makes an empty stretch of band read as a quiet noise
+            // floor rather than as a dead display.
+            tops.push((sub_h - filled.min(sub_h)).min(sub_h - 1));
+            dbs.push(db);
+        }
+
+        for cx in 0..width {
+            // Braille carries one foreground per cell, so the two sub-columns
+            // inside it must agree on a colour. Peak, for the same reason
+            // `column` folds by peak.
+            let color = self.color(dbs[2 * cx].max(dbs[2 * cx + 1]));
+
+            for cy in 0..height {
+                let mut bits = 0u8;
+                for (dy, dots) in BRAILLE_DOTS.iter().enumerate() {
+                    let y = cy * 4 + dy;
+                    for dx in 0..2 {
+                        if self.dot_lit(&tops, 2 * cx + dx, y, trace) {
+                            bits |= dots[dx];
+                        }
+                    }
+                }
+
+                // Leave untouched rather than writing U+2800: the blank pattern
+                // is a glyph, and painting it would overwrite whatever the
+                // waterfall or a future marker put there.
+                if bits == 0 {
+                    continue;
+                }
+
+                if let Some(cell) = buf.cell_mut((area.x + cx as u16, area.y + cy as u16)) {
+                    // Infallible: BRAILLE_BASE + a u8 is inside the 256-code
+                    // point braille block, which has no gaps or surrogates.
+                    let glyph = char::from_u32(BRAILLE_BASE + bits as u32).unwrap();
+                    cell.set_char(glyph).set_fg(color);
+                }
+            }
+        }
+    }
+
+    /// Whether the dot at sub-column `sx`, sub-row `y` (from the top) is lit.
+    fn dot_lit(&self, tops: &[usize], sx: usize, y: usize, trace: bool) -> bool {
+        let cur = tops[sx];
+        if !trace {
+            return y >= cur;
+        }
+
+        // The tip, plus the vertical run back to the previous sub-column's tip.
+        // Without that join a steep skirt renders as a stack of disconnected
+        // dots — the difference between a curve and a dotted diagonal.
+        let prev = if sx == 0 { cur } else { tops[sx - 1] };
+        y >= cur.min(prev) && y <= cur.max(prev)
+    }
+
+    fn render_spectrum_blocks(&self, area: Rect, buf: &mut Buffer) {
         if area.is_empty() || self.bins == 0 {
             return;
         }
@@ -330,7 +512,9 @@ impl SignalView {
                 // terminal's own background rather than painting floor_db —
                 // a half-filled waterfall should look empty, not silent.
                 let pick = |row: Option<&Box<[f32]>>| {
-                    row.map_or(Color::Reset, |r| self.color(self.column(r, x, width)))
+                    row.map_or(colors::WATERFALL_EMPTY, |r| {
+                        self.color(self.column(r, x, width))
+                    })
                 };
 
                 if let Some(cell) = buf.cell_mut((area.x + x as u16, area.y + y)) {
@@ -341,9 +525,104 @@ impl SignalView {
     }
 }
 
+#[cfg(test)]
+mod braille_tests {
+    use super::*;
+
+    const BINS: usize = 64;
+    const FLOOR: f32 = -90.0;
+    const CEIL: f32 = 0.0;
+
+    /// A view holding one flat spectrum at `db`, ready to render.
+    fn view_at(db: f32) -> SignalView {
+        let mut v = SignalView::new(
+            BINS,
+            8,
+            Rc::new(Cell::new(91_000_000)),
+            Rc::new(Cell::new(2_400_000)),
+            Rc::new(Cell::new(FLOOR)),
+            Rc::new(Cell::new(CEIL)),
+        );
+        v.push(&vec![db; BINS]);
+        v.commit();
+        v
+    }
+
+    /// Render one terminal row and return the glyphs across it.
+    fn glyphs(v: &SignalView, width: u16, trace: bool) -> Vec<char> {
+        let area = Rect::new(0, 0, width, 1);
+        let mut buf = Buffer::empty(area);
+        v.render_spectrum_braille(area, &mut buf, trace);
+        (0..width)
+            .map(|x| buf.cell((x, 0)).unwrap().symbol().chars().next().unwrap())
+            .collect()
+    }
+
+    /// The orientation test. `BRAILLE_DOTS` cannot be derived arithmetically —
+    /// the bottom row is dots 7/8, not a continuation of 1-3 and 4-6 — so a
+    /// plausible-looking table can still be upside down or column-swapped.
+    ///
+    /// Both glyphs here are asymmetric in exactly the way that would catch it:
+    /// U+28C0 is the *bottom* line and U+2809 the *top*, so swapping the rows
+    /// swaps the two assertions.
+    #[test]
+    fn dot_table_is_the_right_way_up() {
+        // At the floor, only the baseline row is lit: dots 7 and 8.
+        assert_eq!(glyphs(&view_at(FLOOR), 4, false), vec!['\u{28C0}'; 4]);
+
+        // At the ceiling the cell is solid: all eight dots.
+        assert_eq!(glyphs(&view_at(CEIL), 4, false), vec!['\u{28FF}'; 4]);
+
+        // Half a cell's worth from the top down, in trace mode, is the top row
+        // alone — dots 1 and 4. A row-flipped table returns U+28C0 here.
+        assert_eq!(glyphs(&view_at(CEIL), 4, true), vec!['\u{2809}'; 4]);
+    }
+
+    /// A bar at the floor still draws its baseline rather than nothing, so an
+    /// empty stretch of band reads as a quiet noise floor and not as a dead
+    /// panel. This is the `.min(sub_h - 1)` clamp in `render_spectrum_braille`.
+    #[test]
+    fn the_floor_draws_a_baseline_not_a_blank() {
+        for g in glyphs(&view_at(FLOOR - 20.0), 4, false) {
+            assert_ne!(g, ' ', "a signal below the floor still needs a baseline");
+            assert_ne!(g, '\u{2800}', "and it must not be the blank pattern");
+        }
+    }
+
+    /// Braille buys its horizontal resolution from `column`, which folds bins
+    /// onto `width * 2` sub-columns rather than `width`. If the fold ever went
+    /// back to per-cell, a one-bin carrier would smear across twice the width.
+    #[test]
+    fn a_narrow_carrier_lands_in_one_half_of_a_cell() {
+        let mut v = view_at(FLOOR);
+        // One bin at the ceiling, in the left half of the second cell.
+        // 8 sub-columns across 64 bins is 8 bins each; sub-column 2 is bins
+        // 16..24.
+        let mut row = vec![FLOOR; BINS];
+        row[18] = CEIL;
+        v.push(&row);
+        v.commit();
+
+        let g = glyphs(&v, 4, false);
+        // Cell 1 holds sub-columns 2 and 3. The carrier is in sub-column 2 —
+        // the left dot column — so the left dots are full and the right are
+        // still at the baseline: dot 7 plus the whole left column.
+        assert_eq!(g[1], '\u{28C7}', "carrier should fill only the left dots");
+        assert_eq!(g[0], '\u{28C0}', "and leave its neighbours at the floor");
+    }
+}
+
 impl Widget for &SignalView {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let block = Block::bordered().title("Spectrum \u{b7} MHz");
+        // `style` paints the whole panel, inner included, so the spectrum and
+        // the waterfall share one well rather than meeting at a seam where the
+        // painted-but-empty spectrum ground would butt against the waterfall's
+        // own. Set before the border and title styles, which layer on top.
+        let block = Block::bordered()
+            .style(Style::new().bg(colors::BG_WELL))
+            .title("Spectrum \u{b7} MHz")
+            .title_style(colors::pane_title())
+            .border_style(colors::pane_border(false));
         let inner = block.inner(area);
         block.render(area, buf);
 

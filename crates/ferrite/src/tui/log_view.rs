@@ -11,12 +11,12 @@
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Widget};
 
 use crate::log::{self, Level};
-use crate::tui::control_view::pane_border;
+use crate::tui::colors;
 
 pub struct LogView;
 
@@ -28,8 +28,10 @@ impl LogView {
     /// number that means nothing.
     pub fn render(&self, area: Rect, buf: &mut Buffer, scroll: usize, focused: bool) -> usize {
         let block = Block::bordered()
+            .style(colors::pane_card())
             .title("Log")
-            .border_style(pane_border(focused));
+            .title_style(colors::pane_title())
+            .border_style(colors::pane_border(focused));
         let inner = block.inner(area);
         block.render(area, buf);
 
@@ -50,8 +52,8 @@ impl LogView {
                 let stamp = format!("{:02}:{:02} ", secs / 60, secs % 60);
 
                 let line = Line::from(vec![
-                    Span::styled(stamp, Style::new().fg(Color::DarkGray)),
-                    Span::styled(e.text.clone(), Style::new().fg(level_color(e.level))),
+                    Span::styled(stamp, Style::new().fg(colors::LOG_TIME)),
+                    Span::styled(e.text.clone(), level_style(e.level)),
                 ]);
 
                 let row = Rect::new(inner.x, inner.y + i as u16, inner.width, 1);
@@ -63,10 +65,16 @@ impl LogView {
     }
 }
 
-fn level_color(level: Level) -> Color {
+/// The palette carries no red, so error escalates by *inversion* rather than by
+/// hue: warn is orange text, error is a block of orange. Louder at a glance,
+/// and it does not introduce a colour from outside the palette — which is the
+/// thing that makes a designed UI look assembled.
+fn level_style(level: Level) -> Style {
     match level {
-        Level::Info => Color::Gray,
-        Level::Warn => Color::Yellow,
-        Level::Error => Color::Red,
+        Level::Info => Style::new().fg(colors::LOG_INFO),
+        Level::Warn => Style::new().fg(colors::LOG_WARN),
+        Level::Error => Style::new()
+            .fg(colors::LOG_ERROR_FG)
+            .bg(colors::LOG_ERROR_BG),
     }
 }
