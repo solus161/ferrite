@@ -11,17 +11,19 @@
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Widget;
 
+use crate::tui::colors;
 use crate::tui::tui_states::{Pane, TuiStates};
 
 /// `(key, what it does)`, joined at render time.
-const CONTROL_KEYS: [(&str, &str); 6] = [
+const CONTROL_KEYS: [(&str, &str); 7] = [
     ("\u{2191}\u{2193}", "field"),
     ("\u{2190}\u{2192}", "adjust"),
     ("[ ]", "floor"),
+    ("v", "spectrum"),
     ("m", "mute"),
     ("tab", "pane"),
     ("q", "quit"),
@@ -45,7 +47,7 @@ impl StatusBar {
         if let Some(msg) = status {
             Line::styled(
                 format!(" {msg}"),
-                Style::new().fg(Color::Black).bg(Color::Yellow),
+                Style::new().fg(colors::STATUS_FG).bg(colors::STATUS_BG),
             )
             .render(area, buf);
             return;
@@ -60,11 +62,13 @@ impl StatusBar {
         for (key, what) in keys {
             spans.push(Span::styled(
                 *key,
-                Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                Style::new()
+                    .fg(colors::HINT_KEY)
+                    .add_modifier(Modifier::BOLD),
             ));
             spans.push(Span::styled(
                 format!(" {what}   "),
-                Style::new().fg(Color::DarkGray),
+                Style::new().fg(colors::HINT_TEXT),
             ));
         }
 

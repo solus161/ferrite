@@ -1,4 +1,3 @@
-use std::cell::Cell;
 use std::io;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -7,11 +6,13 @@ use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout};
+use ratatui::style::Style;
 use ratatui::{DefaultTerminal, Frame};
 
 use sdr_core::spmc::RingConsumer;
 use sdr_core::{control_signal::CtrlSignal, fft::Fft};
 
+use crate::tui::colors;
 use crate::tui::control_view::{self, ControlView};
 use crate::tui::info_view::{self, InfoView};
 use crate::tui::log_view::LogView;
@@ -21,7 +22,7 @@ use crate::tui::tui_states::{Health, Pane, TuiStates};
 use super::signal_view::SignalView;
 
 /// 30 fps is good enough
-const FRAME: Duration = Duration::from_millis(33);
+pub const FRAME: Duration = Duration::from_millis(33);
 
 /// Width of the left column, in columns.
 ///
@@ -48,11 +49,13 @@ pub struct Tui<const SLOTS: usize, const BLOCK: usize, const N: usize> {
     status_bar: StatusBar,
     status: Option<(String, Instant)>,
 
-    // IQ stream buffer, after centered and high-pass filter
+    /// IQ stream buffer, after centered and high-pass filter
     block: [f32; BLOCK],
 
     /// Sender of CtrlSignal
     ctrl_tx: Sender<CtrlSignal>,
+
+    
 }
 
 impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N> {
@@ -132,8 +135,7 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
         self.status
             .as_ref()
             .filter(|(_, at)| at.elapsed() < STATUS_TTL)
-            .map(|(t, _)| t.as_str())
-    }
+            .map(|(t, _)| t.as_str()) }
 
     /// Returns true when the app should exit.
     fn on_key(&mut self, k: KeyEvent) -> bool {
@@ -155,7 +157,7 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
             KeyCode::Tab | KeyCode::BackTab => {
                 self.states
                     .focus
-                    .swap(&Cell::new(self.states.focus.get().next()));
+                    .set(self.states.focus.get().next());
                 // A pane you scrolled back through should be showing the tail
                 // again next time you come to it.
                 self.states.log_scroll.set(0);
@@ -175,6 +177,9 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
                 }
                 let (label, value) = self.control_view.focused();
                 self.set_status(format!("{label}  {value}"));
+
+                // Recompute axis mark labels
+                self.signal_view.gen_marked_labels(false);
             }
 
             // Kept as global shortcuts even though both are now Control rows —
@@ -193,6 +198,14 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
 
             // Back to the tail of the log.
             KeyCode::Char('g') => self.states.log_scroll.set(0),
+
+            // A/B the spectrum renderers. Which of blocks and braille reads
+            // better depends on the terminal font as much as on the signal, so
+            // it is a key rather than a decision taken in the source.
+            KeyCode::Char('v') => {
+                let style = self.signal_view.cycle_style();
+                self.set_status(format!("Spectrum  {}", style.label()));
+            }
 
             _ => {}
         }
@@ -271,8 +284,21 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
     /// rather than squeezing, which keeps the top of every list — the part you
     /// steer with — on screen.
     fn draw(&mut self, frame: &mut Frame) {
+        // Paint the ground before anything else. Without this the panels sit on
+        // whatever the terminal's own background happens to be, and a palette
+        // built around a dark teal surface reads as unrelated colours floating
+        // on someone else's theme.
+        //
+        // Cheap: one pass setting a `bg` on cells that are all about to be
+        // written anyway, and it costs no extra escape sequences — a cell
+        // carries its background whether or not we chose it.
+        let area = frame.area();
+        frame
+            .buffer_mut()
+            .set_style(area, Style::new().bg(colors::BG));
+
         let [main, status] =
-            Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(frame.area());
+            Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(area);
 
         let [sidebar, signal] =
             Layout::horizontal([Constraint::Length(SIDEBAR), Constraint::Fill(1)]).areas(main);
@@ -300,6 +326,15 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
         );
         self.states.log_scroll.set(scroll);
 
+        // The waterfall's own height, not the panel's. The time axis is scaled
+        // from this, and the panel is taller by the border, the spectrum and
+        // the frequency row — most of a short pane — so using `signal.height`
+        // overstated the visible history by well over half.
+        //
+        // Taken from `SignalView::layout`, the same split `render` uses a step
+        // later, so the axis cannot describe a pane other than the one drawn.
+        self.signal_view.waterfall_height = SignalView::layout(signal).water.height as f32;
+        self.signal_view.gen_marked_labels(true);
         frame.render_widget(&self.signal_view, signal);
         self.status_bar
             .render(status, frame.buffer_mut(), &self.states, self.status());

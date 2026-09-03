@@ -20,12 +20,12 @@ use std::sync::atomic::Ordering::Relaxed;
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Style};
+use ratatui::style::Style;
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Widget};
 
 use crate::source::source::OFFSET_TUNING_HZ;
-use crate::tui::control_view::pane_border;
+use crate::tui::colors;
 
 use super::tui_states::{Health, UNMEASURED};
 
@@ -57,8 +57,10 @@ impl InfoView {
 
     pub fn render(&self, area: Rect, buf: &mut Buffer) {
         let block = Block::bordered()
+            .style(colors::pane_card())
             .title("Info")
-            .border_style(pane_border(false));
+            .title_style(colors::pane_title())
+            .border_style(colors::pane_border(false));
         let inner = block.inner(area);
         block.render(area, buf);
 
@@ -107,8 +109,10 @@ impl InfoView {
             let [label_area, value_area] =
                 Layout::horizontal([Constraint::Length(9), Constraint::Fill(1)]).areas(*r);
 
-            Line::styled(label, Style::new().fg(Color::DarkGray)).render(label_area, buf);
-            Line::from(value).right_aligned().render(value_area, buf);
+            Line::styled(label, Style::new().fg(colors::LABEL)).render(label_area, buf);
+            Line::styled(value, Style::new().fg(colors::TEXT))
+                .right_aligned()
+                .render(value_area, buf);
         }
     }
 }
