@@ -12,7 +12,7 @@ use std::{array, usize};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Style};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Widget};
 
 // The gradient lives in `colors` with the rest of the palette. All cyan:
@@ -21,6 +21,7 @@ use ratatui::widgets::{Block, Widget};
 // a weak signal legible against the noise floor — is asserted by the tests
 // over there.
 use crate::tui::colors::{self, SPECTRUM_STOPS as STOPS};
+use super::tui_core::FRAME;
 
 /// Upper-half block. The foreground paints the top half of the cell and the
 /// background the bottom, so every terminal row carries two waterfall lines.
@@ -48,6 +49,14 @@ const BRAILLE_DOTS: [[u8; 2]; 4] = [
 /// point is the base plus the dot bits, which is why the table above can be
 /// OR-ed straight onto it.
 const BRAILLE_BASE: u32 = 0x2800;
+
+/// Marks per axis — the length every label array shares, and the most any axis
+/// will draw. Fewer are drawn when the pane is too short to hold them all.
+const MARKS: usize = 6;
+
+/// Columns reserved for a vertical axis: four for the number, one for the tick.
+/// Wide enough for `-100` and for a negative time in tenths.
+const Y_AXIS_WIDTH: u16 = 5;
 
 /// How the spectrum panel draws its trace.
 ///
@@ -88,6 +97,23 @@ impl SpectrumStyle {
     }
 }
 
+/// Where each piece of the panel goes.
+///
+/// Derived in one place because two callers need it and they must agree:
+/// `Widget::render` draws with it, and `tui_core::draw` reads `water.height` a
+/// step earlier to work out how many seconds of history the waterfall is
+/// showing. Computing that height independently is how the time axis ends up
+/// describing a pane that is not the one on screen — using the whole panel's
+/// height overstates the span by the border, the spectrum and the frequency
+/// row, which is most of a short pane.
+pub struct SignalLayout {
+    pub spec_axis: Rect,
+    pub spec: Rect,
+    pub freq_axis: Rect,
+    pub water_axis: Rect,
+    pub water: Rect,
+}
+
 pub struct SignalView {
     bins: usize,
     /// Newest first. Each row is one fftshift'd, dB-scaled spectrum.
@@ -115,23 +141,25 @@ pub struct SignalView {
     /// `push`.
 
     /// 4 segments, 5 values
-    mhz_xaxis_labels: [f32; 6],
-
-    /// Preallocated arrays labels for spectrum db axis
-    /// 5 segments, 6 values
-    spec_yaxis_labels: [f32; 6],
+    water_xaxis_labels: [f32; 6],
 
     /// Preallocated arrays labels for waterfall timelapse axis
     /// 5 segments, 6 values
     water_yaxis_labels: [f32; 6],
 
-    /// Rows the signal pane was last given, written by `tui_core::draw`.
+    /// Preallocated arrays labels for spectrum db axis
+    /// 5 segments, 6 values
+    spec_yaxis_labels: [f32; 6],
+
+    /// Rows the *waterfall* was last given — not the panel, which is taller by
+    /// the border, the spectrum and the frequency row.
     ///
-    /// **Reconstructed, not recovered** — the field was lost with the
-    /// uncommitted work and only its write site survived. Declared `pub` and
-    /// zero-initialised to match how `draw` assigns it; the timelapse axis that
-    /// presumably consumes it is not wired up here, so nothing reads it yet.
-    pub waterfall_height: u16,
+    /// Written by `tui_core::draw` from [`SignalView::layout`], and read by
+    /// [`gen_water_yaxis_label`](Self::gen_water_yaxis_label) to scale the time
+    /// axis. It has to come from outside because the height is not known until
+    /// the pane is laid out, and `Widget::render` takes `&self` so it cannot
+    /// write it back.
+    pub waterfall_height: f32,
 
     /// Which renderer the spectrum panel uses. Not in `TuiStates` — no other
     /// widget reads it, so it stays with the panel that owns it, the same
@@ -152,9 +180,7 @@ impl SignalView {
         let floor_db_old = floor_db.get();
         let ceil_db_old = ceil_db.get();
 
-        // Generate labels
-
-        Self {
+        let mut view = Self {
             bins,
             rows: VecDeque::with_capacity(history),
             history,
@@ -164,11 +190,57 @@ impl SignalView {
             sample_rate,
             floor_db: (floor_db, floor_db_old),
             ceil_db: (ceil_db, ceil_db_old),
-            mhz_xaxis_labels: array::from_fn(|_| 0.0f32),
-            spec_yaxis_labels: array::from_fn(|_| 0.0f32),
+            water_xaxis_labels: array::from_fn(|_| 0.0f32),
             water_yaxis_labels: array::from_fn(|_| 0.0f32),
-            waterfall_height: 0,
+            spec_yaxis_labels: array::from_fn(|_| 0.0f32), waterfall_height: 0.0,
             style: SpectrumStyle::BrailleFill,
+        };
+
+        // Forced, and this is the only place it can be.
+        //
+        // The `gen_*` helpers recompute only when their input differs from the
+        // copy they cached last time, and the struct above seeds those copies
+        // to the *current* values — so on the first frame nothing has changed
+        // yet and the labels would stay at the zeros they were initialised
+        // with. The axis would read `0` all the way down until the first time
+        // the floor was nudged.
+        //
+        // The waterfall's time axis is not seeded here: it needs
+        // `waterfall_height`, which nothing knows until `draw` has laid the
+        // pane out.
+        view.gen_water_xaxis_labels(true);
+        view.gen_spec_yaxis_label(true);
+        view.gen_water_xaxis_labels(true);
+        view
+    }
+
+    /// Split the panel. `area` is the whole thing, border included.
+    ///
+    /// The frequency axis sits on the *seam* rather than above everything: both
+    /// plots share one frequency scale, and putting it where they meet is what
+    /// every SDR display does, because each label then touches the thing it
+    /// labels.
+    pub fn layout(area: Rect) -> SignalLayout {
+        let inner = Block::bordered().inner(area);
+
+        let [spec, freq_axis, water] = Layout::vertical([
+            Constraint::Percentage(30),
+            Constraint::Length(1),
+            Constraint::Fill(1),
+        ])
+        .areas(inner);
+
+        let gutter = [Constraint::Length(Y_AXIS_WIDTH), Constraint::Fill(1)];
+        let [spec_axis, spec] = Layout::horizontal(gutter).areas(spec);
+        let [_, freq_axis] = Layout::horizontal(gutter).areas(freq_axis);
+        let [water_axis, water] = Layout::horizontal(gutter).areas(water);
+
+        SignalLayout {
+            spec_axis,
+            spec,
+            freq_axis,
+            water_axis,
+            water,
         }
     }
 
@@ -186,9 +258,10 @@ impl SignalView {
     /// of the two call sites: both `gen_*` helpers already skip the work when
     /// their inputs have not changed, so calling this on any state change is
     /// cheap and cannot leave an axis stale.
-    pub fn gen_marked_labels(&mut self) {
-        self.gen_mhz_xaxis_labels(false);
-        self.gen_spec_yaxis_label(false);
+    pub fn gen_marked_labels(&mut self, force: bool) {
+        self.gen_spec_yaxis_label(force);
+        self.gen_water_xaxis_labels(force);
+        self.gen_water_yaxis_label(force);
     }
 
     /// Fold one spectrum into the pending row.
@@ -260,26 +333,22 @@ impl SignalView {
             .fold(f32::NEG_INFINITY, f32::max)
     }
 
-    /// This is called when app stats is updated in parent tui
-    pub fn update_tui_stats(&mut self) {}
-
     /// Generate axis labels, given a center value.
-    /// `range_half` is max distance from `center` to either sides.
+    /// `range_half` is max distance from `center` to either side.
+    ///
+    /// Delegates, because a centred axis *is* a bounded one over
+    /// `center ± range_half`. The hand-rolled version carried two bugs that
+    /// only showed once something actually called it:
+    ///
+    /// - it asserted an odd `out.len()`, and every caller passes `[f32; 6]`;
+    /// - even at an odd length it wrote the centre to `bins_half + 1` and left
+    ///   `bins_half` itself at whatever it held before, so the true middle
+    ///   label was never filled in and one neighbour was written twice.
+    ///
+    /// An even count has no middle element to write, which is the deeper reason
+    /// the bounded form is the right primitive here.
     fn gen_axis_labels_center(center: f32, range_half: f32, out: &mut [f32]) {
-        assert_eq!(out.len() % 2, 1);
-        let mark_count = out.len();
-        let bins_half = mark_count / 2;
-        let bin_size: f32 = range_half / bins_half as f32;
-
-        // Median labels
-        out[bins_half + 1] = center;
-
-        // Fill lower
-        for i in 0..bins_half {
-            let fr_center = bin_size * ((bins_half - i) as f32);
-            out[i] = center - fr_center;
-            out[mark_count - i - 1] = center + fr_center;
-        }
+        Self::gen_axis_labels_bound(center - range_half, center + range_half, out);
     }
 
     /// Generate axis labels, given lower and upper bound
@@ -293,21 +362,6 @@ impl SignalView {
         for i in 1..mark_count - 1 {
             out[i] = lower + bin_size * i as f32;
         }
-    }
-
-    /// Computer waterfall mhz axis marks
-    /// `force = true` means recalculate marks always
-    /// else check for change before calculation
-    pub fn gen_mhz_xaxis_labels(&mut self, force: bool) {
-        let current_freq = self.center_freq.0.get();
-        if force || current_freq != self.center_freq.1 {
-            Self::gen_axis_labels_center(
-                self.center_freq.0.get() as f32,
-                self.sample_rate.get() as f32 / 2.0,
-                &mut self.mhz_xaxis_labels[..],
-            );
-        };
-        self.center_freq.1 = current_freq;
     }
 
     /// Compute spectrum db axis mark
@@ -325,41 +379,192 @@ impl SignalView {
         self.ceil_db.1 = current_ceil;
     }
 
+    /// Computer waterfall mhz axis marks
+    /// `force = true` means recalculate marks always
+    /// else check for change before calculation
+    pub fn gen_water_xaxis_labels(&mut self, force: bool) {
+        let current_freq = self.center_freq.0.get();
+        if force || current_freq != self.center_freq.1 {
+            Self::gen_axis_labels_center(
+                self.center_freq.0.get() as f32,
+                self.sample_rate.get() as f32 / 2.0,
+                &mut self.water_xaxis_labels[..],
+            );
+        };
+        self.center_freq.1 = current_freq;
+    }
+
+    /// Compute waterfall timestamp axis
+    pub fn gen_water_yaxis_label(&mut self, force: bool) {
+        if force {
+            Self::gen_axis_labels_bound(
+                0.0,
+                -1.0 * self.waterfall_height * 2.0 * FRAME.as_secs_f32(), // a row is actually filled in 2 ticks
+                &mut self.water_yaxis_labels[..],                
+                );
+        }
+    }
+
     /// Frequency axis, one row, shared by the spectrum above and the waterfall
     /// below.
     ///
     /// `post_process` rotates DC to the middle, so the display spans
-    /// `center ± sample_rate/2`. Five labels centred in five equal columns
-    /// rather than evenly spaced ticks: the column centres fall on ∓0.4, ∓0.2
-    /// and 0 of that span, no manual padding is needed, and they cannot
-    /// collide.
+    /// `center ± sample_rate/2`, and the labels are the *bounds* of that span:
+    /// the first names the plot's left edge and the last its right edge.
     ///
-    /// Signed arithmetic throughout — the low end of the span goes negative on
-    /// a wide sample rate at the bottom of the tuning range, and unsigned would
-    /// wrap it into the gigahertz.
+    /// So they are placed at their true fractional position across the plot and
+    /// **not** centred in equal columns. Equal columns put the first label at
+    /// 1/12 of the width and the last at 11/12 — around 8 % in from each end,
+    /// which on a waterfall reads as the whole scale being offset. The two ends
+    /// are clamped rather than centred: the first is flush left, the last flush
+    /// right, and only the interior ones are centred on their tick. That is
+    /// what makes the axis agree with the pixels above it.
     fn render_mhz_axis(&self, area: Rect, buf: &mut Buffer) {
-        let center_hz = self.center_freq.0.get() as i64;
-        let fifth = self.sample_rate.get() as i64 / 5;
+        if area.is_empty() {
+            return;
+        }
 
-        let cols = Layout::horizontal([Constraint::Ratio(1, 5); 5]).split(area);
+        // `water_xaxis_labels` — the frequency array. Reading `water_yaxis_labels`
+        // here put the waterfall's *time* range on the frequency scale, and
+        // since that range is derived from `waterfall_height`, which is zero
+        // until `draw` has laid the pane out, every label came out `0.000`.
+        let labels = &self.water_xaxis_labels;
+        let width = area.width as usize;
 
-        for (i, col) in cols.iter().enumerate() {
-            let hz = center_hz + (i as i64 - 2) * fifth;
-            Line::styled(
-                format!("{:.3}", hz as f64 / 1e6),
-                Style::new().fg(colors::LABEL),
-            )
-            .centered()
-            .render(*col, buf);
+        let fmt = |hz: f32| format!("{:.3}", hz as f64 / 1e6);
+
+        // The longest label decides how many fit. A fixed count overlaps as
+        // soon as the pane narrows or the tuner passes 100 MHz and every label
+        // gains a digit — and two frequencies printed over each other are worse
+        // than one frequency printed alone.
+        let widest = labels.iter().map(|hz| fmt(*hz).len()).max().unwrap_or(0);
+        if widest == 0 || widest > width {
+            return;
+        }
+
+        // How many fit, given that the two ends are clamped rather than centred.
+        //
+        // The clamp is what costs the extra room: the first label's tick is at
+        // column 0 but its text runs to `widest`, so its neighbour — centred on
+        // its own tick — has to start at least `1.5 × widest + 1` along. That,
+        // not `widest + 1`, is the binding constraint; using the naive spacing
+        // let the first two labels touch (`89.80090.400`) at exactly the widths
+        // where the axis is most cramped. The same bound falls out at the right
+        // end by symmetry, and the interior only needs `widest + 1`.
+        let min_spacing = widest + widest / 2 + 1;
+        let shown = MARKS.min((width - 1) / min_spacing + 1);
+        if shown < 2 {
+            return;
+        }
+
+        // Interpolated across the span, not indexed out of the array — the same
+        // trap as the vertical axes: picking `j * (MARKS - 1) / (shown - 1)`
+        // gives 0, 1, 3, 5 for four of six, which is one narrow gap and two
+        // wide ones.
+        let (lo, hi) = (labels[0], labels[MARKS - 1]);
+
+        for j in 0..shown {
+            let t = j as f32 / (shown - 1) as f32;
+            let text = fmt(lo + (hi - lo) * t);
+            let len = text.len();
+
+            // The tick this label names, then the leftmost cell that centres
+            // the text on it, clamped so neither end runs off the plot. The
+            // clamp is what makes the first label flush left and the last
+            // flush right.
+            let tick = j * (width - 1) / (shown - 1);
+            let x = tick.saturating_sub(len / 2).min(width - len);
+
+            Line::styled(text, Style::new().fg(colors::LABEL)).render(
+                Rect::new(area.x + x as u16, area.y, len as u16, 1),
+                buf,
+            );
         }
     }
 
-    fn renter_spectrum_yaxis<const N: usize>(&self, area: Rect, _buf: &mut Buffer) {
-        if area.is_empty() {
+    /// One vertical axis in a [`Y_AXIS_WIDTH`] gutter.
+    ///
+    /// `top` is the value on the first row and `bottom` the value on the last,
+    /// so the **caller states the direction** rather than this deciding one for
+    /// everybody. The two axes disagree about it: dB runs ceiling-down because
+    /// the plot puts the floor at the bottom, while time runs now-down because
+    /// `render_waterfall` puts the newest row at the top. Everything else — the
+    /// thinning, the end placement, the styling — they share.
+    ///
+    /// **Ends.** The integer arithmetic lands `top` exactly on the first row and
+    /// `bottom` exactly on the last, which is what makes the axis *bound* the
+    /// plot instead of floating inside it. Spreading by `height / n` would leave
+    /// both ends short by half a step and read as a systematic offset.
+    fn render_vaxis(
+        &self,
+        area: Rect,
+        buf: &mut Buffer,
+        top: f32,
+        bottom: f32,
+        label: impl Fn(f32) -> String,
+    ) {
+        // Two rows is the minimum that can carry both ends; below that an axis
+        // says nothing a reader can use. Two columns is one digit plus the tick.
+        if area.is_empty() || area.width < 2 || area.height < 2 {
             return;
-        };
+        }
 
-        let _height = area.height as usize;
+        let height = area.height as usize;
+
+        // At most one label per row. Six labels into four rows would write two
+        // of them over their neighbours and leave whichever came last, so thin
+        // the set instead.
+        let shown = MARKS.min(height);
+
+        // Values are *interpolated* across the range, not indexed out of the
+        // caller's array. Indexing by `j * (n - 1) / (shown - 1)` looks even and
+        // is not: six labels into five rows picks 0, 1, 2, 3, 5 — three 18 dB
+        // gaps and then a 36 dB one, which reads as a mislabelled axis rather
+        // than a thinned one. The arrays are linear ramps, so interpolating
+        // their ends reproduces them exactly whenever every label fits.
+        let num_w = area.width as usize - 1;
+
+        for j in 0..shown {
+            let t = j as f32 / (shown - 1) as f32;
+            let value = top + (bottom - top) * t;
+            let row = (j * (height - 1) / (shown - 1)) as u16;
+
+            let text = format!("{:>num_w$}", label(value));
+
+            let line = Line::from(vec![
+                Span::styled(text, Style::new().fg(colors::LABEL)),
+                // Dimmer than the number: the tick is there to point, not to be
+                // read, and at the same weight it competes with the digits.
+                Span::styled("\u{2524}", Style::new().fg(colors::BORDER)),
+            ]);
+
+            let row_area = Rect::new(area.x, area.y + row, area.width, 1);
+            line.render(row_area, buf);
+        }
+    }
+
+    /// The dB scale down the left edge of the spectrum.
+    ///
+    /// `spec_yaxis_labels` is stored floor-first and the plot puts the floor at
+    /// the *bottom*, so the ends go in reversed.
+    fn render_spectrum_yaxis(&self, area: Rect, buf: &mut Buffer) {
+        let l = &self.spec_yaxis_labels;
+        // `{:.0}`: floor and ceiling move in whole dB, and a trailing `.0` on
+        // every row costs a column the number needs on a narrow gutter.
+        self.render_vaxis(area, buf, l[MARKS - 1], l[0], |v| format!("{v:.0}"));
+    }
+
+    /// The elapsed-time scale down the left edge of the waterfall.
+    ///
+    /// Opposite direction to the dB axis: `water_yaxis_labels` is stored
+    /// newest-first and `render_waterfall` puts the newest row at the top, so
+    /// the ends go in as stored. Values are negative seconds — how long ago that
+    /// row was captured.
+    fn render_water_yaxis(&self, area: Rect, buf: &mut Buffer) {
+        let l = &self.water_yaxis_labels;
+        // One decimal: the whole visible history is often under a second, so
+        // `{:.0}` would print `-0` for most of the column.
+        self.render_vaxis(area, buf, l[0], l[MARKS - 1], |v| format!("{v:.1}"));
     }
 
     fn render_spectrum(&self, area: Rect, buf: &mut Buffer) {
@@ -589,6 +794,200 @@ mod braille_tests {
         }
     }
 
+    /// Read one row of the buffer back as a string.
+    fn row_text(buf: &Buffer, y: u16, width: u16) -> String {
+        (0..width)
+            .map(|x| buf.cell((x, y)).unwrap().symbol())
+            .collect()
+    }
+
+    /// The axis must run the same way the plot does: floor at the bottom,
+    /// ceiling at the top. `spec_yaxis_labels` is stored floor-first, so the
+    /// renderer walks it against the rows — get that backwards and every
+    /// reading is inverted while still looking like a plausible axis.
+    ///
+    /// The ends are checked exactly, because "bounds the plot" is the property:
+    /// labels spread by `height / n` instead would sit half a step in from both
+    /// edges and read as a systematic offset.
+    #[test]
+    fn the_db_axis_runs_floor_at_the_bottom() {
+        let v = view_at(FLOOR);
+        let (w, h) = (5, 7);
+        let area = Rect::new(0, 0, w, h);
+        let mut buf = Buffer::empty(area);
+        v.render_spectrum_yaxis(area, &mut buf);
+
+        assert_eq!(row_text(&buf, 0, w), "   0\u{2524}", "ceiling tops the axis");
+        assert_eq!(
+            row_text(&buf, h - 1, w),
+            " -90\u{2524}",
+            "floor sits on the last row"
+        );
+    }
+
+    /// Six labels cannot go into four rows. Thinning has to keep the two ends —
+    /// they are the ones the reader needs — and must never write two labels
+    /// onto one row, which would leave whichever came last and silently
+    /// mislabel that row.
+    #[test]
+    fn a_short_axis_thins_labels_instead_of_overwriting() {
+        let v = view_at(FLOOR);
+        let (w, h) = (5, 4);
+        let area = Rect::new(0, 0, w, h);
+        let mut buf = Buffer::empty(area);
+        v.render_spectrum_yaxis(area, &mut buf);
+
+        assert_eq!(row_text(&buf, 0, w), "   0\u{2524}");
+        assert_eq!(row_text(&buf, h - 1, w), " -90\u{2524}");
+
+        // Every row carries exactly one label, none doubled up.
+        for y in 0..h {
+            let t = row_text(&buf, y, w);
+            assert!(t.ends_with('\u{2524}'), "row {y} has no tick: {t:?}");
+        }
+    }
+
+    /// The two vertical axes run in **opposite** directions, and sharing one
+    /// renderer is exactly what makes that easy to get wrong: dB puts its
+    /// largest value on the first row, time puts its largest — zero, the
+    /// newest — there too, but its array is stored the other way round. Flip
+    /// either call and the waterfall claims the oldest row is the newest.
+    #[test]
+    fn the_time_axis_runs_newest_at_the_top() {
+        let mut v = view_at(FLOOR);
+        v.waterfall_height = 12.0;
+        v.gen_water_yaxis_label(true);
+
+        let (w, h) = (5, 12);
+        let area = Rect::new(0, 0, w, h);
+        let mut buf = Buffer::empty(area);
+        v.render_water_yaxis(area, &mut buf);
+
+        assert_eq!(
+            row_text(&buf, 0, w),
+            " 0.0\u{2524}",
+            "the newest row is now, at the top"
+        );
+
+        // 12 rows x 2 spectra per row x one frame each.
+        let oldest = -12.0 * 2.0 * FRAME.as_secs_f32();
+        assert_eq!(
+            row_text(&buf, h - 1, w),
+            format!("{:>4}\u{2524}", format!("{oldest:.1}")),
+            "the bottom row is the whole visible history ago"
+        );
+    }
+
+    /// The height the time axis is scaled by must be the waterfall's, not the
+    /// panel's — the panel is taller by the border, the spectrum and the
+    /// frequency row, which on a short pane is most of it. Reading the wrong
+    /// one overstates how much history is on screen.
+    #[test]
+    fn the_layout_reports_the_waterfall_not_the_panel() {
+        let area = Rect::new(0, 0, 60, 20);
+        let l = SignalView::layout(area);
+
+        assert!(
+            l.water.height < area.height,
+            "waterfall {} should be shorter than the panel {}",
+            l.water.height,
+            area.height
+        );
+        // Border top and bottom, the spectrum, and the frequency row.
+        assert_eq!(l.water.height, 12);
+        assert_eq!(l.water_axis.height, l.water.height, "gutter tracks the plot");
+        assert_eq!(l.water_axis.width, Y_AXIS_WIDTH);
+    }
+
+    /// The frequency labels are the *bounds* of the span, so the first names
+    /// the plot's left edge and the last its right edge — they have to sit on
+    /// those edges. Centring each in an equal column instead put the ends ~8 %
+    /// of the width inboard, which reads as the whole scale being offset rather
+    /// than as a rounding detail.
+    ///
+    /// Checked across several widths because the label count changes with them,
+    /// and the count is what the placement arithmetic keys off.
+    #[test]
+    fn the_frequency_labels_sit_on_the_plot_edges() {
+        for w in [60u16, 44, 34, 26] {
+            let area = Rect::new(0, 0, w, 12);
+            let v = SignalView::new(
+                BINS,
+                8,
+                Rc::new(Cell::new(91_000_000)),
+                Rc::new(Cell::new(2_400_000)),
+                Rc::new(Cell::new(FLOOR)),
+                Rc::new(Cell::new(CEIL)),
+            );
+
+            let l = SignalView::layout(area);
+            let mut buf = Buffer::empty(area);
+            v.render_mhz_axis(l.freq_axis, &mut buf);
+
+            let row = row_text(&buf, l.freq_axis.y, w);
+            let first = row.find(|c: char| !c.is_whitespace()).unwrap();
+            let last = row.rfind(|c: char| !c.is_whitespace()).unwrap();
+
+            assert_eq!(
+                first,
+                l.freq_axis.x as usize,
+                "w={w}: first label is not flush with the plot's left edge: {row:?}"
+            );
+            assert_eq!(
+                last,
+                (l.freq_axis.right() - 1) as usize,
+                "w={w}: last label is not flush with the right edge: {row:?}"
+            );
+
+            // 89.800 and 92.200 are the span bounds for 91 MHz at 2.4 MS/s.
+            assert!(row.contains("89.800") && row.contains("92.200"), "w={w}: {row:?}");
+        }
+    }
+
+    /// Labels must never touch. The two ends are clamped rather than centred,
+    /// which steals room from their neighbours — sizing the gap as `widest + 1`
+    /// instead of `1.5 x widest + 1` let the first two run together as
+    /// `89.80090.400` at exactly the widths where the axis is most cramped.
+    #[test]
+    fn frequency_labels_never_run_together() {
+        for w in 20u16..80 {
+            let area = Rect::new(0, 0, w, 12);
+            let v = SignalView::new(
+                BINS,
+                8,
+                Rc::new(Cell::new(91_000_000)),
+                Rc::new(Cell::new(2_400_000)),
+                Rc::new(Cell::new(FLOOR)),
+                Rc::new(Cell::new(CEIL)),
+            );
+
+            let l = SignalView::layout(area);
+            let mut buf = Buffer::empty(area);
+            v.render_mhz_axis(l.freq_axis, &mut buf);
+
+            let row = row_text(&buf, l.freq_axis.y, w);
+            for chunk in row.split_whitespace() {
+                assert_eq!(
+                    chunk.len(),
+                    6,
+                    "w={w}: two labels ran together as {chunk:?} in {row:?}"
+                );
+            }
+        }
+    }
+
+    /// A pane too small for an axis must draw nothing rather than panic on the
+    /// `shown - 1` divisor, which is zero when only one label fits.
+    #[test]
+    fn an_axis_too_small_to_read_draws_nothing() {
+        let v = view_at(FLOOR);
+        for (w, h) in [(5, 1), (5, 0), (1, 7), (0, 7)] {
+            let area = Rect::new(0, 0, w, h);
+            let mut buf = Buffer::empty(Rect::new(0, 0, w.max(1), h.max(1)));
+            v.render_spectrum_yaxis(area, &mut buf);
+        }
+    }
+
     /// Braille buys its horizontal resolution from `column`, which folds bins
     /// onto `width * 2` sub-columns rather than `width`. If the fold ever went
     /// back to per-cell, a one-bin carrier would smear across twice the width.
@@ -623,38 +1022,17 @@ impl Widget for &SignalView {
             .title("Spectrum \u{b7} MHz")
             .title_style(colors::pane_title())
             .border_style(colors::pane_border(false));
-        let inner = block.inner(area);
         block.render(area, buf);
 
-        let y_axis_width: u16 = 5;
+        let l = SignalView::layout(area);
 
-        // Axis on the seam rather than above everything: both panels share one
-        // frequency scale, and putting it where they meet is what every SDR
-        // display does, because each label then touches the thing it labels.
-        let [area_spec, mhz_axis, area_water] = Layout::vertical([
-            Constraint::Percentage(30),
-            Constraint::Length(1),
-            Constraint::Fill(1),
-        ])
-        .areas(inner);
-
-        // The left col for db axis
-        let [_area_spec_axis, area_spec] =
-            Layout::horizontal([Constraint::Length(y_axis_width), Constraint::Fill(1)])
-                .areas(area_spec);
-
-        // Same must be done tor mhz_axis
-        let [_, mhz_axis] =
-            Layout::horizontal([Constraint::Length(y_axis_width), Constraint::Fill(1)])
-                .areas(mhz_axis);
-
-        // Y axis of waterfall show timelapsed
-        let [_area_water_axis, area_water] =
-            Layout::horizontal([Constraint::Length(y_axis_width), Constraint::Fill(1)])
-                .areas(area_water);
-
-        self.render_spectrum(area_spec, buf);
-        self.render_mhz_axis(mhz_axis, buf);
-        self.render_waterfall(area_water, buf);
+        self.render_spectrum_yaxis(l.spec_axis, buf);
+        self.render_spectrum(l.spec, buf);
+        self.render_mhz_axis(l.freq_axis, buf);
+        self.render_water_yaxis(l.water_axis, buf);
+        self.render_waterfall(l.water, buf);
     }
 }
+
+
+

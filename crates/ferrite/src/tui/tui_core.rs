@@ -22,7 +22,7 @@ use crate::tui::tui_states::{Health, Pane, TuiStates};
 use super::signal_view::SignalView;
 
 /// 30 fps is good enough
-const FRAME: Duration = Duration::from_millis(33);
+pub const FRAME: Duration = Duration::from_millis(33);
 
 /// Width of the left column, in columns.
 ///
@@ -49,11 +49,13 @@ pub struct Tui<const SLOTS: usize, const BLOCK: usize, const N: usize> {
     status_bar: StatusBar,
     status: Option<(String, Instant)>,
 
-    // IQ stream buffer, after centered and high-pass filter
+    /// IQ stream buffer, after centered and high-pass filter
     block: [f32; BLOCK],
 
     /// Sender of CtrlSignal
     ctrl_tx: Sender<CtrlSignal>,
+
+    
 }
 
 impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N> {
@@ -133,8 +135,7 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
         self.status
             .as_ref()
             .filter(|(_, at)| at.elapsed() < STATUS_TTL)
-            .map(|(t, _)| t.as_str())
-    }
+            .map(|(t, _)| t.as_str()) }
 
     /// Returns true when the app should exit.
     fn on_key(&mut self, k: KeyEvent) -> bool {
@@ -178,7 +179,7 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
                 self.set_status(format!("{label}  {value}"));
 
                 // Recompute axis mark labels
-                self.signal_view.gen_marked_labels();
+                self.signal_view.gen_marked_labels(false);
             }
 
             // Kept as global shortcuts even though both are now Control rows —
@@ -274,13 +275,6 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
         self.signal_view.commit();
     }
 
-    /// This is called when a certain states changed
-    /// Recalculate axis mark labels
-    fn update_mark_labels(&mut self) {
-        self.signal_view.gen_mhz_xaxis_labels(false);
-        self.signal_view.gen_spec_yaxis_label(false);
-    }
-
     /// Left column of readouts, signal view filling the rest, one status row
     /// across the bottom.
     ///
@@ -332,8 +326,15 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
         );
         self.states.log_scroll.set(scroll);
 
-        self.signal_view.waterfall_height = signal.height;
-        self.signal_view.gen_marked_labels();
+        // The waterfall's own height, not the panel's. The time axis is scaled
+        // from this, and the panel is taller by the border, the spectrum and
+        // the frequency row — most of a short pane — so using `signal.height`
+        // overstated the visible history by well over half.
+        //
+        // Taken from `SignalView::layout`, the same split `render` uses a step
+        // later, so the axis cannot describe a pane other than the one drawn.
+        self.signal_view.waterfall_height = SignalView::layout(signal).water.height as f32;
+        self.signal_view.gen_marked_labels(true);
         frame.render_widget(&self.signal_view, signal);
         self.status_bar
             .render(status, frame.buffer_mut(), &self.states, self.status());
