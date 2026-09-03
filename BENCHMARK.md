@@ -1,13 +1,13 @@
 # `spmc::Ring` vs. mutex-based queues — benchmark report
 
-Source: `benches/ring_vs_mutex.rs` · Run with `cargo bench --bench ring_vs_mutex`
+Source: `crates/sdr-core/benches/ring_vs_mutex.rs` · Run with `cargo bench --bench ring_vs_mutex`
 
 Machine: x86_64, 16 cores, Linux, release profile.
 Geometry mirrors the application: `BLOCK = 512` f32 (2 KB/op), `SLOTS = 16`.
 All latencies are **nanoseconds, producer-side only**. Timer overhead floor: 30 ns.
 
 > **This run supersedes all previous ones.** It was taken after three changes to
-> `src/spmc.rs`: the cursor collapse (two `AtomicUsize` → one monotonic
+> `crates/sdr-core/src/spmc.rs`: the cursor collapse (two `AtomicUsize` → one monotonic
 > `AtomicU64`), the option-B seqlock validation, and gated writes returning
 > `CustomError::SlowConsumer`. The headline changes are in the `torn` and
 > `written` columns.
@@ -323,7 +323,7 @@ producer that never consults it.
 
 ### The fix — option B
 
-Two changes, both in `src/spmc.rs`:
+Two changes, both in `crates/sdr-core/src/spmc.rs`:
 
 **1. Cursor collapse.** `RingCursor((AtomicUsize, AtomicUsize))` — a `(round,
 index)` pair — became a single monotonic `AtomicU64` sequence. The pair could be
