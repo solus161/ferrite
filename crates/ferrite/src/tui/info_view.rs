@@ -13,6 +13,8 @@
 //! of an uninitialised counter. R1.3 fills in the drop/lap/underrun row, R1.5
 //! the RSSI and SNR.
 
+use std::cell::Cell;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
 
@@ -23,20 +25,34 @@ use ratatui::text::Line;
 use ratatui::widgets::{Block, Widget};
 
 use crate::source::source::OFFSET_TUNING_HZ;
-use crate::tui::app_states::{AppStates, UNMEASURED};
 use crate::tui::control_view::pane_border;
+
+use super::tui_states::{Health, UNMEASURED};
 
 /// Rows plus border. Kept beside the row list for the same reason
 /// [`control_view::HEIGHT`](super::control_view::HEIGHT) is.
 pub const HEIGHT: u16 = 7 + 2;
 
 pub struct InfoView {
-    app: Arc<AppStates>,
+    center_freq: Rc<Cell<u32>>,
+    sample_rate: Rc<Cell<u32>>,
+    audio_rate: Rc<Cell<u32>>,
+    health: Arc<Health>,
 }
 
 impl InfoView {
-    pub fn new(app: Arc<AppStates>) -> Self {
-        Self { app }
+    pub fn new(
+        center_freq: Rc<Cell<u32>>,
+        sample_rate: Rc<Cell<u32>>,
+        audio_rate: Rc<Cell<u32>>,
+        health: Arc<Health>,
+    ) -> Self {
+        Self {
+            center_freq,
+            sample_rate,
+            audio_rate,
+            health,
+        }
     }
 
     pub fn render(&self, area: Rect, buf: &mut Buffer) {
@@ -50,34 +66,35 @@ impl InfoView {
             return;
         }
 
-        let app = &self.app;
-        let h = &app.health;
-
         // The LO is parked below the station (see `source::source`), so it is
         // never the tuned frequency and there is otherwise nothing on screen
         // that says where the dongle is actually looking.
-        let lo = app
-            .center_freq
-            .load(Relaxed)
-            .saturating_sub(OFFSET_TUNING_HZ);
+        let lo = self.center_freq.get().saturating_sub(OFFSET_TUNING_HZ);
 
         let rows = [
             (
                 "Rate",
-                format!("{:.3} MS/s", app.sample_rate.load(Relaxed) as f64 / 1e6),
+                format!("{:.3} MS/s", self.sample_rate.get() as f64 / 1e6),
             ),
-            (
-                "Audio",
-                format!("{} kHz", app.audio_rate.load(Relaxed) / 1000),
-            ),
+            ("Audio", format!("{} kHz", self.audio_rate.get() / 1000)),
             ("LO", format!("{:.3} MHz", lo as f64 / 1e6)),
-            ("RSSI", measured(h.rssi_dbfs_x10.load(Relaxed), "dBFS")),
-            ("SNR", measured(h.snr_db_x10.load(Relaxed), "dB")),
+            (
+                "RSSI",
+                measured(self.health.rssi_dbfs_x10.load(Relaxed), "dBFS"),
+            ),
+            ("SNR", measured(self.health.snr_db_x10.load(Relaxed), "dB")),
             (
                 "Drop/lap",
-                format!("{} / {}", h.iq_drops.load(Relaxed), h.iq_laps.load(Relaxed)),
+                format!(
+                    "{} / {}",
+                    self.health.iq_drops.load(Relaxed),
+                    self.health.iq_laps.load(Relaxed)
+                ),
             ),
-            ("Underrun", format!("{}", h.underruns.load(Relaxed))),
+            (
+                "Underrun",
+                format!("{}", self.health.underruns.load(Relaxed)),
+            ),
         ];
 
         // One terminal row per entry, leftover height left blank rather than

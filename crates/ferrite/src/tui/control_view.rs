@@ -14,8 +14,6 @@
 
 use std::cell::Cell;
 use std::rc::Rc;
-use std::sync::Arc;
-use std::sync::atomic::Ordering::Relaxed;
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -25,7 +23,7 @@ use ratatui::widgets::{Block, Widget};
 
 use sdr_core::control_signal::CtrlSignal;
 
-use crate::tui::app_states::{AppStates, TunerMode};
+use crate::tui::tui_states::{TuiStates, TunerMode};
 /// Widest tuning range across the tuners librtlsdr supports, not this device's.
 /// The FC0013 in hand covers roughly 22–1100 MHz (PLAN.md §8.0) and silently
 /// clamps beyond that; clamping here only stops the UI showing a frequency no
@@ -117,20 +115,20 @@ impl Field {
     }
 
     fn value(self, v: &ControlView) -> String {
-        let app = &v.app;
+        let states = &v.states;
         match self {
-            Field::Mode => app.mode().label().to_string(),
-            Field::Freq => format!("{:.3} MHz", app.center_freq.load(Relaxed) as f64 / 1e6),
-            Field::Step => fmt_hz(v.step.get()),
-            Field::Gain => format!("{:.1} dB", app.gain_tenths.load(Relaxed) as f32 / 10.0),
-            Field::Agc => on_off(app.agc.load(Relaxed)),
-            Field::Bw => fmt_hz(app.bandwidth.load(Relaxed)),
-            Field::Ppm => format!("{:+}", app.ppm.load(Relaxed)),
-            Field::Volume => format!("{}", app.volume.load(Relaxed)),
-            Field::Mute => on_off(app.muted.load(Relaxed)),
-            Field::Deemph => format!("{} \u{b5}s", app.deemph_us.load(Relaxed)),
-            Field::Floor => format!("{:.0} dB", v.floor_db.get()),
-            Field::Ceil => format!("{:.0} dB", v.ceil_db.get()),
+            Field::Mode => states.mode.get().label().to_string(),
+            Field::Freq => format!("{:.3} MHz", states.center_freq.get() as f64 / 1e6),
+            Field::Step => fmt_hz(states.step.get()),
+            Field::Gain => format!("{:.1} dB", states.gain_tenths.get() as f32 / 10.0),
+            Field::Agc => on_off(states.agc.get()),
+            Field::Bw => fmt_hz(states.bandwidth.get()),
+            Field::Ppm => format!("{:+}", states.ppm.get()),
+            Field::Volume => format!("{}", states.volume.get()),
+            Field::Mute => on_off(states.muted.get()),
+            Field::Deemph => format!("{} \u{b5}s", states.deemph_us.get()),
+            Field::Floor => format!("{:.0} dB", states.floor_db.get()),
+            Field::Ceil => format!("{:.0} dB", states.ceil_db.get()),
         }
     }
 
@@ -141,9 +139,9 @@ impl Field {
     /// how you find out that Gain stopped mattering when AGC came on.
     fn inert(self, v: &ControlView) -> bool {
         match self {
-            Field::Mode => !v.app.mode().implemented(),
-            Field::Gain => v.app.agc.load(Relaxed),
-            Field::Volume => v.app.muted.load(Relaxed),
+            Field::Mode => !v.states.mode.get().implemented(),
+            Field::Gain => v.states.agc.get(),
+            Field::Volume => v.states.muted.get(),
             _ => false,
         }
     }
@@ -157,16 +155,16 @@ impl Field {
     ///
     /// [`value`]: Field::value
     fn adjust(self, v: &ControlView, dir: i32) -> Option<CtrlSignal> {
-        let app = &v.app;
+        let states = &v.states;
         match self {
             Field::Mode => {
                 let i = TunerMode::ALL
                     .iter()
-                    .position(|&m| m == app.mode())
+                    .position(|&m| m == states.mode.get())
                     .unwrap_or(0);
                 let n = TunerMode::ALL.len();
                 let next = TunerMode::ALL[(i + if dir > 0 { 1 } else { n - 1 }) % n];
-                app.set_mode(next);
+                states.set_mode(next);
                 if next.implemented() {
                     log_info!("mode {}", next.label());
                 } else {
@@ -180,17 +178,17 @@ impl Field {
 
             Field::Freq => {
                 let hz = offset(
-                    app.center_freq.load(Relaxed),
-                    v.step.get() as i64 * dir as i64,
+                    states.center_freq.get(),
+                    states.step.get() as i64 * dir as i64,
                     FREQ_RANGE,
                 );
-                app.center_freq.store(hz, Relaxed);
+                states.center_freq.set(hz);
                 Some(CtrlSignal::CenterHz(hz))
             }
 
             // Purely how far `Freq` moves — no device round trip.
             Field::Step => {
-                v.step.set(rung(&STEP_LADDER, v.step.get(), dir));
+                states.step.set(rung(&STEP_LADDER, states.step.get(), dir));
                 None
             }
 
@@ -200,22 +198,23 @@ impl Field {
             // presses and display a gain the hardware never had.
             Field::Gain => {
                 let tenths = v.gain_step(dir);
-                app.gain_tenths.store(tenths, Relaxed);
+                states.gain_tenths.set(tenths);
                 log_info!("gain {:.1} dB", tenths as f32 / 10.0);
                 // Reaching for the gain means you want it by hand — every radio
                 // carrying both controls behaves this way. `GainTenths` *is*
                 // "manual, this value", so one signal covers both halves; a
                 // separate AGC-off would leave the tuner in auto until the next
                 // gain press.
-                if app.agc.swap(false, Relaxed) {
+                states.agc.swap(&Cell::new(false));
+                if states.agc.get() {
                     log_info!("AGC off (manual gain)");
                 }
                 Some(CtrlSignal::GainTenths(tenths))
             }
 
             Field::Agc => {
-                let on = !app.agc.load(Relaxed);
-                app.agc.store(on, Relaxed);
+                let on = !states.agc.get();
+                states.agc.set(on);
                 log_info!("AGC {}", on_off(on));
                 // Leaving AGC restores the gain sitting in the panel. Sending a
                 // bare "AGC off" would drop the tuner into manual mode at
@@ -223,43 +222,39 @@ impl Field {
                 // on screen and the hardware would disagree.
                 Some(match on {
                     true => CtrlSignal::AgcOn,
-                    false => CtrlSignal::GainTenths(app.gain_tenths.load(Relaxed)),
+                    false => CtrlSignal::GainTenths(states.gain_tenths.get()),
                 })
             }
 
             Field::Bw => {
-                let bw = rung(&BW_LADDER, app.bandwidth.load(Relaxed), dir);
-                app.bandwidth.store(bw, Relaxed);
+                let bw = rung(&BW_LADDER, states.bandwidth.get(), dir);
+                states.bandwidth.set(bw);
                 log_info!("channel bandwidth {}", fmt_hz(bw));
                 Some(CtrlSignal::Bandwidth(bw))
             }
 
             Field::Ppm => {
-                let ppm = (app.ppm.load(Relaxed) + dir).clamp(PPM_RANGE.0, PPM_RANGE.1);
-                app.ppm.store(ppm, Relaxed);
+                let ppm = (states.ppm.get() + dir).clamp(PPM_RANGE.0, PPM_RANGE.1);
+                states.ppm.set(ppm);
                 Some(CtrlSignal::Ppm(ppm))
             }
 
             Field::Volume => {
-                let vol = (app.volume.load(Relaxed) as i64 + 5 * dir as i64).clamp(0, 100) as u32;
-                app.volume.store(vol, Relaxed);
+                let vol = (states.volume.get() as i64 + 5 * dir as i64).clamp(0, 100) as u32;
+                states.volume.set(vol as f32);
                 None
             }
 
             Field::Mute => {
-                let muted = !app.muted.load(Relaxed);
-                app.muted.store(muted, Relaxed);
+                let muted = !states.muted.get();
+                states.muted.set(muted);
                 None
             }
 
             Field::Deemph => {
                 // Two values, so direction is irrelevant — either arrow toggles.
-                let us = if app.deemph_us.load(Relaxed) == 50 {
-                    75
-                } else {
-                    50
-                };
-                app.deemph_us.store(us, Relaxed);
+                let us = if states.deemph_us.get() == 50 { 75 } else { 50 };
+                states.deemph_us.set(us);
                 log_info!("de-emphasis {us} \u{b5}s");
                 None
             }
@@ -267,15 +262,19 @@ impl Field {
             // Both ends push the other rather than stopping, so you can drag
             // the whole window up and down without alternating fields.
             Field::Floor => {
-                let floor = v.floor_db.get() + 2.0 * dir as f32;
-                v.floor_db.set(floor);
-                v.ceil_db.set(v.ceil_db.get().max(floor + MIN_DB_SPAN));
+                let floor = states.floor_db.get() + 2.0 * dir as f32;
+                states.floor_db.set(floor);
+                states
+                    .ceil_db
+                    .set(states.ceil_db.get().max(floor + MIN_DB_SPAN));
                 None
             }
             Field::Ceil => {
-                let ceil = v.ceil_db.get() + 2.0 * dir as f32;
-                v.ceil_db.set(ceil);
-                v.floor_db.set(v.floor_db.get().min(ceil - MIN_DB_SPAN));
+                let ceil = states.ceil_db.get() + 2.0 * dir as f32;
+                states.ceil_db.set(ceil);
+                states
+                    .floor_db
+                    .set(states.floor_db.get().min(ceil - MIN_DB_SPAN));
                 None
             }
         }
@@ -283,33 +282,19 @@ impl Field {
 }
 
 pub struct ControlView {
-    app: Arc<AppStates>,
+    states: Rc<TuiStates>,
     /// The tuner's own gain table, tenths of a dB, ascending. Empty if the
     /// device reported none, in which case Gain becomes a no-op rather than
     /// inventing values.
     gain_table: Vec<i32>,
-    /// UI-only: how far one `Freq` press moves. Never leaves this thread.
-    step: Cell<u32>,
-    floor_db: Rc<Cell<f32>>,
-    ceil_db: Rc<Cell<f32>>,
-    /// Index into [`Field::ALL`].
     selected: usize,
 }
 
 impl ControlView {
-    pub fn new(
-        app: Arc<AppStates>,
-        gain_table: Vec<i32>,
-        step: u32,
-        floor_db: Rc<Cell<f32>>,
-        ceil_db: Rc<Cell<f32>>,
-    ) -> Self {
+    pub fn new(states: Rc<TuiStates>, gain_table: Vec<i32>) -> Self {
         Self {
-            app,
+            states,
             gain_table,
-            step: Cell::new(step),
-            floor_db,
-            ceil_db,
             selected: 0,
         }
     }
@@ -338,7 +323,7 @@ impl ControlView {
     /// Neighbouring rung of the tuner's gain table, starting from whichever
     /// entry is nearest the current value.
     fn gain_step(&self, dir: i32) -> i32 {
-        let cur = self.app.gain_tenths.load(Relaxed);
+        let cur = self.states.gain_tenths.get();
         if self.gain_table.is_empty() {
             return cur;
         }

@@ -452,6 +452,11 @@ and the fork is a real choice:
 - **Wider across the spectrum** — **R3.0** (mode abstraction), then R3.2 → R3.1 → R3.6.
   This is the better-value branch if the interest is in what is on the air rather than in
   FM fidelity: R3.0 is paid once and every mode after it is an evening.
+- **Deeper on the receiver itself** — **Tier 5**, R5.0 → R5.6 → R5.1. The cheapest of the
+  three: it adds no demodulator and no hardware, because every measurement is a function of
+  data already in memory each frame. It is also the branch that unblocks the most elsewhere
+  — R5.1 finishes R1.5 and gates R1.6 and R2.4, R5.10 *is* R2.4's sweep, R5.11 de-risks
+  R1.9.
 
 Read **§8.0 first either way** — it rules out several otherwise-obvious targets on this
 particular dongle.
@@ -711,6 +716,229 @@ transmitting is not debuggable; a decoder debugged against a saved capture is.
       while the UI runs on the desktop — and it's a third `Source` implementation, so R2.1's
       trait pays off twice. Streaming the demodulated audio out over HTTP/Icecast is the
       other half.
+
+### Tier 5 — the radio as an instrument (P1)
+
+*Prompted by [sdrtop](https://github.com/mustang6139/sdrtop), which is the same hardware
+pointed the other way: a terminal SDR that deliberately has **no audio** and spends the
+whole screen on measuring the receiver instead. It is worth reading as a catalogue even
+though almost none of its code applies here — it targets HackRF and a calibrated gain
+chain, and this dongle has neither.*
+
+**The thesis.** Tier 3 answers "there is not much to do here" with new demodulators, and
+each one is a weekend behind the R3.0 gate. Tier 5 answers it with a much cheaper surface:
+make the receiver itself the subject. Nearly every measurement below is a pure function of
+data that is **already in memory every frame** — the dB bins `Tui::sample` hands to
+`SignalView::push`, or the IQ that `read_async` already touched sample by sample. Nothing
+here needs a new demodulator, new hardware, or a change to the audio deadline.
+
+It also pays into the other tiers rather than competing with them. R5.1 is the missing half
+of R1.5 and unblocks R1.6 (squelch) and R2.4 (scan); R5.10 *is* R2.4's sweep engine; R5.11
+builds R1.9's pilot detector as a meter first, so the L-sized stereo item arrives with its
+hardest component already tested; R5.9 is what turns §6's tail-latency claims from asserted
+into measured, and is the payload that makes R4.3 (Pi) worth doing.
+
+**Suggested order:** R5.0 → R5.6 → R5.1 → R5.2 → the rest to taste. R5.6 first among the
+measurements because it is the one that changes how you *operate* the radio on day one; the
+FC0013's 23 gain values in three clusters (§8.0) are otherwise pure guesswork.
+
+#### Where the taps are — read before starting any of these
+
+Two different measurement domains, and conflating them is the trap:
+
+- **Post-correction IQ, at the device rate.** Ring c (`producer_fft`, `IQ_SLOTS ×
+  IQ_BLOCK` interleaved f32) is tapped in `source.rs` *after* `center_iq`, `IqDcBlocker`
+  and `Xlator`. Everything spectral belongs here, and a new consumer is a one-line
+  `producer_fft.subscribe()` — the multi-cursor design in §3 exists for exactly this.
+- **Raw ADC bytes.** Clipping, ADC utilisation, the IQ histogram and the *uncorrected* DC
+  offset are only visible on the `u8` pairs at the top of the `read_async` closure, before
+  centring. They cannot be recovered from ring c — the DC blocker has already removed the
+  thing being measured. These are counters on `Health`, computed in place.
+
+And the standing rule from §1 and [`crate::log`] holds throughout: **the hot path reports
+via counters, never via a formatted string.** Every item below publishes to `Health` as an
+atomic and is rendered by the UI thread, with [`UNMEASURED`] where nothing has written yet.
+
+- [ ] **R5.0 Instrument pane + measurement consumer** — M — *the gate, and cheap.*
+      **Why:** the readouts below do not fit in `InfoView`'s seven rows, and they should not
+      steal the waterfall's columns. `Pane` has exactly two variants today; the UI already
+      has the shape for a third.
+      **What:** a `Pane::Instrument` that `Tab` reaches, plus one ring-c consumer running
+      analysis at its own cadence (~10 Hz) rather than at the 30 fps frame rate. Note the UI
+      thread's own FFT sees roughly one block in ten (`seek_latest` then drop the rest, by
+      design) — that is fine for a display metric and wrong for an integrated one, which is
+      why the measurements get their own cursor rather than riding `Tui::sample`.
+      **Where:** `tui/instrument_view.rs`; `Pane` in `tui/tui_states.rs`; subscription in
+      `main.rs` beside `consumer_fft`.
+      **Done when:** a third pane renders, and the audio path is byte-identical — the whole
+      point of a broadcast ring is that adding a reader costs the producer nothing.
+
+- [ ] **R5.6 ADC utilisation, clipping, and the gain advisor** — S — **do this first.**
+      **Why:** the highest value-per-line item in the entire roadmap. §8.0 establishes that
+      this tuner offers 23 gain values in three switched-LNA clusters with ~11 dB gaps, and
+      right now there is no way to tell whether a chosen one is starving the ADC or clipping
+      it — the Gain row shows an input, not a consequence.
+      **What:** histogram the raw `u8` pairs into low/mid/clip buckets; publish fill
+      percentage, a saturation count, and PAPR (crest factor). Then the advisor: a verdict
+      of *starved / good / clipping* and, when it is not "good", the neighbouring entry in
+      the device gain table to move to — an index into that table, never a dB figure, since
+      `snap_gain_tenths` would only snap it back.
+      **Where:** the `bytes.chunks_exact(2)` loop in `source.rs::start_receive`; counters on
+      `Health`; a gauge in R5.0's pane.
+      **Done when:** covering the antenna reads *starved*, a strong local station on max
+      gain reads *clipping*, and following the advice moves the verdict to *good*.
+
+- [ ] **R5.1 Noise floor, true RSSI and SNR** — S — *completes R1.5.*
+      **Why:** `Health::rssi_dbfs_x10` and `snr_db_x10` exist, are wired into `InfoView`,
+      and nothing writes them — both rows render `—` today. SNR in particular is undefined
+      without a noise-floor estimate, which is also the missing input to R1.6's squelch
+      threshold and R2.4's peak detector. One estimator, three unblocked items.
+      **What:** noise floor as a low percentile (median, or ~30th) of the FFT bins rather
+      than a mean — a mean is dragged up by the carrier it is meant to exclude. RSSI from
+      in-band bin power; SNR as in-band minus floor. EMA-smoothed, because an unsmoothed
+      floor flickers by several dB frame to frame and makes the squelch chatter.
+      **Where:** the measurement consumer from R5.0; the two existing `Health` atomics.
+      **Done when:** both `InfoView` rows read real numbers, the floor stays put while
+      tuning across an empty stretch of band, and SNR tracks moving on and off a station.
+
+- [ ] **R5.2 dB axis, reference level, max-hold and averaging** — S
+      **Why:** `SignalView` already renders a bonded spectrum above the waterfall sharing
+      one floor/ceil and an MHz axis — the trace is there, the *analysis* on it is not.
+      `pending` is peak-hold across the ~4 windows in one frame and is reset by `commit`, so
+      nothing survives a frame.
+      **What:** (a) a dB scale on the spectrum's left edge, since floor/ceil are already
+      adjustable and currently unlabelled; (b) a persistent max-hold trace drawn as a
+      separate dim line, clearable on a keypress; (c) N-frame averaging as an alternative
+      reduction — on **linear magnitude before `post_process` takes the log**, because
+      averaging values already in dB is wrong and is precisely why `push` uses `max` today;
+      (d) reference-level nudge keys so floor and ceil move together.
+      **Where:** `tui/signal_view.rs`; new `Field`s beside `Floor`/`Ceil`.
+      **Done when:** a burst leaves a mark on the max-hold trace, and averaging visibly
+      settles the noise floor without burying a narrow carrier.
+
+- [ ] **R5.3 Markers and deltas** — S
+      **Why:** the waterfall shows that something is at some frequency; a marker says which,
+      and how far it is from the last one. This is the difference between a pretty display
+      and a measurement.
+      **What:** place a marker at a bin, read out frequency and dB; a second marker gives Δf
+      and ΔdB. Peak-search snaps to the strongest bin in view. Markers persist across
+      retunes and land in R2.3's config file.
+      **Where:** `tui/signal_view.rs` for the render, `tui_states.rs` for the list — markers
+      are pure UI state and must not go anywhere near `AppStates`.
+      **Done when:** a marker on a broadcast carrier and one on the noise beside it read a
+      Δ that matches R5.1's SNR.
+
+- [ ] **R5.4 Channel power, occupied bandwidth, ACPR** — M
+      **Why:** the three numbers that describe a signal rather than a picture of it, and all
+      three are integrations over bins already in hand.
+      **What:** channel power over the tuned bandwidth; occupied bandwidth as the 99 %-power
+      span (ITU-R SM.328); adjacent-channel power ratio against the neighbours at ±200 kHz
+      for broadcast FM. Sum in **linear power, then take the log once** — the recurring trap
+      in this tier.
+      **Where:** the R5.0 consumer; readouts in the instrument pane.
+      **Done when:** a broadcast FM station reads an OBW near 180–200 kHz, which is the
+      known-good answer that says the integration is right.
+
+- [ ] **R5.5 Band-plan overlay and RBW** — S
+      **Why:** §8.0 already worked out which bands this dongle is good for and that
+      knowledge lives only in this file. On screen it becomes a label under the axis saying
+      what you are looking at.
+      **What:** a static table of band edges and names — broadcast FM, airband, 2 m, marine,
+      137 MHz satellite, PMR, 433 ISM — drawn as tinted spans under the frequency axis, plus
+      an RBW readout (`sample_rate / N`, ~1.17 kHz at 2.4 MS/s and N = 2048) so the spectrum
+      says what resolution it is showing.
+      **Where:** a `const` table in a new `tui/bandplan.rs`; rendered by `render_mhz_axis`.
+      **Done when:** tuning to 124 MHz labels the span *airband*.
+
+- [ ] **R5.7 Persistence constellation, DC offset and IQ imbalance** — M
+      **Why:** `IqDcBlocker` runs on every sample and nothing shows what it is removing, and
+      quadrature error is invisible until it shows up as an image you cannot explain. This is
+      also the best-looking widget available here — the renderer already does sub-cell blocks
+      for the waterfall.
+      **What:** a decaying 2-D histogram of I against Q; a fitted ellipse whose eccentricity
+      is the amplitude imbalance and whose tilt is the phase error; numeric DC offset from
+      the *raw* bytes (see the tap note above) alongside the corrected value from ring c, so
+      the blocker's work is visible rather than assumed.
+      **Where:** `tui/constellation_view.rs`; raw-domain figures as `Health` counters.
+      **Done when:** a strong FM carrier draws a filled ring, and the measured DC offset
+      agrees with the 127.4 empirical centring constant in `dsp::center_iq`.
+
+- [ ] **R5.8 IQ imbalance correction and an IRR meter** — M
+      **Why:** once R5.7 measures it, correcting it is roughly ten lines, and it removes the
+      mirror-image ghosts that otherwise appear symmetric about DC. The meter is the proof.
+      **What:** amplitude and phase correction applied per sample; an image-rejection-ratio
+      null meter comparing a tone against its mirror across DC, before and after.
+      **Where:** a new stage in `source.rs` between `IqDcBlocker` and `Xlator` — it must run
+      *before* the shift, since the imbalance is a property of the quadrature mixer and the
+      mirror is about the tuner's DC, not the channel's.
+      **Done when:** the IRR figure improves by a visible number of dB when correction is
+      toggled, and the ghost of a strong station is gone from the waterfall.
+
+- [ ] **R5.9 Stream timing diagnostics** — S
+      **Why:** §6 says this project is about the tail, not the mean, and then the tail is
+      asserted rather than measured. This measures it, with no instrumentation framework —
+      the callback already runs once per USB transfer, so the inter-arrival time is one
+      `Instant` subtraction.
+      **What:** transfer cadence, achieved throughput against nominal, and jitter as p50/p99
+      of the inter-arrival gap, with a verdict. Ring fill level for ring b comes free from
+      `RingProducer::pending` and is the input R1.8's drift loop will need anyway.
+      **Where:** `source.rs` callback entry; `Health`; sparklines in the instrument pane.
+      **Done when:** the numbers are on screen, and R4.3 has something to report from a Pi
+      beyond "it did not crash".
+      **Careful:** an `Instant::now()` per transfer is fine (~4700/s at most); a `Duration`
+      formatted into a `String` anywhere in that closure is the exact defect R1.3 exists to
+      remove.
+
+- [ ] **R5.10 Sweep beyond the window** — M — *this is R2.4's engine.*
+      **Why:** the display spans 2.4 MHz and broadcast FM is 20 MHz wide. Retune, capture,
+      stitch, repeat — and the result is both a band picture and the peak list that R2.4's
+      scanner consumes. Building it once, here, is what stops R2.4 from being a second
+      implementation of the same loop.
+      **What:** start/stop/dwell as controls; retune via the existing `CtrlSignal` path;
+      discard the first block or two after each hop while the PLL settles (getting this
+      wrong is the entire difficulty); stitch on power, trimming each segment's edges where
+      the decimation filters roll off.
+      **Where:** a sweep state machine driving `ctrl_tx`; segments accumulated in the
+      instrument pane.
+      **Done when:** one sweep of 88–108 MHz produces a peak list matching the stations
+      actually receivable, and tuning to a listed peak plays it.
+
+- [ ] **R5.11 FM deviation, MPX and pilot meter** — M — *pre-work for R1.9.*
+      **Why:** this is the one place ferrite can go further than sdrtop rather than catching
+      up, because ferrite actually demodulates. And it front-loads the risky half of R1.9:
+      the pilot detector built here as a meter becomes that item's PLL, tested against real
+      air before any stereo matrix exists.
+      **What:** peak and RMS deviation from the discriminator output (`DSPFlow.out_demod`,
+      already at 300 kHz where the full multiplex is present and unfiltered); an MPX
+      spectrum; 19 kHz pilot presence and level; stereo injection as a percentage.
+      **Where:** a tap on `out_demod` in `source/dsp.rs`; a panel in the instrument pane.
+      **Done when:** a station known to be stereo lights the pilot indicator and reads a
+      plausible injection percentage, and peak deviation on a loud passage approaches the
+      75 kHz that `Demodulation::new` is constructed with.
+
+- [ ] **R5.12 Layout presets and a help overlay** — S
+      **Why:** by R5.4 there is more to show than fits, and the answer is not a smaller font.
+      Presets are how sdrtop fits twenty panels into one terminal without clutter.
+      **What:** number keys select a layout — receiver (today's), spectrum focus, instrument
+      focus, IQ focus — and `?` opens a key overlay, which the app has needed since the
+      second `Field` was added.
+      **Where:** `tui/tui.rs::draw`; layout choice in `TuiStates`; persisted by R2.3.
+      **Done when:** one keypress switches layout, and `?` lists every binding.
+
+#### Deliberately not taken from sdrtop
+
+- **Noise figure (Friis), MDS, and calibrated dBm.** These need a characterised gain chain.
+  This tuner reports 23 uncalibrated values in three clusters with ~11 dB gaps and no
+  reference level anywhere in the path, so the outputs would be arithmetic dressed as
+  measurement. Everything above is deliberately relative (dBFS, dB ratios) or a count.
+  Revisit only alongside the R820T from §8.0, and only with a known reference source.
+- **Six colour themes.** The waterfall palette is a considered choice — monotone in
+  lightness, so a weak signal stays legible against the floor and survives a grayscale
+  screenshot. Making it swappable trades that away for a settings row.
+- **Observer mode.** It exists because sdrtop expects to share a device with another
+  application. ferrite holds the dongle for its lifetime.
+- **Multi-device abstraction.** One dongle. R2.1's `Source` trait already provides the only
+  abstraction that pays for itself here, and R4.4 is the second implementation.
 
 ---
 

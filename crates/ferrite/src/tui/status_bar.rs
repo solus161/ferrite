@@ -8,6 +8,7 @@
 //! are added. A transient status message takes the whole row while it is live —
 //! the log keeps the history, the bar only ever shows the latest.
 
+
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -36,12 +37,12 @@ const LOG_KEYS: [(&str, &str); 4] = [
 pub struct StatusBar;
 
 impl StatusBar {
-    pub fn render(&self, area: Rect, buf: &mut Buffer, states: &TuiStates) {
+    pub fn render(&self, area: Rect, buf: &mut Buffer, states: &TuiStates, status: Option<&str>) {
         if area.is_empty() {
             return;
         }
 
-        if let Some(msg) = states.status() {
+        if let Some(msg) = status {
             Line::styled(
                 format!(" {msg}"),
                 Style::new().fg(Color::Black).bg(Color::Yellow),
@@ -50,7 +51,7 @@ impl StatusBar {
             return;
         }
 
-        let keys: &[(&str, &str)] = match states.focus {
+        let keys: &[(&str, &str)] = match states.focus.get() {
             Pane::Control => &CONTROL_KEYS,
             Pane::Log => &LOG_KEYS,
         };

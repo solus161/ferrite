@@ -7,16 +7,13 @@
 use std::cell::Cell;
 use std::collections::VecDeque;
 use std::rc::Rc;
-use std::sync::Arc;
-use std::sync::atomic::Ordering::Relaxed;
+use std::{array, usize};
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Widget};
-
-use crate::tui::app_states::AppStates;
 
 /// Upper-half block. The foreground paints the top half of the cell and the
 /// background the bottom, so every terminal row carries two waterfall lines.
@@ -44,33 +41,63 @@ pub struct SignalView {
     /// render, so several fold into the one row a frame is allowed to commit.
     pending: Box<[f32]>,
     has_pending: bool,
+
+    /// A pair of (current, old), so rerender MHz only at changes.
+    center_freq: (Rc<Cell<u32>>, u32),
+
+    /// Sample rate is constant
+    sample_rate: Rc<Cell<u32>>,
+
     /// Colour range. These two decide whether the display looks like anything.
     /// Shared with the Control panel, which is where they are edited — a copied
     /// `f32` would let the two drift.
-    floor_db: Rc<Cell<f32>>,
-    ceil_db: Rc<Cell<f32>>,
+    /// This `floor_db` and `ceil_db` are tuple of (updated value, old value)
+    /// so rerender happens only at values changed
+    floor_db: (Rc<Cell<f32>>, f32),
+    ceil_db: (Rc<Cell<f32>>, f32),
     /// Read for the frequency axis only; the spectra themselves arrive through
     /// `push`.
-    app: Arc<AppStates>,
+
+    /// 4 segments, 5 values
+    mhz_xaxis_labels: [f32; 6],
+
+    /// Preallocated arrays labels for spectrum db axis
+    /// 5 segments, 6 values
+    spec_yaxis_labels: [f32; 6],
+
+    /// Preallocated arrays labels for waterfall timelapse axis
+    /// 5 segments, 6 values
+    water_yaxis_labels: [f32; 6],
 }
 
 impl SignalView {
     pub fn new(
         bins: usize,
         history: usize,
-        app: Arc<AppStates>,
+        center_freq: Rc<Cell<u32>>,
+        sample_rate: Rc<Cell<u32>>,
         floor_db: Rc<Cell<f32>>,
         ceil_db: Rc<Cell<f32>>,
     ) -> Self {
+        let center_freq_old = center_freq.get();
+        let floor_db_old = floor_db.get();
+        let ceil_db_old = ceil_db.get();
+
+        // Generate labels
+
         Self {
             bins,
             rows: VecDeque::with_capacity(history),
             history,
             pending: vec![f32::NEG_INFINITY; bins].into_boxed_slice(),
             has_pending: false,
-            floor_db,
-            ceil_db,
-            app,
+            center_freq: (center_freq, center_freq_old),
+            sample_rate,
+            floor_db: (floor_db, floor_db_old),
+            ceil_db: (ceil_db, ceil_db_old),
+            mhz_xaxis_labels: array::from_fn(|_| 0.0f32),
+            spec_yaxis_labels: array::from_fn(|_| 0.0f32),
+            water_yaxis_labels: array::from_fn(|_| 0.0f32),
         }
     }
 
@@ -113,7 +140,7 @@ impl SignalView {
 
     /// dB to RGB across `[floor_db, ceil_db]`, clamped at both ends.
     fn color(&self, db: f32) -> Color {
-        let (floor, ceil) = (self.floor_db.get(), self.ceil_db.get());
+        let (floor, ceil) = (self.floor_db.0.get(), self.ceil_db.0.get());
         let span = (ceil - floor).max(f32::EPSILON);
         let t = ((db - floor) / span).clamp(0.0, 1.0);
 
@@ -143,6 +170,71 @@ impl SignalView {
             .fold(f32::NEG_INFINITY, f32::max)
     }
 
+    /// This is called when app stats is updated in parent tui
+    pub fn update_tui_stats(&mut self) {}
+
+    /// Generate axis labels, given a center value.
+    /// `range_half` is max distance from `center` to either sides.
+    fn gen_axis_labels_center(center: f32, range_half: f32, out: &mut [f32]) {
+        assert_eq!(out.len() % 2, 1);
+        let mark_count = out.len();
+        let bins_half = mark_count / 2;
+        let bin_size: f32 = range_half / bins_half as f32;
+
+        // Median labels
+        out[bins_half + 1] = center;
+
+        // Fill lower
+        for i in 0..bins_half {
+            let fr_center = bin_size * ((bins_half - i) as f32);
+            out[i] = center - fr_center;
+            out[mark_count - i - 1] = center + fr_center;
+        }
+    }
+
+    /// Generate axis labels, given lower and upper bound
+    fn gen_axis_labels_bound(lower: f32, upper: f32, out: &mut [f32]) {
+        let mark_count = out.len();
+        let bin_count = mark_count - 1;
+        let bin_size: f32 = (upper - lower) / bin_count as f32;
+        out[0] = lower;
+        out[mark_count - 1] = upper;
+
+        for i in 1..mark_count - 1 {
+            out[i] = lower + bin_size * i as f32;
+        }
+    }
+
+    /// Computer waterfall mhz axis marks
+    /// `force = true` means recalculate marks always
+    /// else check for change before calculation
+    fn gen_mhz_xaxis_labels(&mut self, force: bool) {
+        let current_freq = self.center_freq.0.get();
+        if force || current_freq != self.center_freq.1 {
+            Self::gen_axis_labels_center(
+                self.center_freq.0.get() as f32,
+                self.sample_rate.get() as f32 / 2.0,
+                &mut self.mhz_xaxis_labels[..],
+            );
+        };
+        self.center_freq.1 = current_freq;
+    }
+
+    /// Compute spectrum db axis mark
+    pub fn gen_spec_yaxis_label(&mut self, force: bool) {
+        let current_floor = self.floor_db.0.get();
+        let current_ceil = self.ceil_db.0.get();
+        if force || current_floor != self.floor_db.1 || current_ceil != self.ceil_db.1 {
+            Self::gen_axis_labels_bound(
+                current_floor,
+                current_ceil,
+                &mut self.spec_yaxis_labels[..],
+            );
+        };
+        self.floor_db.1 = current_floor;
+        self.ceil_db.1 = current_ceil;
+    }
+
     /// Frequency axis, one row, shared by the spectrum above and the waterfall
     /// below.
     ///
@@ -156,8 +248,8 @@ impl SignalView {
     /// a wide sample rate at the bottom of the tuning range, and unsigned would
     /// wrap it into the gigahertz.
     fn render_mhz_axis(&self, area: Rect, buf: &mut Buffer) {
-        let center_hz = self.app.center_freq.load(Relaxed) as i64;
-        let fifth = self.app.sample_rate.load(Relaxed) as i64 / 5;
+        let center_hz = self.center_freq.0.get() as i64;
+        let fifth = self.sample_rate.get() as i64 / 5;
 
         let cols = Layout::horizontal([Constraint::Ratio(1, 5); 5]).split(area);
 
@@ -172,6 +264,14 @@ impl SignalView {
         }
     }
 
+    fn renter_spectrum_yaxis<const N: usize>(&self, area: Rect, _buf: &mut Buffer) {
+        if area.is_empty() {
+            return;
+        };
+
+        let _height = area.height as usize;
+    }
+
     fn render_spectrum(&self, area: Rect, buf: &mut Buffer) {
         if area.is_empty() || self.bins == 0 {
             return;
@@ -181,7 +281,7 @@ impl SignalView {
 
         let Some(row) = self.rows.front() else { return };
 
-        let (floor, ceil) = (self.floor_db.get(), self.ceil_db.get());
+        let (floor, ceil) = (self.floor_db.0.get(), self.ceil_db.0.get());
         // Height is in whole cells but the blocks give eighths, so the bar is
         // measured in eighths throughout and split at the end. Doing it the
         // other way — cells, then a leftover in dB — needs a second division
@@ -247,6 +347,8 @@ impl Widget for &SignalView {
         let inner = block.inner(area);
         block.render(area, buf);
 
+        let y_axis_width: u16 = 5;
+
         // Axis on the seam rather than above everything: both panels share one
         // frequency scale, and putting it where they meet is what every SDR
         // display does, because each label then touches the thing it labels.
@@ -256,6 +358,21 @@ impl Widget for &SignalView {
             Constraint::Fill(1),
         ])
         .areas(inner);
+
+        // The left col for db axis
+        let [_area_spec_axis, area_spec] =
+            Layout::horizontal([Constraint::Length(y_axis_width), Constraint::Fill(1)])
+                .areas(area_spec);
+
+        // Same must be done tor mhz_axis
+        let [_, mhz_axis] =
+            Layout::horizontal([Constraint::Length(y_axis_width), Constraint::Fill(1)])
+                .areas(mhz_axis);
+
+        // Y axis of waterfall show timelapsed
+        let [_area_water_axis, area_water] =
+            Layout::horizontal([Constraint::Length(y_axis_width), Constraint::Fill(1)])
+                .areas(area_water);
 
         self.render_spectrum(area_spec, buf);
         self.render_mhz_axis(mhz_axis, buf);

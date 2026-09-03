@@ -1,6 +1,7 @@
+use std::cell::Cell;
 use std::io;
+use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::Ordering::Relaxed;
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
@@ -11,12 +12,11 @@ use ratatui::{DefaultTerminal, Frame};
 use sdr_core::spmc::RingConsumer;
 use sdr_core::{control_signal::CtrlSignal, fft::Fft};
 
-use crate::tui::app_states::AppStates;
 use crate::tui::control_view::{self, ControlView};
 use crate::tui::info_view::{self, InfoView};
 use crate::tui::log_view::LogView;
 use crate::tui::status_bar::StatusBar;
-use crate::tui::tui_states::{Pane, TuiStates};
+use crate::tui::tui_states::{Health, Pane, TuiStates};
 
 use super::signal_view::SignalView;
 
@@ -31,9 +31,12 @@ const FRAME: Duration = Duration::from_millis(33);
 /// them on `Freq 91.500 MHz`.
 const SIDEBAR: u16 = 30;
 
+/// How long a status message stays on the bottom bar before the key hints come
+/// back. Long enough to read, short enough that the bar is not stale.
+const STATUS_TTL: Duration = Duration::from_secs(3);
+
 pub struct Tui<const SLOTS: usize, const BLOCK: usize, const N: usize> {
-    app: Arc<AppStates>,
-    states: TuiStates,
+    states: Rc<TuiStates>,
     consumer: RingConsumer<f32, SLOTS, BLOCK>,
     fft: Fft<N>,
 
@@ -43,6 +46,7 @@ pub struct Tui<const SLOTS: usize, const BLOCK: usize, const N: usize> {
     info_view: InfoView,
     log_view: LogView,
     status_bar: StatusBar,
+    status: Option<(String, Instant)>,
 
     // IQ stream buffer, after centered and high-pass filter
     block: [f32; BLOCK],
@@ -53,26 +57,43 @@ pub struct Tui<const SLOTS: usize, const BLOCK: usize, const N: usize> {
 
 impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N> {
     pub fn new(
-        app: Arc<AppStates>,
+        states: TuiStates,
         gain_table: Vec<i32>,
-        step: u32,
         consumer: RingConsumer<f32, SLOTS, BLOCK>,
         ctrl_tx: Sender<CtrlSignal>,
+        health: Arc<Health>,
     ) -> Self {
         // Block size must be x*window size
-        const { assert!(BLOCK % (2 * N) == 0) };
+        const { assert!(BLOCK.is_multiple_of(2 * N)) };
 
-        let states = TuiStates::new(-90.0, 0.0);
-        let (floor, ceil) = (states.floor_db.clone(), states.ceil_db.clone());
+        let states = Rc::new(states);
+
+        let signal_view = SignalView::new(
+            N,
+            256,
+            states.center_freq(),
+            states.sample_rate(),
+            states.floor_db(),
+            states.ceil_db(),
+        );
+
+        let info_view = InfoView::new(
+            states.center_freq(),
+            states.sample_rate(),
+            states.audio_rate(),
+            health,
+        );
+
+        let control_view = ControlView::new(states.clone(), gain_table);
 
         Self {
-            signal_view: SignalView::new(N, 256, app.clone(), floor.clone(), ceil.clone()),
-            control_view: ControlView::new(app.clone(), gain_table, step, floor, ceil),
-            info_view: InfoView::new(app.clone()),
+            states,
+            signal_view,
+            control_view,
+            info_view,
             log_view: LogView,
             status_bar: StatusBar,
-            app,
-            states,
+            status: None,
             consumer,
             fft: Fft::new(),
             block: [0.0f32; BLOCK],
@@ -107,6 +128,13 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
         }
     }
 
+    pub fn status(&self) -> Option<&str> {
+        self.status
+            .as_ref()
+            .filter(|(_, at)| at.elapsed() < STATUS_TTL)
+            .map(|(t, _)| t.as_str())
+    }
+
     /// Returns true when the app should exit.
     fn on_key(&mut self, k: KeyEvent) -> bool {
         // Crossterm reports Press *and* Release under the kitty keyboard
@@ -125,10 +153,12 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
             KeyCode::Char('q') | KeyCode::Esc => return self.quit(),
 
             KeyCode::Tab | KeyCode::BackTab => {
-                self.states.focus = self.states.focus.next();
+                self.states
+                    .focus
+                    .swap(&Cell::new(self.states.focus.get().next()));
                 // A pane you scrolled back through should be showing the tail
                 // again next time you come to it.
-                self.states.log_scroll = 0;
+                self.states.log_scroll.set(0);
             }
 
             KeyCode::Up => self.scroll(-1),
@@ -144,7 +174,7 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
                     let _ = self.ctrl_tx.send(sig);
                 }
                 let (label, value) = self.control_view.focused();
-                self.states.set_status(format!("{label}  {value}"));
+                self.set_status(format!("{label}  {value}"));
             }
 
             // Kept as global shortcuts even though both are now Control rows —
@@ -156,14 +186,13 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
             // Mute earns a global key for the same reason every media player
             // gives it one.
             KeyCode::Char('m') => {
-                let muted = !self.app.muted.load(Relaxed);
-                self.app.muted.store(muted, Relaxed);
-                self.states
-                    .set_status(if muted { "Muted" } else { "Unmuted" });
+                let muted = !self.states.muted.get();
+                self.states.muted.set(muted);
+                self.set_status(if muted { "Muted" } else { "Unmuted" });
             }
 
             // Back to the tail of the log.
-            KeyCode::Char('g') => self.states.log_scroll = 0,
+            KeyCode::Char('g') => self.states.log_scroll.set(0),
 
             _ => {}
         }
@@ -179,14 +208,24 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
         true
     }
 
+    /// Post a transient message to the bottom bar. The log keeps the history;
+    /// the bar only ever shows the latest.
+    pub fn set_status(&mut self, text: impl Into<String>) {
+        self.status = Some((text.into(), Instant::now()));
+    }
+
     fn scroll(&mut self, dir: i32) {
-        match self.states.focus {
+        match self.states.focus.get() {
             Pane::Control => self.control_view.select(dir),
             // Up scrolls *back* through history, which is the direction the
             // text moves.
             Pane::Log => {
-                self.states.log_scroll =
-                    self.states.log_scroll.saturating_add_signed(-dir as isize);
+                let scroll = self
+                    .states
+                    .log_scroll
+                    .get()
+                    .saturating_add_signed(-dir as isize);
+                self.states.log_scroll.set(scroll);
             }
         }
     }
@@ -194,7 +233,7 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
     fn nudge_floor(&mut self, db: f32) {
         let floor = self.states.floor_db.get() + db;
         self.states.floor_db.set(floor);
-        self.states.set_status(format!("Floor  {floor:.0} dB"));
+        self.set_status(format!("Floor  {floor:.0} dB"));
     }
 
     /// Process one block -> spectrum & spectrogram
@@ -204,12 +243,17 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
         // than the one `claim`'s resync lands on, N/2 slots back.
         self.consumer.seek_latest();
 
-        // Nothing to read
-        if self.consumer.read_into(&mut self.block).is_err() {
+        // Uncomment this if you want to copy into self.block
+        // if self.consumer.read_into(&mut self.block).is_err() {
+        //     return;
+        // };
+
+        // Buffer will be copied to fft anyway, no need to copy here, just return the slice
+        let Ok(buf) = self.consumer.read() else {
             return;
         };
 
-        for window in self.block.chunks_exact(2 * N) {
+        for window in buf.chunks_exact(2 * N) {
             if let Some(spectrum) = self.fft.push(window) {
                 self.signal_view.push(spectrum);
             }
@@ -240,7 +284,7 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
         ])
         .areas(sidebar);
 
-        let focus = self.states.focus;
+        let focus = self.states.focus.get();
         self.control_view
             .render(area_control, frame.buffer_mut(), focus == Pane::Control);
         self.info_view.render(area_info, frame.buffer_mut());
@@ -248,15 +292,16 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
         // Clamped by the view, which is the only thing that knows how many
         // lines fit — otherwise a held key winds the counter off past the end
         // of the history and the pane goes blank.
-        self.states.log_scroll = self.log_view.render(
+        let scroll = self.log_view.render(
             area_log,
             frame.buffer_mut(),
-            self.states.log_scroll,
+            self.states.log_scroll.get(),
             focus == Pane::Log,
         );
+        self.states.log_scroll.set(scroll);
 
         frame.render_widget(&self.signal_view, signal);
         self.status_bar
-            .render(status, frame.buffer_mut(), &self.states);
+            .render(status, frame.buffer_mut(), &self.states, self.status());
     }
 }
