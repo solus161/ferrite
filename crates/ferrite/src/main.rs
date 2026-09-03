@@ -14,7 +14,7 @@ use sdr_core::{control_signal::CtrlSignal, exceptions::CustomError, spmc::RingPr
 use crate::source::source::Source;
 use crate::source::source::{CPAL_BLOCK, IQ_BLOCK, IQ_SLOTS, OFFSET_TUNING_HZ};
 use crate::speaker::Speaker;
-use crate::tui::{app_states::AppStates, tui::Tui};
+use crate::tui::{tui::Tui, tui_states::Health, tui_states::TuiStates};
 
 /// Startup gain, in librtlsdr's tenths of a dB. Snapped to the tuner's own
 /// table at open, so this is a request, not a promise — 20 dB lands on the
@@ -104,34 +104,30 @@ fn main() -> Result<(), CustomError> {
     // For controller
     let (ctrl_tx, ctrl_rx) = channel::<CtrlSignal>();
 
-    // ── Shared state ────────────────────────────────────────────────────────
-    // One `Arc` for everything the radio has an opinion about: the UI writes
-    // settings into it, the DSP and cpal read them, and measurements come back
-    // the other way. Purely visual state (cursor, colour range, log scroll)
-    // stays in `TuiStates`, on the UI thread, behind no synchronisation at all.
-    //
-    // The rates go in as zero because the *device* picks them: cpal reports the
-    // output rate it will actually run at, and librtlsdr the sample rate it
-    // rounded to. Seeding a nominal value here would put a number on screen
-    // that nothing had confirmed.
-    let app = Arc::new(AppStates::new(
-        0,          // sample rate — from librtlsdr, below
-        0,          // audio rate  — from cpal, below
-        91_000_000, // center
-        DEFAULT_GAIN_TENTHS,
-        300_000, // channel bandwidth
-        0,       // ppm
-    ));
+    // Health states is shared accross threads: source, fft, cpal, etc
+    let health = Arc::new(Health::new());
 
     // Speaker. Fills in both rates, since it is what asks cpal for one.
-    let speaker = Speaker::new(consumer_sp, app.clone());
+    let speaker = Speaker::new(consumer_sp);
     let rtl_rate = speaker.rtl_rate;
-    speaker.play()?;
+
+    // Some initial states
+    let states = TuiStates::new(
+        speaker.rtl_rate,
+        speaker.audio_rate,
+        91_000_000,
+        DEFAULT_STEP_HZ,
+        DEFAULT_GAIN_TENTHS,
+        300_000,
+        0,
+        -90.0,
+        0.0,
+    );
 
     let source = Source::new(
         rtl_rate,
-        app.center_freq.load(Relaxed),
-        app.bandwidth.load(Relaxed),
+        states.center_freq.get(),
+        states.bandwidth.get(),
         (DEFAULT_GAIN_TENTHS / 10).max(0) as u32,
         ctrl_rx,
     );
@@ -141,9 +137,9 @@ fn main() -> Result<(), CustomError> {
     // hand the table itself to the Control panel — its Gain row steps that
     // table rather than whole dB, which is what keeps the displayed gain a gain
     // the device actually has.
-    app.gain_tenths.store(source.applied_gain_tenths, Relaxed);
+    states.gain_tenths.set(source.applied_gain_tenths);
     // librtlsdr rounds the requested rate to what its divider can make.
-    app.sample_rate.store(source.sample_rate(), Relaxed);
+    states.sample_rate.set(source.sample_rate);
     let gain_table = source.gain_table.clone();
 
     log_info!(
@@ -153,23 +149,18 @@ fn main() -> Result<(), CustomError> {
     );
     log_info!(
         "{:.3} MS/s \u{b7} LO {:.3} MHz \u{b7} offset tuning {} kHz",
-        source.sample_rate() as f64 / 1e6,
-        app.center_freq
-            .load(Relaxed)
-            .saturating_sub(OFFSET_TUNING_HZ) as f64
-            / 1e6,
+        source.sample_rate as f64 / 1e6,
+        states.center_freq.get().saturating_sub(OFFSET_TUNING_HZ) as f64 / 1e6,
         OFFSET_TUNING_HZ / 1000
     );
 
     let (source_handle, ctrl_handle) = source.start_receive(producer_sp, producer_fft)?;
 
-    let tui = Tui::<IQ_SLOTS, IQ_BLOCK, FFT_N>::new(
-        app,
-        gain_table,
-        DEFAULT_STEP_HZ,
-        consumer_fft,
-        ctrl_tx,
-    );
+    let tui =
+        Tui::<IQ_SLOTS, IQ_BLOCK, FFT_N>::new(states, gain_table, consumer_fft, ctrl_tx, health);
+
+    // Let's run the whole thing
+    speaker.play()?;
     let _ = tui.run();
 
     let _ = source_handle.join();

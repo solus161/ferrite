@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::Ordering::Relaxed;
+use std::sync::RwLock;
 
 use cpal::{
     Stream,
@@ -9,10 +9,10 @@ use cpal::{
 use sdr_core::spmc::RingConsumer;
 
 use crate::source::source::{AUDIO_DECIM, CPAL_BLOCK, IQ_SLOTS};
-use crate::tui::app_states::AppStates;
 
 pub struct Speaker {
     stream: Stream,
+    volume_scale: Arc<RwLock<f32>>,
     pub rtl_rate: u32,
     pub audio_rate: u32,
 }
@@ -25,7 +25,7 @@ impl Speaker {
     /// a ~10.7 ms hard deadline, so it may not lock, allocate or log. Volume and
     /// mute arrive this way rather than over a channel for the same reason —
     /// see [`crate::log`] for the rule and PLAN.md §1 for why it exists.
-    pub fn new(consumer: RingConsumer<f32, IQ_SLOTS, CPAL_BLOCK>, app: Arc<AppStates>) -> Self {
+    pub fn new(consumer: RingConsumer<f32, IQ_SLOTS, CPAL_BLOCK>) -> Self {
         let host = cpal::default_host();
         let device = host
             .default_output_device()
@@ -45,8 +45,8 @@ impl Speaker {
         // cpal decides the output rate, so this is the first place either rate
         // is known. The Info panel reads both; `sample_rate` is corrected again
         // once librtlsdr reports what its divider rounded to.
-        app.audio_rate.store(audio_rate, Relaxed);
-        app.sample_rate.store(rtl_rate, Relaxed);
+        // app.audio_rate.store(audio_rate, Relaxed);
+        // app.sample_rate.store(rtl_rate, Relaxed);
 
         println!(
             "audio: {} Hz × {} ch  |  rtl: {} Hz  |  decim: {}",
@@ -67,6 +67,10 @@ impl Speaker {
         // yet. Counting those makes the Info panel's underrun row read ~24 000
         // on a perfectly healthy radio, which is worse than not measuring at
         // all. An underrun is the ring running dry *after* it has been fed.
+
+        let volume_scale = Arc::new(RwLock::new(1.0_f32));
+        let volume_scale_clone = volume_scale.clone();
+
         let mut started = false;
         let stream = device
             .build_output_stream(
@@ -88,7 +92,6 @@ impl Speaker {
                     // One load per callback, not per frame: volume cannot
                     // usefully change inside 10.7 ms, and a per-sample atomic
                     // read would defeat autovectorisation of the copy loop.
-                    let scale = app.audio_scale();
 
                     for frame in data.chunks_mut(channels) {
                         if pos == CPAL_BLOCK {
@@ -109,7 +112,8 @@ impl Speaker {
                                     // measure", and a nonzero count here means
                                     // fix the rate mismatch, not the ring size.
                                     if started {
-                                        app.health.underruns.fetch_add(1, Relaxed);
+                                        // TODO: add a health metric here
+                                        // app.health.underruns.fetch_add(1, Relaxed);
                                     }
                                     for out in frame.iter_mut() {
                                         *out = 0.0;
@@ -119,7 +123,11 @@ impl Speaker {
                             }
                         }
 
-                        let s = staging[pos] * scale;
+                        let volume = match volume_scale_clone.try_read() {
+                            Ok(guard) => guard.clone(),
+                            Err(_) => 1.0,
+                        };
+                        let s = staging[pos] * volume;
                         pos += 1;
                         for out in frame.iter_mut() {
                             *out = s; // mono → every channel
@@ -133,6 +141,7 @@ impl Speaker {
 
         Self {
             stream,
+            volume_scale,
             rtl_rate,
             audio_rate,
         }

@@ -94,9 +94,9 @@ pub struct Source {
     /// Handle for control signal threat
     ctrl_handle: JoinHandle<()>,
 
-    sample_rate: u32,
-    center_freq: Arc<AtomicU32>,
-    tuned_freq: Arc<AtomicU32>,
+    /// What librtlsdr's divider actually rounded the requested rate to. Not
+    /// generally the value passed to [`new`](Self::new).
+    pub sample_rate: u32,
 
     /// The gain the tuner actually accepted, in librtlsdr's tenths of a dB.
     /// Not necessarily what was asked for — see [`snap_gain`].
@@ -175,12 +175,8 @@ impl Source {
 
         let sample_rate = ctl.sample_rate();
 
-        let tuned_freq = Arc::new(AtomicU32::new(center_freq));
-        let center_freq = Arc::new(AtomicU32::new(center_freq));
-
         // Start a thread to receive control signal
         // better than checking within read_async
-        let center_freq_clone = center_freq.clone();
         let ctrl_handle = thread::spawn(move || {
             // Every arm logs rather than printing: stdout is the TUI's once
             // `ratatui::init()` runs. This thread is not on a deadline path, so
@@ -194,7 +190,6 @@ impl Source {
                         let lo = freq.saturating_sub(OFFSET_TUNING_HZ);
                         ctl.set_center_freq(lo)
                             .expect(&CustomError::RtlSetFreq(lo).to_string());
-                        center_freq_clone.store(freq, Ordering::Release);
                         // ctl.reset_buffer().expect(&CustomError::RtlResetBuffer.to_string());
                     }
 
@@ -255,17 +250,9 @@ impl Source {
             reader,
             ctrl_handle,
             sample_rate,
-            center_freq,
-            tuned_freq,
             applied_gain_tenths: gain,
             gain_table: gains_for_ui,
         }
-    }
-
-    /// What librtlsdr's divider actually rounded the requested rate to. Not
-    /// generally the value passed to [`new`](Self::new).
-    pub fn sample_rate(&self) -> u32 {
-        self.sample_rate
     }
 
     /// Start receiving from USB, send the self to another thread
