@@ -264,12 +264,12 @@ impl SignalView {
         }
     }
 
-    fn renter_spectrum_yaxis<const N: usize>(&self, area: Rect, buf: &mut Buffer) {
+    fn renter_spectrum_yaxis<const N: usize>(&self, area: Rect, _buf: &mut Buffer) {
         if area.is_empty() {
             return;
         };
 
-        let height = area.height as usize;
+        let _height = area.height as usize;
     }
 
     fn render_spectrum(&self, area: Rect, buf: &mut Buffer) {
@@ -360,7 +360,7 @@ impl Widget for &SignalView {
         .areas(inner);
 
         // The left col for db axis
-        let [area_spec_axis, area_spec] =
+        let [_area_spec_axis, area_spec] =
             Layout::horizontal([Constraint::Length(y_axis_width), Constraint::Fill(1)])
                 .areas(area_spec);
 
@@ -370,7 +370,7 @@ impl Widget for &SignalView {
                 .areas(mhz_axis);
 
         // Y axis of waterfall show timelapsed
-        let [area_water_axis, area_water] =
+        let [_area_water_axis, area_water] =
             Layout::horizontal([Constraint::Length(y_axis_width), Constraint::Fill(1)])
                 .areas(area_water);
 

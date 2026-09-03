@@ -8,7 +8,6 @@
 //! are added. A transient status message takes the whole row while it is live —
 //! the log keeps the history, the bar only ever shows the latest.
 
-use std::time::Instant;
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;

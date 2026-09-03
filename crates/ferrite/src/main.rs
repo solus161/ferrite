@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::sync::atomic::Ordering::Relaxed;
 use std::sync::mpsc::channel;
 
 #[macro_use]

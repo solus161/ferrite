@@ -38,7 +38,7 @@ impl Speaker {
             .default_output_config()
             .expect("Error getting config for default output");
         let channels = out_cfg.channels() as usize;
-        println!("channels {}", &channels);
+        println!("channels {}", channels);
         let audio_rate = out_cfg.sample_rate(); // u32 in cpal 0.18
         let rtl_rate = audio_rate * AUDIO_DECIM;
 
@@ -124,7 +124,7 @@ impl Speaker {
                         }
 
                         let volume = match volume_scale_clone.try_read() {
-                            Ok(guard) => guard.clone(),
+                            Ok(guard) => *guard,
                             Err(_) => 1.0,
                         };
                         let s = staging[pos] * volume;

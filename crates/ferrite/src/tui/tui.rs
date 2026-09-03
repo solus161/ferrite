@@ -64,7 +64,7 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
         health: Arc<Health>,
     ) -> Self {
         // Block size must be x*window size
-        const { assert!(BLOCK % (2 * N) == 0) };
+        const { assert!(BLOCK.is_multiple_of(2 * N)) };
 
         let states = Rc::new(states);
 

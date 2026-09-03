@@ -12,9 +12,8 @@
 use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
-use std::sync::atomic::{AtomicI32, AtomicU8, AtomicU32, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicI32, AtomicU64};
 
 use super::utils::get_attr_clone;
 

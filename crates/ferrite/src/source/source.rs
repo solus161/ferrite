@@ -1,5 +1,3 @@
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::Receiver;
 use std::{
     array,
@@ -119,18 +117,18 @@ impl Source {
     ) -> Self {
         // ── SDR setup (librtlsdr via rtlsdr_mt) ─────────────────────────────────
         let (mut ctl, reader) =
-            rtlsdr_mt::open(0).expect(&CustomError::RtlOpenDevice(0).to_string());
+            rtlsdr_mt::open(0).unwrap_or_else(|_| panic!("{}", CustomError::RtlOpenDevice(0).to_string()));
 
         // Offset tuning: park the LO below the station, not on it.
         let lo = center_freq.saturating_sub(OFFSET_TUNING_HZ);
         ctl.set_center_freq(lo)
-            .expect(&CustomError::RtlSetFreq(lo).to_string());
+            .unwrap_or_else(|_| panic!("{}", CustomError::RtlSetFreq(lo).to_string()));
 
         let tuner_bw = tuner_bandwidth(bandwidth);
         ctl.set_bandwidth(tuner_bw)
-            .expect(&CustomError::RtlSetBandwidth(tuner_bw).to_string());
+            .unwrap_or_else(|_| panic!("{}", CustomError::RtlSetBandwidth(tuner_bw).to_string()));
         ctl.set_sample_rate(sample_rate)
-            .expect(&CustomError::RtlSetSampleRate(sample_rate).to_string());
+            .unwrap_or_else(|_| panic!("{}", CustomError::RtlSetSampleRate(sample_rate).to_string()));
 
         // ── Gain: manual, not AGC ───────────────────────────────────────────────
         // The RTL2832's AGC is *digital*, downstream of the ADC. It cannot improve
@@ -143,7 +141,7 @@ impl Source {
         // sounds. `disable_agc` turns the digital AGC off *and* puts the tuner in
         // manual gain mode; `set_tuner_gain` would only do the latter.
         ctl.disable_agc()
-            .expect(&CustomError::RtlDisableAgc.to_string());
+            .unwrap_or_else(|_| panic!("{}", CustomError::RtlDisableAgc.to_string()));
 
         let mut gain_buf: rtlsdr_mt::TunerGains = [0; 32];
         let mut gains: Vec<i32> = ctl.tuner_gains(&mut gain_buf).to_vec();
@@ -156,7 +154,7 @@ impl Source {
 
         let gain = snap_gain(&gains, gain_db);
         ctl.set_tuner_gain(gain)
-            .expect(&CustomError::RtlSetGain(gain).to_string());
+            .unwrap_or_else(|_| panic!("{}", CustomError::RtlSetGain(gain).to_string()));
 
         println!(
             "tuner gain: {:.1} dB (asked {} dB) | supported: {}",
@@ -171,7 +169,7 @@ impl Source {
 
         // Flush stale USB buffers before streaming
         ctl.reset_buffer()
-            .expect(&CustomError::RtlResetBuffer.to_string());
+            .unwrap_or_else(|_| panic!("{}", CustomError::RtlResetBuffer.to_string()));
 
         let sample_rate = ctl.sample_rate();
 
@@ -189,7 +187,7 @@ impl Source {
                         // the station where the Xlator is not looking.
                         let lo = freq.saturating_sub(OFFSET_TUNING_HZ);
                         ctl.set_center_freq(lo)
-                            .expect(&CustomError::RtlSetFreq(lo).to_string());
+                            .unwrap_or_else(|_| panic!("{}", CustomError::RtlSetFreq(lo).to_string()));
                         // ctl.reset_buffer().expect(&CustomError::RtlResetBuffer.to_string());
                     }
 
@@ -201,7 +199,7 @@ impl Source {
                     CtrlSignal::Bandwidth(bw) => {
                         let tuner_bw = tuner_bandwidth(bw);
                         ctl.set_bandwidth(tuner_bw)
-                            .expect(&CustomError::RtlSetBandwidth(tuner_bw).to_string());
+                            .unwrap_or_else(|_| panic!("{}", CustomError::RtlSetBandwidth(tuner_bw).to_string()));
                         log_info!(
                             "IF filter {:.0} kHz for a {:.0} kHz channel",
                             tuner_bw as f32 / 1e3,
@@ -216,9 +214,9 @@ impl Source {
                     CtrlSignal::GainTenths(tenths) => {
                         let g = snap_gain_tenths(&gains, tenths);
                         ctl.disable_agc()
-                            .expect(&CustomError::RtlDisableAgc.to_string());
+                            .unwrap_or_else(|_| panic!("{}", CustomError::RtlDisableAgc.to_string()));
                         ctl.set_tuner_gain(g)
-                            .expect(&CustomError::RtlSetGain(g).to_string());
+                            .unwrap_or_else(|_| panic!("{}", CustomError::RtlSetGain(g).to_string()));
                         if g != tenths {
                             log_warn!(
                                 "tuner took {:.1} dB, not {:.1} dB",
@@ -230,12 +228,12 @@ impl Source {
 
                     CtrlSignal::AgcOn => {
                         ctl.enable_agc()
-                            .expect(&CustomError::RtlEnableAgc.to_string());
+                            .unwrap_or_else(|_| panic!("{}", CustomError::RtlEnableAgc.to_string()));
                     }
 
                     CtrlSignal::Ppm(ppm) => ctl
                         .set_ppm(ppm)
-                        .expect(&CustomError::RtlSetPpm(ppm).to_string()),
+                        .unwrap_or_else(|_| panic!("{}", CustomError::RtlSetPpm(ppm).to_string())),
 
                     CtrlSignal::Quit => {
                         ctl.cancel_async_read();
