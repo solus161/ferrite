@@ -9,5 +9,25 @@ edition = "2024"
 # The DSP runs 2.4 M samples/s through several FIR stages. At opt-level 0 the
 # per-sample work is non-inlined calls and the audio thread cannot keep up,
 # while `ferrite` itself stays debuggable at the default level.
+#
+# Note this does NOT cover the whole chain: `DSPFlow` lives in the `ferrite`
+# crate, as does the per-sample loop in `source::start_receive`, and the
+# generic `IqDcBlocker<_>` / `RingProducer::push` monomorphise into `ferrite`
+# rather than here. A dev build leaves all of that at opt-level 0. Add
+# `[profile.dev.package.ferrite] opt-level = 3` if you want a debug build that
+# runs at a realistic speed.
 [profile.dev.package.sdr-core]
 opt-level = 3
+
+# `sdr-core` and `ferrite` are separate crates, and the hot loop crosses
+# between them once per sample — `center_iq`, `IqDcBlocker::process`,
+# `Xlator::process_sample`, `RingProducer::push`, 4.8 M times a second. None of
+# those carry `#[inline]`, so without cross-crate inlining every one is a real
+# call. Fat LTO with a single codegen unit is what collapses them, and it
+# matters more here than it does for most binaries.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+# Line tables only (not full DWARF): costs nothing at runtime and is what makes
+# `perf record` on the release build name the FIR stages instead of addresses.
+debug = 1

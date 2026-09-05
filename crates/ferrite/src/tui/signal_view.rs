@@ -58,6 +58,11 @@ const MARKS: usize = 6;
 /// Wide enough for `-100` and for a negative time in tenths.
 const Y_AXIS_WIDTH: u16 = 5;
 
+/// The cursor marker, on its own row above the frequency axis.
+///
+/// Points down, at the axis label that names it and at the waterfall below.
+const CURSOR: char = '\u{25BC}';
+
 /// How the spectrum panel draws its trace.
 ///
 /// A real trade rather than a preference, which is why all three stay in the
@@ -109,6 +114,8 @@ impl SpectrumStyle {
 pub struct SignalLayout {
     pub spec_axis: Rect,
     pub spec: Rect,
+    /// One row for the frequency cursors, between the spectrum and the axis.
+    pub cursor: Rect,
     pub freq_axis: Rect,
     pub water_axis: Rect,
     pub water: Rect,
@@ -242,17 +249,27 @@ impl SignalView {
         (t >= 0.0 && t < 1.0).then(|| ((t * width as f32) as u16).min(width - 1))
     }
 
-    /// Draw one full-height vertical rule at column `x` of `area`.
+    /// The centre and channel markers, on their own row.
     ///
-    /// Writes a glyph rather than tinting with `set_style`: the waterfall packs
-    /// two rows into every cell as foreground *and* background, so a background
-    /// tint would erase half the data it covers, and a foreground-only tint
-    /// would be invisible on the half-block's lower row. One overwritten column
-    /// out of ~100 across 2.4 MHz is the cheaper trade.
-    fn render_cursor(area: Rect, x: u16, color: Color, buf: &mut Buffer) {
-        for dy in 0..area.height {
-            if let Some(cell) = buf.cell_mut((area.x + x, area.y + dy)) {
-                cell.set_char('\u{2502}').set_fg(color);
+    /// A dedicated strip rather than rules drawn down the plots: the spectrum
+    /// and the waterfall write every cell of their own areas, so a cursor drawn
+    /// over them is a column of data destroyed rather than annotated. Here it
+    /// annotates.
+    ///
+    /// Tuned is drawn first, so when the channel sits exactly on the centre the
+    /// cyan marker is the one left visible. The centre is the fixed reference
+    /// and always exists; a half-covered orange one would just read as a
+    /// rendering fault.
+    fn render_cursors(&self, area: Rect, buf: &mut Buffer) {
+        for (hz, color) in [
+            (self.tuned_freq.get(), colors::CURSOR_TUNED),
+            (self.center_freq.0.get(), colors::CURSOR_CENTER),
+        ] {
+            let Some(x) = self.freq_col(hz, area.width) else {
+                continue;
+            };
+            if let Some(cell) = buf.cell_mut((area.x + x, area.y)) {
+                cell.set_char(CURSOR).set_fg(color);
             }
         }
     }
@@ -263,24 +280,35 @@ impl SignalView {
     /// plots share one frequency scale, and putting it where they meet is what
     /// every SDR display does, because each label then touches the thing it
     /// labels.
+    ///
+    /// The cursor strip is one row directly above that axis. It costs the
+    /// waterfall a row, which is cheaper than what it replaces: cursors drawn as
+    /// rules through the plots blanked a whole column of data each, and at
+    /// 2.4 MHz over ~100 columns that is ~24 kHz of spectrum per cursor you
+    /// could no longer see.
     pub fn layout(area: Rect) -> SignalLayout {
         let inner = Block::bordered().inner(area);
 
-        let [spec, freq_axis, water] = Layout::vertical([
+        let [spec, cursor, freq_axis, water] = Layout::vertical([
             Constraint::Percentage(30),
+            Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Fill(1),
         ])
         .areas(inner);
 
+        // Every band is cut with the same gutter, so one column index means the
+        // same frequency in the spectrum, the cursor strip and the waterfall.
         let gutter = [Constraint::Length(Y_AXIS_WIDTH), Constraint::Fill(1)];
         let [spec_axis, spec] = Layout::horizontal(gutter).areas(spec);
+        let [_, cursor] = Layout::horizontal(gutter).areas(cursor);
         let [_, freq_axis] = Layout::horizontal(gutter).areas(freq_axis);
         let [water_axis, water] = Layout::horizontal(gutter).areas(water);
 
         SignalLayout {
             spec_axis,
             spec,
+            cursor,
             freq_axis,
             water_axis,
             water,
@@ -937,8 +965,9 @@ mod braille_tests {
             l.water.height,
             area.height
         );
-        // Border top and bottom, the spectrum, and the frequency row.
-        assert_eq!(l.water.height, 12);
+        // Border top and bottom, the spectrum, the cursor strip and the
+        // frequency row: 20 - 2 - 5 - 1 - 1.
+        assert_eq!(l.water.height, 11);
         assert_eq!(l.water_axis.height, l.water.height, "gutter tracks the plot");
         assert_eq!(l.water_axis.width, Y_AXIS_WIDTH);
     }
@@ -1060,9 +1089,10 @@ mod braille_tests {
     /// actually being heard, so their placement is the property worth pinning.
     ///
     /// Centre sits at mid-span by construction; the channel sits a fraction of
-    /// the width to the right equal to its fraction of the sample rate. Both
-    /// must land on the *same* column in the spectrum and the waterfall, which
-    /// is what makes the display readable as one scale.
+    /// the width to the right equal to its fraction of the sample rate. They
+    /// live on their own strip, so the check is also that the plots either side
+    /// come through untouched — drawing cursors over the data is what this
+    /// replaced.
     #[test]
     fn the_cursors_mark_the_centre_and_the_channel() {
         const CENTER: u32 = 90_650_000;
@@ -1096,16 +1126,30 @@ mod braille_tests {
             (mid, colors::CURSOR_CENTER, "centre"),
             (chan, colors::CURSOR_TUNED, "channel"),
         ] {
+            let cell = buf.cell((l.cursor.x + x, l.cursor.y)).unwrap();
+            assert_eq!(
+                cell.symbol(),
+                "\u{25bc}",
+                "{what} cursor missing from the strip at column {x}"
+            );
+            assert_eq!(cell.fg, colour, "{what} cursor is the wrong colour");
+
+            // And the plots either side are left alone.
             for (pane, name) in [(l.spec, "spectrum"), (l.water, "waterfall")] {
-                let cell = buf.cell((pane.x + x, pane.y)).unwrap();
-                assert_eq!(
-                    cell.symbol(),
-                    "\u{2502}",
-                    "{what} cursor missing from the {name} at column {x}"
+                assert_ne!(
+                    buf.cell((pane.x + x, pane.y)).unwrap().symbol(),
+                    "\u{25bc}",
+                    "a cursor leaked into the {name} at column {x}"
                 );
-                assert_eq!(cell.fg, colour, "{what} cursor is the wrong colour in the {name}");
             }
         }
+
+        // The strip is its own band, not stolen from either plot.
+        assert_eq!(l.cursor.height, 1);
+        assert_eq!(l.cursor.x, l.spec.x);
+        assert_eq!(l.cursor.width, l.spec.width);
+        assert_eq!(l.cursor.y, l.spec.y + l.spec.height, "sits under the spectrum");
+        assert_eq!(l.cursor.y + 1, l.freq_axis.y, "and directly above the axis");
     }
 }
 
@@ -1126,29 +1170,10 @@ impl Widget for &SignalView {
 
         self.render_spectrum_yaxis(l.spec_axis, buf);
         self.render_spectrum(l.spec, buf);
+        self.render_cursors(l.cursor, buf);
         self.render_mhz_axis(l.freq_axis, buf);
         self.render_water_yaxis(l.water_axis, buf);
         self.render_waterfall(l.water, buf);
-
-        // Last, because both plot renderers write every cell in their own area
-        // and would paint over anything drawn earlier.
-        //
-        // `l.spec` and `l.water` are cut from the same `inner` with the same
-        // gutter constraint, so they share an `x` and a `width` and one column
-        // index lines up across both. The axis row between them is skipped on
-        // purpose: it holds text, and a glyph dropped into it would split a
-        // frequency label in half.
-        //
-        // Tuned first, so that when the channel is parked on the centre the
-        // cyan centre line is what you see rather than a half-hidden orange one.
-        if let Some(x) = self.freq_col(self.tuned_freq.get(), l.spec.width) {
-            SignalView::render_cursor(l.spec, x, colors::CURSOR_TUNED, buf);
-            SignalView::render_cursor(l.water, x, colors::CURSOR_TUNED, buf);
-        }
-        if let Some(x) = self.freq_col(self.center_freq.0.get(), l.spec.width) {
-            SignalView::render_cursor(l.spec, x, colors::CURSOR_CENTER, buf);
-            SignalView::render_cursor(l.water, x, colors::CURSOR_CENTER, buf);
-        }
     }
 }
 
