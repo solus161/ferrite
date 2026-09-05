@@ -1,0 +1,12 @@
+[build]
+# The FIR stages are the hot path: ~200k multiply-accumulates per 8192-sample
+# USB transfer, ~293 transfers a second. `DecimFIR::convolve` is written as
+# four independent accumulators specifically so the compiler can keep four
+# vector lanes in flight, and that only pays off if it is allowed to emit FMA
+# and 256-bit loads. Without this flag the target is baseline x86-64 — SSE2,
+# no FMA, no AVX2 — and the unrolling buys nothing.
+#
+# The cost is a binary tied to the machine that built it. That is the right
+# trade for a local receiver; anything shipped elsewhere needs an explicit
+# `--target` build without this, or it will fault with SIGILL on older CPUs.
+rustflags = ["-C", "target-cpu=native"]

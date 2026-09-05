@@ -75,6 +75,7 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
             N,
             256,
             states.center_freq(),
+            states.tuned_freq(),
             states.sample_rate(),
             states.floor_db(),
             states.ceil_db(),
@@ -82,6 +83,7 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
 
         let info_view = InfoView::new(
             states.center_freq(),
+            states.tuned_freq(),
             states.sample_rate(),
             states.audio_rate(),
             health,

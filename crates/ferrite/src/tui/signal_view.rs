@@ -127,6 +127,13 @@ pub struct SignalView {
     /// A pair of (current, old), so rerender MHz only at changes.
     center_freq: (Rc<Cell<u32>>, u32),
 
+    /// The demodulated channel, drawn as the moving cursor.
+    ///
+    /// A bare `Rc<Cell<_>>` rather than the `(current, old)` pair the axis
+    /// labels use: nothing is cached off it, the cursor is recomputed from
+    /// scratch every frame, so there is no stale copy to invalidate.
+    tuned_freq: Rc<Cell<u32>>,
+
     /// Sample rate is constant
     sample_rate: Rc<Cell<u32>>,
 
@@ -172,6 +179,7 @@ impl SignalView {
         bins: usize,
         history: usize,
         center_freq: Rc<Cell<u32>>,
+        tuned_freq: Rc<Cell<u32>>,
         sample_rate: Rc<Cell<u32>>,
         floor_db: Rc<Cell<f32>>,
         ceil_db: Rc<Cell<f32>>,
@@ -187,6 +195,7 @@ impl SignalView {
             pending: vec![f32::NEG_INFINITY; bins].into_boxed_slice(),
             has_pending: false,
             center_freq: (center_freq, center_freq_old),
+            tuned_freq,
             sample_rate,
             floor_db: (floor_db, floor_db_old),
             ceil_db: (ceil_db, ceil_db_old),
@@ -212,6 +221,40 @@ impl SignalView {
         view.gen_spec_yaxis_label(true);
         view.gen_water_xaxis_labels(true);
         view
+    }
+
+    /// Terminal column for an absolute frequency, or `None` if it is off-span.
+    ///
+    /// Deliberately the same mapping [`column`](Self::column) uses — `t * width`
+    /// over the whole span — and *not* the one `render_mhz_axis` uses for label
+    /// ticks, which is edge-to-edge over `width - 1`. The two differ by up to a
+    /// column at the extremes, and a cursor has to sit over the data it points
+    /// at, not over the label.
+    fn freq_col(&self, hz: u32, width: u16) -> Option<u16> {
+        if width == 0 {
+            return None;
+        }
+        let fs = self.sample_rate.get() as f32;
+        if fs <= 0.0 {
+            return None;
+        }
+        let t = (hz as f32 - self.center_freq.0.get() as f32) / fs + 0.5;
+        (t >= 0.0 && t < 1.0).then(|| ((t * width as f32) as u16).min(width - 1))
+    }
+
+    /// Draw one full-height vertical rule at column `x` of `area`.
+    ///
+    /// Writes a glyph rather than tinting with `set_style`: the waterfall packs
+    /// two rows into every cell as foreground *and* background, so a background
+    /// tint would erase half the data it covers, and a foreground-only tint
+    /// would be invisible on the half-block's lower row. One overwritten column
+    /// out of ~100 across 2.4 MHz is the cheaper trade.
+    fn render_cursor(area: Rect, x: u16, color: Color, buf: &mut Buffer) {
+        for dy in 0..area.height {
+            if let Some(cell) = buf.cell_mut((area.x + x, area.y + dy)) {
+                cell.set_char('\u{2502}').set_fg(color);
+            }
+        }
     }
 
     /// Split the panel. `area` is the whole thing, border included.
@@ -744,6 +787,7 @@ mod braille_tests {
             BINS,
             8,
             Rc::new(Cell::new(91_000_000)),
+            Rc::new(Cell::new(91_350_000)),
             Rc::new(Cell::new(2_400_000)),
             Rc::new(Cell::new(FLOOR)),
             Rc::new(Cell::new(CEIL)),
@@ -915,6 +959,7 @@ mod braille_tests {
                 BINS,
                 8,
                 Rc::new(Cell::new(91_000_000)),
+                Rc::new(Cell::new(91_350_000)),
                 Rc::new(Cell::new(2_400_000)),
                 Rc::new(Cell::new(FLOOR)),
                 Rc::new(Cell::new(CEIL)),
@@ -956,6 +1001,7 @@ mod braille_tests {
                 BINS,
                 8,
                 Rc::new(Cell::new(91_000_000)),
+                Rc::new(Cell::new(91_350_000)),
                 Rc::new(Cell::new(2_400_000)),
                 Rc::new(Cell::new(FLOOR)),
                 Rc::new(Cell::new(CEIL)),
@@ -1009,6 +1055,58 @@ mod braille_tests {
         assert_eq!(g[1], '\u{28C7}', "carrier should fill only the left dots");
         assert_eq!(g[0], '\u{28C0}', "and leave its neighbours at the floor");
     }
+
+    /// The two cursors are the only thing tying the waterfall to what is
+    /// actually being heard, so their placement is the property worth pinning.
+    ///
+    /// Centre sits at mid-span by construction; the channel sits a fraction of
+    /// the width to the right equal to its fraction of the sample rate. Both
+    /// must land on the *same* column in the spectrum and the waterfall, which
+    /// is what makes the display readable as one scale.
+    #[test]
+    fn the_cursors_mark_the_centre_and_the_channel() {
+        const CENTER: u32 = 90_650_000;
+        const TUNED: u32 = 91_000_000;
+        const FS: u32 = 2_400_000;
+
+        let mut v = SignalView::new(
+            BINS,
+            8,
+            Rc::new(Cell::new(CENTER)),
+            Rc::new(Cell::new(TUNED)),
+            Rc::new(Cell::new(FS)),
+            Rc::new(Cell::new(FLOOR)),
+            Rc::new(Cell::new(CEIL)),
+        );
+        v.push(&vec![FLOOR; BINS]);
+        v.commit();
+
+        let area = Rect::new(0, 0, 60, 20);
+        let l = SignalView::layout(area);
+        let mut buf = Buffer::empty(area);
+        Widget::render(&v, area, &mut buf);
+
+        let w = l.spec.width as f32;
+        let mid = (0.5 * w) as u16;
+        let off = ((TUNED - CENTER) as f32 / FS as f32 + 0.5) * w;
+        let chan = off as u16;
+        assert!(chan > mid, "the channel is above the centre, so it draws right of it");
+
+        for (x, colour, what) in [
+            (mid, colors::CURSOR_CENTER, "centre"),
+            (chan, colors::CURSOR_TUNED, "channel"),
+        ] {
+            for (pane, name) in [(l.spec, "spectrum"), (l.water, "waterfall")] {
+                let cell = buf.cell((pane.x + x, pane.y)).unwrap();
+                assert_eq!(
+                    cell.symbol(),
+                    "\u{2502}",
+                    "{what} cursor missing from the {name} at column {x}"
+                );
+                assert_eq!(cell.fg, colour, "{what} cursor is the wrong colour in the {name}");
+            }
+        }
+    }
 }
 
 impl Widget for &SignalView {
@@ -1031,6 +1129,26 @@ impl Widget for &SignalView {
         self.render_mhz_axis(l.freq_axis, buf);
         self.render_water_yaxis(l.water_axis, buf);
         self.render_waterfall(l.water, buf);
+
+        // Last, because both plot renderers write every cell in their own area
+        // and would paint over anything drawn earlier.
+        //
+        // `l.spec` and `l.water` are cut from the same `inner` with the same
+        // gutter constraint, so they share an `x` and a `width` and one column
+        // index lines up across both. The axis row between them is skipped on
+        // purpose: it holds text, and a glyph dropped into it would split a
+        // frequency label in half.
+        //
+        // Tuned first, so that when the channel is parked on the centre the
+        // cyan centre line is what you see rather than a half-hidden orange one.
+        if let Some(x) = self.freq_col(self.tuned_freq.get(), l.spec.width) {
+            SignalView::render_cursor(l.spec, x, colors::CURSOR_TUNED, buf);
+            SignalView::render_cursor(l.water, x, colors::CURSOR_TUNED, buf);
+        }
+        if let Some(x) = self.freq_col(self.center_freq.0.get(), l.spec.width) {
+            SignalView::render_cursor(l.spec, x, colors::CURSOR_CENTER, buf);
+            SignalView::render_cursor(l.water, x, colors::CURSOR_CENTER, buf);
+        }
     }
 }
 

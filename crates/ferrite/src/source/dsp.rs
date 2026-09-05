@@ -1,7 +1,7 @@
 use std::array;
 
 use sdr_core::dsp::{
-    DecimFIR, Deemphasis, Demodulation, FilterType, PolyphaseResampler, Window, create_taps,
+    DecimFIR, Deemphasis, Demodulation, FilterType, PolyphaseResampler, Window, create_taps, DcBlocker
 };
 
 /// De-emphasis time constant. 50 µs everywhere except the Americas and South
@@ -28,9 +28,10 @@ pub struct DSPFlow {
     demod: Demodulation,
     resampler: PolyphaseResampler, // 1024, up 4 down 25
     deemph: Deemphasis,            // runs last, at 48 kHz
+    dc_blocker: DcBlocker,
     out_i_decim: [f32; 1024],
     out_q_decim: [f32; 1024],
-    out_demod: [f32; 1024],
+    out_demod: [f32; 1024], 
     /// Only `[..n]` is live, where `n` is what [`process`](Self::process) returns.
     pub out: [f32; 164],
 }
@@ -47,23 +48,23 @@ impl DSPFlow {
         // So only 14 multiplication for 27 taps
         let lpf_taps_1 = create_taps::<27>(
             FilterType::Lowpass,
-            100_000.0,
+            110_000.0,
             2_400_000.0,
-            Window::Hann,
+            Window::Kaiser,
             None,
         );
         let lpf_taps_2 = create_taps::<69>(
             FilterType::Lowpass,
-            100_000.0,
+            85_000.0,
             600_000.0,
-            Window::Hann,
+            Window::Kaiser,
             None,
         );
-        let mut lpf_taps_resampler = create_taps::<1900>(
+        let mut lpf_taps_resampler = create_taps::<1901>(
             FilterType::Lowpass,
             15_000.0,
             1_200_000.0,
-            Window::Hann,
+            Window::Kaiser,
             None,
         );
 
@@ -76,6 +77,7 @@ impl DSPFlow {
             demod: Demodulation::new(75_000.0, 300_000.0),
             resampler: PolyphaseResampler::new(4, 25, &lpf_taps_resampler),
             deemph: Deemphasis::new(DEEMPHASIS_TAU, 48_000.0),
+            dc_blocker: DcBlocker::new(48_000),
             out_i_decim: array::from_fn(|_| 0.0f32),
             out_q_decim: array::from_fn(|_| 0.0f32),
             out_demod: array::from_fn(|_| 0.0f32),
@@ -109,11 +111,18 @@ impl DSPFlow {
         // Resampler
         let resampler_count = self.resampler.process(&self.out_demod, &mut self.out);
 
+        // Last DcBlocker on resampler
+        self.out[..resampler_count].iter_mut().for_each(|x| {
+            *x = self.dc_blocker.process(*x)
+        });
+        
         // De-emphasis, at the audio rate and on the live samples only. The
         // one-pole state carries across calls, so the varying block length
         // (163 or 164) is harmless — what matters is that the stream stays
         // contiguous, which `push` on the ring guarantees.
         self.deemph.process(&mut self.out[..resampler_count]);
+
+        
 
         resampler_count
     }

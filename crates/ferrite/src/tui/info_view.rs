@@ -24,17 +24,17 @@ use ratatui::style::Style;
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Widget};
 
-use crate::source::source::OFFSET_TUNING_HZ;
 use crate::tui::colors;
 
 use super::tui_states::{Health, UNMEASURED};
 
 /// Rows plus border. Kept beside the row list for the same reason
 /// [`control_view::HEIGHT`](super::control_view::HEIGHT) is.
-pub const HEIGHT: u16 = 7 + 2;
+pub const HEIGHT: u16 = 8 + 2;
 
 pub struct InfoView {
     center_freq: Rc<Cell<u32>>,
+    tuned_freq: Rc<Cell<u32>>,
     sample_rate: Rc<Cell<u32>>,
     audio_rate: Rc<Cell<u32>>,
     health: Arc<Health>,
@@ -43,12 +43,14 @@ pub struct InfoView {
 impl InfoView {
     pub fn new(
         center_freq: Rc<Cell<u32>>,
+        tuned_freq: Rc<Cell<u32>>,
         sample_rate: Rc<Cell<u32>>,
         audio_rate: Rc<Cell<u32>>,
         health: Arc<Health>,
     ) -> Self {
         Self {
             center_freq,
+            tuned_freq,
             sample_rate,
             audio_rate,
             health,
@@ -68,18 +70,23 @@ impl InfoView {
             return;
         }
 
-        // The LO is parked below the station (see `source::source`), so it is
-        // never the tuned frequency and there is otherwise nothing on screen
-        // that says where the dongle is actually looking.
-        let lo = self.center_freq.get().saturating_sub(OFFSET_TUNING_HZ);
-
         let rows = [
             (
                 "Rate",
                 format!("{:.3} MS/s", self.sample_rate.get() as f64 / 1e6),
             ),
             ("Audio", format!("{} kHz", self.audio_rate.get() / 1000)),
-            ("LO", format!("{:.3} MHz", lo as f64 / 1e6)),
+            // Both, because they are independent now: the LO is where the
+            // dongle is looking and the centre of the span, the tuned frequency
+            // is the channel picked out of it.
+            (
+                "LO",
+                format!("{:.3} MHz", self.center_freq.get() as f64 / 1e6),
+            ),
+            (
+                "Tuned",
+                format!("{:.3} MHz", self.tuned_freq.get() as f64 / 1e6),
+            ),
             (
                 "RSSI",
                 measured(self.health.rssi_dbfs_x10.load(Relaxed), "dBFS"),
@@ -103,7 +110,7 @@ impl InfoView {
         // stretched — a readout reads as a list, not as evenly spread lines. In
         // a pane too short for all of them the trailing rows come back
         // zero-height and `Line::render` skips them on its own.
-        let areas = Layout::vertical([Constraint::Length(1); 7]).split(inner);
+        let areas = Layout::vertical([Constraint::Length(1); 8]).split(inner);
 
         for (r, (label, value)) in areas.iter().zip(rows) {
             let [label_area, value_area] =
