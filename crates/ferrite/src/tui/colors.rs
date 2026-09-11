@@ -13,9 +13,11 @@
 //! cursor with it.
 //!
 //! **The governing rule of this palette: cyan is data, orange is the UI
-//! talking.** Orange never appears in the spectrum or waterfall, so an accent
-//! can never be mistaken for a signal, and a warning is the only warm thing on
-//! screen.
+//! talking.** The gradient breaks it at the top end on purpose — the two
+//! hottest [`SPECTRUM_STOPS`] are warm, because a peak has to be findable at a
+//! glance. Everywhere else the rule holds, and the two cursor colours below are
+//! picked from the tones the gradient does *not* produce so they cannot be read
+//! as signal.
 //!
 //! Everything is `Color::Rgb`, which needs a truecolor terminal — ratatui emits
 //! 24-bit SGR and does not degrade to the 256-colour cube on its own. Any
@@ -24,37 +26,52 @@
 
 use ratatui::style::{Color, Style};
 
+const fn to_array_f32(color: &Color) -> [f32; 3] {
+    let mut output = [0.0_f32; 3];
+    let rgb = match color {
+        Color::Rgb(r, g , b) => Some((
+            *r as f32,
+            *g as f32,
+            *b as f32,
+        )),
+        _ => None
+    };
+    let (r, g, b) = rgb.expect("cannot extract rgb");
+    output[0] = r;
+    output[1] = g;
+    output[2] = b;
+    output
+}
+
 // ── Ink ─────────────────────────────────────────────────────────────────────
 // The palette verbatim. Const, and already `Color`, so a use site costs nothing
 // and cannot fail — a hex string would need parsing at every call.
 
-pub const BG_VOID: Color = Color::Rgb(0x01, 0x01, 0x01);
-pub const BG_PRIMARY: Color = Color::Rgb(0x07, 0x14, 0x1A);
-pub const BG_PANEL: Color = Color::Rgb(0x10, 0x10, 0x10);
-pub const BG_PANEL_ALT: Color = Color::Rgb(0x11, 0x1F, 0x23);
-pub const BG_ELEVATED: Color = Color::Rgb(0x16, 0x2D, 0x32);
+pub const BG_VOID: Color = Color::Rgb(0x01, 0x01, 0x01);            // #010101
+pub const BG_PRIMARY: Color = Color::Rgb(0x07, 0x14, 0x1A);         // #07141A
+pub const BG_PANEL: Color = Color::Rgb(0x10, 0x10, 0x10);           // #101010
+pub const BG_PANEL_ALT: Color = Color::Rgb(0x11, 0x1F, 0x23);       // #111F23
+pub const BG_ELEVATED: Color = Color::Rgb(0x16, 0x2D, 0x32);        // #162D32
 
-pub const CYAN_MUTED: Color = Color::Rgb(0x1D, 0x40, 0x48);
-pub const CYAN_MID: Color = Color::Rgb(0x25, 0x54, 0x5D);
-pub const CYAN_BASE: Color = Color::Rgb(0x30, 0x68, 0x74);
-pub const CYAN_BRIGHT: Color = Color::Rgb(0x4F, 0x9C, 0xAB);
-pub const CYAN_LIGHT: Color = Color::Rgb(0x68, 0x97, 0xA0);
-pub const CYAN_GLOW: Color = Color::Rgb(0xB1, 0xEF, 0xF2);
-pub const CYAN_HIGHLIGHT: Color = Color::Rgb(0xC8, 0xF6, 0xF6);
+pub const CYAN_MUTED: Color = Color::Rgb(0x1D, 0x40, 0x48);         // #1D4048
+pub const CYAN_MID: Color = Color::Rgb(0x25, 0x54, 0x5D);           // #25545D
+pub const CYAN_BASE: Color = Color::Rgb(0x30, 0x68, 0x74);          // #306874
+pub const CYAN_BRIGHT: Color = Color::Rgb(0x4F, 0x9C, 0xAB);        // #4F9CAB
+pub const CYAN_LIGHT: Color = Color::Rgb(0x68, 0x97, 0xA0);         // #6897A0
+pub const CYAN_GLOW: Color = Color::Rgb(0xB1, 0xEF, 0xF2);          // #B1EFF2
+pub const CYAN_HIGHLIGHT: Color = Color::Rgb(0xC8, 0xF6, 0xF6);     // #C8F6F6
 
-pub const ORANGE_DIM: Color = Color::Rgb(0x50, 0x3D, 0x26);
-pub const ORANGE_BASE: Color = Color::Rgb(0xCE, 0x7C, 0x34);
-pub const ORANGE_GLOW: Color = Color::Rgb(0xFD, 0xCE, 0x95);
+pub const ORANGE_DIM: Color = Color::Rgb(0x50, 0x3D, 0x26);         // #503D26
+pub const ORANGE_BASE: Color = Color::Rgb(0xCE, 0x7C, 0x34);        // #CE7C34
+pub const ORANGE_GLOW: Color = Color::Rgb(0xFD, 0xCE, 0x95);        // #FDCE95
+pub const ORANGE_DANGER: Color = Color::Rgb(0xFE, 0x51, 0x29);      // #fe5129
 
-/// Note the source names are inverted against intuition: `grey-light`
-/// (#383A38, L\*=24) is *darker* than `grey-mid` (#565B5A, L\*=38). Kept as
-/// given so the file still matches the palette it came from — which is exactly
-/// why the role layer below exists to be read instead.
-pub const GREY_MID: Color = Color::Rgb(0x56, 0x5B, 0x5A);
-pub const GREY_LIGHT: Color = Color::Rgb(0x38, 0x3A, 0x38);
-pub const WHITE_DIM: Color = Color::Rgb(0xE7, 0xE9, 0xE9);
-pub const WHITE: Color = Color::Rgb(0xF2, 0xF3, 0xF3);
-pub const WHITE_BRIGHT: Color = Color::Rgb(0xFD, 0xFD, 0xFD);
+pub const GREY_MID: Color = Color::Rgb(0x38, 0x3A, 0x38);           // #383A38
+pub const GREY_LIGHT: Color = Color::Rgb(0x56, 0x5B, 0x5A);         // #565B5A
+pub const WHITE_DIM: Color = Color::Rgb(0xE7, 0xE9, 0xE9);          // #E7E9E9
+pub const WHITE: Color = Color::Rgb(0xF2, 0xF3, 0xF3);              // #F2F3F3
+pub const WHITE_BRIGHT: Color = Color::Rgb(0xFD, 0xFD, 0xFD);       // #FDFDFD
+pub const YELLOW_BRIGHT: Color = Color::Rgb(0xEE, 0xC4, 0x3A);      // #eec43a
 
 // ── Roles ───────────────────────────────────────────────────────────────────
 // Three groups, and which one a thing belongs to is decided by its *state*, not
@@ -146,6 +163,8 @@ pub const FOCUS: Color = ORANGE_BASE;
 /// resting screen, and the thing the eye is meant to find first. 12.85:1.
 pub const FOCUS_BRIGHT: Color = ORANGE_GLOW;
 
+pub const FOCUS_DANGER: Color = ORANGE_DANGER;
+
 /// A transient status message takes the whole bar. Inverted rather than merely
 /// coloured, because it has to win against whatever it replaced.
 pub const STATUS_FG: Color = BG_VOID;
@@ -200,16 +219,33 @@ const CYAN_SOFT: [f32; 3] = [0x80 as f32, 0xC5 as f32, 0xCE as f32];
 /// It is also near-uniform perceptually: L\* steps of 24.7, 15.9, 19.3, 15.2,
 /// 18.4, a 1.62× spread against inferno's 1.32×.
 ///
-/// All cyan, deliberately. Orange is the accent, and a waterfall that borrows
-/// it would make a loud carrier and a warning the same colour.
+/// The top two stops are warm, which costs the "orange is never data" rule but
+/// buys a peak you can find without hunting. What it constrains is the cursor
+/// colours: see [`CURSOR_CENTER`] and [`CURSOR_TUNED`].
 pub const SPECTRUM_STOPS: [[f32; 3]; 6] = [
-    [0x01 as f32, 0x01 as f32, 0x01 as f32], // bg-void
-    [0x1D as f32, 0x40 as f32, 0x48 as f32], // cyan-muted
-    [0x30 as f32, 0x68 as f32, 0x74 as f32], // cyan-base
-    [0x4F as f32, 0x9C as f32, 0xAB as f32], // cyan-bright
-    CYAN_SOFT,
-    [0xC8 as f32, 0xF6 as f32, 0xF6 as f32], // cyan-highlight
+    to_array_f32(&BG_VOID),
+    to_array_f32(&BG_PRIMARY),
+    to_array_f32(&CYAN_MUTED),
+    to_array_f32(&CYAN_BASE),        // These last 3 really make peaks bright
+    to_array_f32(&ORANGE_GLOW),
+    to_array_f32(&ORANGE_DANGER),
 ];
+
+// ── Spectrum cursors ────────────────────────────────────────────────────────
+
+/// The hardware centre frequency, pinned to the middle of the span.
+///
+/// The brightest cyan in the palette, and deliberately *not* one of the
+/// [`SPECTRUM_STOPS`]: the gradient tops out at `CYAN_BASE` before it turns
+/// warm, so nothing the waterfall can draw reaches this.
+pub const CURSOR_CENTER: Color = CYAN_HIGHLIGHT;
+
+/// The tuned channel, wherever the translator has been pointed.
+///
+/// `ORANGE_BASE` is the one warm tone the gradient never produces — it runs
+/// `CYAN_BASE` → `ORANGE_GLOW` → `ORANGE_DANGER` and skips straight past this
+/// one — so the cursor stays distinct even lying across a saturated carrier.
+pub const CURSOR_TUNED: Color = ORANGE_BASE;
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 

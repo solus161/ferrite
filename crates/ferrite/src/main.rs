@@ -47,21 +47,36 @@ fn main() -> Result<(), CustomError> {
     /* A shared ring for speaker and fft, stream of interleaving IQ, block size 16384
     The flow is like this:
 
-    The LO is parked OFFSET_TUNING_HZ *below* the wanted station (`source.rs`), so
-    everything downstream of the Xlator sees the station at 0 Hz and the dongle's
-    LO-leakage spike at -350kHz, where the decimators bury it.
+    Two frequencies (`source.rs`). `center_freq` is the LO, written
+    to the dongle verbatim; it is the centre of the sampled span and of the
+    waterfall. `tuned_freq` is the channel, and the Xlator shifts it down to 0 Hz
+    for the demodulator. They start OFFSET_TUNING_HZ apart so the channel does
+    not open on the LO-leakage spike, and the channel may sit anywhere within
+    TUNE_SPAN_HZ of the centre.
+
+    The channel is pinned at a fixed *offset* from the centre, not at a fixed
+    absolute frequency: retuning the dongle slides both together, so the cursor
+    holds its place on the waterfall and the translator is never disturbed. The
+    demodulated frequency does follow the centre — Tuned is what moves the
+    channel relative to it.
 
     RTL-SDR at 2.4MHz, 15 queued blocks of 16384 interleaved IQ bytes, u8
     |―Preprocessing, per sample, inside the read_async callback (`source.rs`)
     | |―center_iq: u8 -> f32, (x - 127.4)/128
     | |―IqDcBlocker: leaky-integrator high-pass, ~8Hz corner, on I and Q
-    | |―Xlator: shift down 350kHz — station lands on 0Hz, spike on -350kHz.
-    |            Ahead of the split deliberately, so the waterfall is centred
-    |            on the station too.
     |―Split to Audio/CPAL and FFT (TUI), [f32; 16384] interleaved
+    |  The split is *ahead* of the Xlator, and has to be. Shifting a sampled
+    |  signal rotates its spectrum circularly, so translating before the FFT
+    |  wraps the bottom of the span around to the top, where it is drawn a whole
+    |  sample rate away from its real frequency. The FFT leg therefore stays
+    |  LO-centred and only the audio leg is translated.
       |―Audio/CPAL — decimators want I and Q as separate arrays, for SIMD,
       |               so this leg carries two [f32; 8192] rather than the
-      |               interleaved block. `DSPFlow` in `source/dsp.rs`:
+      |               interleaved block.
+      | |―Xlator: shift down by (tuned_freq - center_freq), bringing the channel
+      | |          to 0Hz. Offset arrives from the controller thread through a
+      | |          shared atomic, read once per USB buffer.
+      | `DSPFlow` in `source/dsp.rs`:
       | |―Multi-stage decimator: sliding window multiplied by precomputed taps.
       | | |                      Same shape as SDR++'s `plan_8`.
       | | |―WFM (the only mode implemented)
@@ -81,7 +96,9 @@ fn main() -> Result<(), CustomError> {
       | |                     of the 4 branches would otherwise carry a quarter.
       | |                     -> 163 or 164 samples (8192/50 = 163.84)
       | |―De-emphasis, 50us one-pole, at 48kHz, in place over `out[..n]` only
-      |―FFT: convert to ComplexF32 for more graceful api
+      |―FFT: convert to ComplexF32 for more graceful api. Untranslated, so bin
+      |      centre is the LO and the MHz axis can be labelled on center_freq
+      |      directly. Two cursors mark centre (cyan) and channel (orange).
 
     */
 
@@ -111,9 +128,13 @@ fn main() -> Result<(), CustomError> {
     let rtl_rate = speaker.rtl_rate;
 
     // Some initial states
+    // Centre and channel start OFFSET_TUNING_HZ apart so the station does not
+    // open sitting on the residual LO spike. Freq then slides both together;
+    // only Tuned changes the offset between them.
     let states = TuiStates::new(
         speaker.rtl_rate,
         speaker.audio_rate,
+        91_000_000 - OFFSET_TUNING_HZ,
         91_000_000,
         DEFAULT_STEP_HZ,
         DEFAULT_GAIN_TENTHS,
@@ -126,6 +147,7 @@ fn main() -> Result<(), CustomError> {
     let source = Source::new(
         rtl_rate,
         states.center_freq.get(),
+        states.tuned_freq.get(),
         states.bandwidth.get(),
         (DEFAULT_GAIN_TENTHS / 10).max(0) as u32,
         ctrl_rx,
@@ -147,10 +169,10 @@ fn main() -> Result<(), CustomError> {
         gain_table.len()
     );
     log_info!(
-        "{:.3} MS/s \u{b7} LO {:.3} MHz \u{b7} offset tuning {} kHz",
+        "{:.3} MS/s \u{b7} LO {:.3} MHz \u{b7} tuned {:.3} MHz",
         source.sample_rate as f64 / 1e6,
-        states.center_freq.get().saturating_sub(OFFSET_TUNING_HZ) as f64 / 1e6,
-        OFFSET_TUNING_HZ / 1000
+        states.center_freq.get() as f64 / 1e6,
+        states.tuned_freq.get() as f64 / 1e6
     );
 
     let (source_handle, ctrl_handle) = source.start_receive(producer_sp, producer_fft)?;

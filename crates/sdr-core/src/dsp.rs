@@ -12,24 +12,26 @@ pub fn next_wrapped(i: usize, size: usize) -> usize {
 /// Center 2 bytes IQ to 127.4, clamped to [-1, 1)
 /// The offset of 127.4, not 127.5, is an empirical correction for the R820T's slight ADC bias.
 /// Using 127.5 leaves a small residual DC.
+#[inline]
 pub fn center_iq(i: u8, q: u8) -> (f32, f32) {
     ((i as f32 - 127.4) / 128.0, (q as f32 - 127.4) / 128.0)
 }
 
-struct DcBlocker<const N: usize> {
+pub struct DcBlocker {
     rate: f32,
     offset: f32,
 }
 
-impl<const N: usize> DcBlocker<N> {
-    fn new(sample_rate: u32) -> Self {
+impl DcBlocker {
+    pub fn new(sample_rate: u32) -> Self {
         Self {
             rate: 50.0 / sample_rate as f32,
             offset: 0.0,
         }
     }
-
-    fn process(&mut self, x: f32) -> f32 {
+    
+    #[inline]
+    pub fn process(&mut self, x: f32) -> f32 {
         let y = x - self.offset;
         self.offset += y * self.rate;
         y
@@ -92,6 +94,7 @@ fn bessel_i0(x: f32) -> f32 {
 
 /// Create taps according to different window types
 /// Feeded cutoff and sample rate are non-normalized
+/// Taps are created reversed so can be used with convolve fn rightaway
 pub fn create_taps<const N: usize>(
     filter_type: FilterType,
     cutoff: f32,
@@ -155,6 +158,9 @@ pub fn create_taps<const N: usize>(
     // Normalize dc gain = 1.0
     let gain: f32 = output.iter().sum();
     output.iter_mut().for_each(|o| *o /= gain);
+
+    // Reverse taps to used with convolve fn
+    output.reverse();
     output
 }
 
@@ -232,34 +238,29 @@ impl<const P: usize, const N: usize, const T: usize> DecimFIR<P, N, T> {
     /// According to the definition of convolution, `y[k]` must be mapped to `x[N-k]`,
     /// or `y` at `k` mapped to sample `x` delayed by `k`,
     /// so `y` must be inversed first
+    /// taps must be reversed
     /// https://brianmcfee.net/dstbook-site/content/ch03-convolution/Convolution.html
-    /// Written like this for vectorization with `target-cpu=native` build option
+    /// Written like this for vectorization with `target-cpu=native` and `target-feature=+avx2` build option
     fn convolve(x: &[f32], y: &[f32]) -> f32 {
         assert!(x.len() == y.len());
 
-        let n = x.len();
-
-        let mut acc_0 = 0.0f32;
-        let mut acc_1 = 0.0f32;
-        let mut acc_2 = 0.0f32;
-        let mut acc_3 = 0.0f32;
-
-        let chunk = x.len() / 4;
+        // let n = x.len();
+        let mut acc = [0.0f32; 8];
+        let chunk = x.len() / 8;
         for i in 0..chunk {
-            let base = i * 4;
-            acc_0 += x[base] * y[n - base - 1];
-            acc_1 += x[base + 1] * y[n - base - 2];
-            acc_2 += x[base + 2] * y[n - base - 3];
-            acc_3 += x[base + 3] * y[n - base - 4];
+            let base = i * 8;
+            for k in 0..8 {
+                acc[k] += x[base + k] * y[base + k]
+            }
         }
 
         let mut acc_tail = 0.0f32;
-        let remainder_start = chunk * 4;
+        let remainder_start = chunk * 8;
         for i in remainder_start..x.len() {
-            acc_tail += x[i] * y[n - i - 1]
+            acc_tail += x[i] * y[i]
         }
 
-        acc_0 + acc_1 + acc_2 + acc_3 + acc_tail
+        acc.iter().sum::<f32>() + acc_tail
     }
 
     pub fn set_iq(&mut self, idx: usize, i: f32, q: f32) {
@@ -351,19 +352,20 @@ fn gcd(a: usize, b: usize) -> usize {
 }
 
 /// That high-pass filter for both I & Q channel
-pub struct IqDcBlocker<const N: usize> {
-    i_blocker: DcBlocker<N>,
-    q_blocker: DcBlocker<N>,
+pub struct IqDcBlocker {
+    i_blocker: DcBlocker,
+    q_blocker: DcBlocker,
 }
 
-impl<const N: usize> IqDcBlocker<N> {
+impl IqDcBlocker {
     pub fn new(sample_rate: u32) -> Self {
         Self {
-            i_blocker: DcBlocker::<N>::new(sample_rate),
-            q_blocker: DcBlocker::<N>::new(sample_rate),
+            i_blocker: DcBlocker::new(sample_rate),
+            q_blocker: DcBlocker::new(sample_rate),
         }
     }
-
+    
+    #[inline]
     pub fn process(&mut self, i: f32, q: f32) -> (f32, f32) {
         (self.i_blocker.process(i), self.q_blocker.process(q))
     }
@@ -397,8 +399,11 @@ impl Xlator {
         }
     }
 
+    /// Retune without touching `phase`, so the phasor stays continuous across
+    /// the change and a retune produces no click in the demodulated audio.
     pub fn set_offset(&mut self, offset: f32) {
         let w = -std::f32::consts::TAU * offset / self.sample_rate;
+        self.offset = offset;
         self.delta = ComplexF32::new(w.cos(), w.sin());
     }
 
@@ -414,6 +419,7 @@ impl Xlator {
     /// The SDR callback centres and DC-blocks sample by sample already, so
     /// going through a `ComplexF32` buffer would mean an extra pass over
     /// 8192 samples purely to change container.
+    #[inline]
     pub fn process_sample(&mut self, i: f32, q: f32) -> (f32, f32) {
         // (i + jq)(pr + jpi)
         let (pr, pi) = (self.phase.real, self.phase.img);
@@ -429,6 +435,7 @@ impl Xlator {
     /// show up as slow amplitude modulation. 512 is simply often enough that
     /// the drift stays far below the noise floor while the divide is amortised
     /// to nothing.
+    #[inline]
     fn advance(&mut self) {
         self.phase = self.phase * self.delta;
         self.n += 1;

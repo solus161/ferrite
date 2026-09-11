@@ -23,6 +23,7 @@ use ratatui::widgets::{Block, Widget};
 
 use sdr_core::control_signal::CtrlSignal;
 
+use crate::source::source::clamp_tuned;
 use crate::tui::colors;
 use crate::tui::tui_states::{TuiStates, TunerMode};
 /// Widest tuning range across the tuners librtlsdr supports, not this device's.
@@ -60,6 +61,7 @@ pub const HEIGHT: u16 = (Field::ALL.len() + SECTIONS + 2) as u16;
 pub enum Field {
     Mode,
     Freq,
+    Tuned,
     Step,
     Gain,
     Agc,
@@ -73,9 +75,10 @@ pub enum Field {
 }
 
 impl Field {
-    const ALL: [Field; 12] = [
+    const ALL: [Field; 13] = [
         Field::Mode,
         Field::Freq,
+        Field::Tuned,
         Field::Step,
         Field::Gain,
         Field::Agc,
@@ -102,6 +105,7 @@ impl Field {
         match self {
             Field::Mode => "Mode",
             Field::Freq => "Freq",
+            Field::Tuned => "Tuned",
             Field::Step => "Step",
             Field::Gain => "Gain",
             Field::Agc => "AGC",
@@ -120,6 +124,7 @@ impl Field {
         match self {
             Field::Mode => states.mode.get().label().to_string(),
             Field::Freq => format!("{:.3} MHz", states.center_freq.get() as f64 / 1e6),
+            Field::Tuned => format!("{:.3} MHz", states.tuned_freq.get() as f64 / 1e6),
             Field::Step => fmt_hz(states.step.get()),
             Field::Gain => format!("{:.1} dB", states.gain_tenths.get() as f32 / 10.0),
             Field::Agc => on_off(states.agc.get()),
@@ -177,14 +182,46 @@ impl Field {
                 None
             }
 
+            // The hardware LO, and the centre of the waterfall. Moving it slides
+            // the whole span with the channel riding along at a fixed offset, so
+            // the cursor holds its place on screen and the translator is never
+            // disturbed. The channel's *absolute* frequency does move, so this
+            // does land on a different station — `Tuned` is what walks the
+            // channel around inside the span.
             Field::Freq => {
+                let was = states.center_freq.get();
+                let hz = offset(was, states.step.get() as i64 * dir as i64, FREQ_RANGE);
+                states.center_freq.set(hz);
+
+                // The channel is pinned *relative* to the centre, so it moves by
+                // exactly what the centre moved. Taking the delta after the fact
+                // rather than reusing the step matters at the ends of
+                // `FREQ_RANGE`, where `offset` clamped and the centre went less
+                // far than asked.
+                //
+                // The translator offset is therefore unchanged, which is why
+                // this still emits one signal: the controller derives the offset
+                // from the difference, and the difference did not move.
+                let delta = hz as i64 - was as i64;
+                let tuned = (states.tuned_freq.get() as i64 + delta).max(0) as u32;
+                states.tuned_freq.set(tuned);
+
+                Some(CtrlSignal::CenterHz(hz))
+            }
+
+            // The channel actually demodulated, and the only way to change what
+            // is heard. Pure DSP — the device is never told, so no retune.
+            Field::Tuned => {
                 let hz = offset(
-                    states.center_freq.get(),
+                    states.tuned_freq.get(),
                     states.step.get() as i64 * dir as i64,
                     FREQ_RANGE,
                 );
-                states.center_freq.set(hz);
-                Some(CtrlSignal::CenterHz(hz))
+                // Through the shared helper, so the window rule lives in one
+                // place and the controller cannot land somewhere else.
+                let hz = clamp_tuned(states.center_freq.get(), hz);
+                states.tuned_freq.set(hz);
+                Some(CtrlSignal::TunedHz(hz))
             }
 
             // Purely how far `Freq` moves — no device round trip.
@@ -473,6 +510,7 @@ fn rung(ladder: &[u32], cur: u32, dir: i32) -> u32 {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::source::source::TUNE_SPAN_HZ;
 
     #[test]
     fn a_ladder_starts_from_the_nearest_rung_and_saturates() {
@@ -502,6 +540,7 @@ mod test {
             2_400_000,
             48_000,
             91_000_000,
+            91_350_000,
             100_000,
             gain_tenths,
             300_000,
@@ -509,6 +548,53 @@ mod test {
             floor_db,
             ceil_db,
         ))
+    }
+
+    /// Moving the centre must not change the *offset* between the two.
+    ///
+    /// The channel is pinned relative to the centre, so retuning slides both by
+    /// the same delta and the translator offset — the only thing the audio path
+    /// actually sees — never moves. Holding the channel at a fixed absolute
+    /// frequency instead would drag its cursor across the waterfall and
+    /// eventually shove it out of the span.
+    #[test]
+    fn moving_the_centre_carries_the_channel_with_it() {
+        let v = ControlView::new(states(197, -90.0, 0.0), vec![]);
+        let st = &v.states;
+        let gap = st.tuned_freq.get() as i64 - st.center_freq.get() as i64;
+
+        for dir in [1, 1, 1, -1, -1, -1, -1] {
+            let sig = Field::Freq.adjust(&v, dir);
+            assert!(matches!(sig, Some(CtrlSignal::CenterHz(_))));
+            assert_eq!(
+                st.tuned_freq.get() as i64 - st.center_freq.get() as i64,
+                gap,
+                "the channel drifted relative to the centre"
+            );
+        }
+    }
+
+    /// ...and `Tuned` is the one that does change it, within the window.
+    #[test]
+    fn the_channel_moves_alone_and_stops_at_the_span_edge() {
+        let v = ControlView::new(states(197, -90.0, 0.0), vec![]);
+        let st = &v.states;
+        let center = st.center_freq.get();
+
+        // Far enough to hit the edge whichever way it walks: the span is
+        // TUNE_SPAN_HZ either side and the step is 100 kHz.
+        for dir in [1, -1] {
+            for _ in 0..40 {
+                Field::Tuned.adjust(&v, dir);
+                assert_eq!(st.center_freq.get(), center, "Tuned must not retune");
+            }
+            let gap = st.tuned_freq.get() as i64 - center as i64;
+            assert_eq!(
+                gap.abs(),
+                TUNE_SPAN_HZ as i64,
+                "should have clamped hard at the span edge, not run past it"
+            );
+        }
     }
 
     /// Every field must be reachable, and the cursor must come back round.

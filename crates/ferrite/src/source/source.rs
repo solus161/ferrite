@@ -1,3 +1,5 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::mpsc::Receiver;
 use std::{
     array,
@@ -26,40 +28,57 @@ pub const CPAL_BLOCK: usize = 164; // ceil(8192 / 50) — the block is 163 or 16
 pub const IQ_SLOTS: usize = 16;
 pub const IQ_BLOCK: usize = 16384;
 
-/// Offset tuning: how far *below* the wanted station the LO is parked.
+/// How far below the tuned channel the LO is parked at startup.
 ///
 /// The dongle's LO leakage and I/Q imbalance put a large spike at 0 Hz, which
-/// is exactly on the carrier when tuned on-channel. Parking the LO low instead
-/// puts the station at `+OFFSET_TUNING_HZ` and leaves the spike at DC; the
-/// [`Xlator`] then shifts everything down so the station lands at 0 and the
-/// spike is thrown out to `-OFFSET_TUNING_HZ`, where the decimation filters
-/// bury it.
+/// is exactly on the carrier if the channel sits on the LO. Starting the
+/// channel this far above it leaves the spike well outside, where the
+/// decimation filters bury it.
 ///
-/// 350 kHz is not arbitrary. The spike has to survive two decimations without
-/// folding back onto the channel, and where it lands depends on the offset:
+/// This is only the *initial* separation. `center_freq` is programmed into the
+/// dongle verbatim and `tuned_freq` is what the [`Xlator`] brings down to DC,
+/// and the channel can sit anywhere within [`TUNE_SPAN_HZ`] of the centre —
+/// including, deliberately, right on the spike.
 ///
-/// | offset | worst-case rejection | note                        |
-/// |--------|----------------------|-----------------------------|
-/// | 250 kHz|      -127 dB         |                             |
-/// | 350 kHz|      -152 dB         | chosen                      |
-/// | 450 kHz|      -118 dB         |                             |
-/// | 500 kHz|       -71 dB         | folds into stage 2 passband |
-/// | 600 kHz|       -70 dB         | fs/4: folds exactly onto DC |
-///
-/// Anything near fs/4 is the worst possible choice — the spike aliases straight
-/// back to 0 Hz on the stage-1 decimation, undoing the whole exercise.
+/// The channel is pinned *relative* to the centre: retuning the dongle slides
+/// both together and leaves the translator offset alone, so the cursor holds
+/// its place on the waterfall and the DSP sees no change. The frequency being
+/// demodulated does follow the centre, so a retune lands on a different
+/// station; `Tuned` is what moves the channel within the span.
 pub const OFFSET_TUNING_HZ: u32 = 350_000;
+
+/// How far the tuned channel may sit from the centre, either side.
+///
+/// The invariant this has to satisfy is `TUNE_SPAN_HZ + channel_bw / 2 <
+/// sample_rate / 2`: the whole channel must stay inside the digitised span, or
+/// its far edge folds back across Nyquist. At 2.4 MS/s with a 300 kHz channel
+/// that ceiling is 1.05 MHz; 1.0 MHz keeps a 200 kHz guard for the decimation
+/// filters' transition bands and for the tuner's own roll-off near the edges.
+pub const TUNE_SPAN_HZ: u32 = 1_000_000;
+
+/// Hold `tuned` inside [`TUNE_SPAN_HZ`] of `center`.
+///
+/// Both the UI (for what it displays) and the controller thread (for the
+/// translator offset it derives) clamp through here, so the two can never
+/// disagree about where the channel actually ended up.
+pub fn clamp_tuned(center: u32, tuned: u32) -> u32 {
+    tuned.clamp(
+        center.saturating_sub(TUNE_SPAN_HZ),
+        center.saturating_add(TUNE_SPAN_HZ),
+    )
+}
 
 /// The tuner's IF filter width for a given channel width.
 ///
-/// The filter is centred on the LO, which offset tuning parks
-/// [`OFFSET_TUNING_HZ`] *below* the station, so it has to reach past the offset
-/// to the far edge of the channel rather than merely span the channel:
-/// `2 × (350k + 150k)` = 1.0 MHz for a 300 kHz channel. Both the initial setup
-/// and the retune path go through here, because applying a channel width raw
-/// sets a filter narrower than the offset and mutes the radio.
+/// The filter is centred on the LO and the channel may sit anywhere within
+/// [`TUNE_SPAN_HZ`] of it, so it has to reach past the whole tunable span
+/// rather than merely span one channel.
+///
+/// Note this is a no-op on the FC0013 in this dongle: librtlsdr's
+/// `fc0013_set_bw` is `{ return 0; }`, so the request is accepted and nothing
+/// is programmed. It is kept correct for tuners that do honour it.
 fn tuner_bandwidth(channel_hz: u32) -> u32 {
-    2 * (OFFSET_TUNING_HZ + channel_hz / 2)
+    2 * (TUNE_SPAN_HZ + channel_hz / 2)
 }
 
 /// Snap a request in librtlsdr's tenths of a dB to the nearest gain the tuner
@@ -105,12 +124,22 @@ pub struct Source {
     /// on an FC0013 most whole-dB steps land in an ~11 dB dead zone and change
     /// nothing.
     pub gain_table: Vec<i32>,
+
+    /// Translator offset in Hz, `tuned_freq - center_freq`. Signed: the channel
+    /// may sit either side of the centre.
+    ///
+    /// The `Xlator` is moved into the SDR read callback, on a different thread
+    /// from the one draining `ctrl_rx`, so a retune cannot reach it by method
+    /// call. The controller stores here and the callback polls once per USB
+    /// buffer, which is the same shape as every other DSP-applied setting.
+    xlator_offset: Arc<AtomicI32>,
 }
 
 impl Source {
     pub fn new(
         sample_rate: u32,
         center_freq: u32,
+        tuned_freq: u32,
         bandwidth: u32,
         gain_db: u32,
         ctrl_rx: Receiver<CtrlSignal>,
@@ -119,10 +148,12 @@ impl Source {
         let (mut ctl, reader) =
             rtlsdr_mt::open(0).unwrap_or_else(|_| panic!("{}", CustomError::RtlOpenDevice(0).to_string()));
 
-        // Offset tuning: park the LO below the station, not on it.
-        let lo = center_freq.saturating_sub(OFFSET_TUNING_HZ);
-        ctl.set_center_freq(lo)
-            .unwrap_or_else(|_| panic!("{}", CustomError::RtlSetFreq(lo).to_string()));
+        // `center_freq` *is* the LO now. Nothing is derived from it, and it is
+        // also what the waterfall is centred on, so the axis cannot drift out of
+        // step with the hardware.
+        ctl.set_center_freq(center_freq).unwrap_or_else(|_| {
+            panic!("{}", CustomError::RtlSetFreq(center_freq).to_string())
+        });
 
         let tuner_bw = tuner_bandwidth(bandwidth);
         ctl.set_bandwidth(tuner_bw)
@@ -173,35 +204,61 @@ impl Source {
 
         let sample_rate = ctl.sample_rate();
 
+        // How a retune reaches the translator: it is moved into the SDR read
+        // callback, on a different thread from this one.
+        let xlator_offset = Arc::new(AtomicI32::new(
+            clamp_tuned(center_freq, tuned_freq) as i32 - center_freq as i32,
+        ));
+        let ctrl_offset = xlator_offset.clone();
+
         // Start a thread to receive control signal
         // better than checking within read_async
         let ctrl_handle = thread::spawn(move || {
             // Every arm logs rather than printing: stdout is the TUI's once
             // `ratatui::init()` runs. This thread is not on a deadline path, so
             // it is allowed to (see `crate::log`).
+            //
+            // `TunedHz` arrives as an absolute frequency, so converting it to the
+            // offset the translator wants needs the current centre.
+            let mut center = center_freq;
+
             while let Ok(sig) = ctrl_rx.recv() {
                 // TODO: handle error, should not expect()
                 match sig {
                     CtrlSignal::CenterHz(freq) => {
-                        // Same offset as `new` applied, or retuning would put
-                        // the station where the Xlator is not looking.
-                        let lo = freq.saturating_sub(OFFSET_TUNING_HZ);
-                        ctl.set_center_freq(lo)
-                            .unwrap_or_else(|_| panic!("{}", CustomError::RtlSetFreq(lo).to_string()));
-                        // ctl.reset_buffer().expect(&CustomError::RtlResetBuffer.to_string());
+                        ctl.set_center_freq(freq).unwrap_or_else(|_| {
+                            panic!("{}", CustomError::RtlSetFreq(freq).to_string())
+                        });
+                        // The channel is pinned relative to the centre and the UI
+                        // moves it by the same delta, so the offset is unchanged
+                        // and the atomic is deliberately not touched — retuning
+                        // the dongle does not disturb the audio. Only the base
+                        // for converting a later `TunedHz` moves.
+                        center = freq;
+                    }
+
+                    // No device round trip: the translator is pure DSP, and the
+                    // callback picks this up on its next USB buffer.
+                    CtrlSignal::TunedHz(hz) => {
+                        let tuned = clamp_tuned(center, hz);
+                        ctrl_offset.store(tuned as i32 - center as i32, Ordering::Relaxed);
                     }
 
                     // The UI sends a *channel* width; the tuner's IF filter is
-                    // centred on the LO and has to reach past the offset to the
-                    // far edge of the channel. Applying the channel width raw
-                    // here — as this arm used to — sets a filter narrower than
-                    // the offset itself and cuts the station out entirely.
+                    // centred on the LO and has to reach past the whole tunable
+                    // span. Applying the channel width raw here — as this arm
+                    // used to — sets a filter narrower than the span and cuts
+                    // the station out entirely.
                     CtrlSignal::Bandwidth(bw) => {
                         let tuner_bw = tuner_bandwidth(bw);
                         ctl.set_bandwidth(tuner_bw)
                             .unwrap_or_else(|_| panic!("{}", CustomError::RtlSetBandwidth(tuner_bw).to_string()));
+                        // "requested", not "set": librtlsdr's fc0013_set_bw is
+                        // a stub that returns success and programs nothing, so
+                        // on this dongle the number below is what we asked for,
+                        // not what the hardware is doing.
                         log_info!(
-                            "IF filter {:.0} kHz for a {:.0} kHz channel",
+                            "IF filter {:.0} kHz requested for a {:.0} kHz channel",
                             tuner_bw as f32 / 1e3,
                             bw as f32 / 1e3
                         );
@@ -243,13 +300,13 @@ impl Source {
             }
         });
 
-        // TODO: let skip tuned_freq for now
         Self {
             reader,
             ctrl_handle,
             sample_rate,
             applied_gain_tenths: gain,
             gain_table: gains_for_ui,
+            xlator_offset,
         }
     }
 
@@ -275,12 +332,15 @@ impl Source {
         // let mut highpass_filter = IqDcBlocker::<IQ_BLOCK>::new(self.sample_rate);
 
         // DCBlocker, before all
-        let mut dc_blocker = IqDcBlocker::<IQ_BLOCK>::new(self.sample_rate);
+        let mut dc_blocker = IqDcBlocker::new(self.sample_rate);
 
-        // Shift the station from +OFFSET_TUNING_HZ down to 0, which throws the
-        // LO spike out to -OFFSET_TUNING_HZ. Positive offset = shift down; see
-        // `Xlator::new`, whose delta carries the minus sign.
-        let mut xlator = Xlator::new(OFFSET_TUNING_HZ as f32, self.sample_rate as f32);
+        // Brings the tuned channel down to DC for the demodulator. Positive
+        // offset = shift down; see `Xlator::new`, whose delta carries the minus
+        // sign. The offset is `tuned_freq - center_freq` and is refreshed from
+        // the shared atomic once per USB buffer.
+        let xlator_offset = self.xlator_offset.clone();
+        let mut applied_offset = xlator_offset.load(Ordering::Relaxed);
+        let mut xlator = Xlator::new(applied_offset as f32, self.sample_rate as f32);
         // Multi phase decimator
         let mut dsp = DSPFlow::new_boxed();
 
@@ -295,17 +355,34 @@ impl Source {
             .spawn(move || {
                 self.reader
                     .read_async(15, IQ_BLOCK as u32, move |bytes| {
+                        // Once per buffer rather than per sample: a retune is a
+                        // UI-rate event, and `set_offset` leaves the phasor
+                        // untouched, so the change is phase-continuous and makes
+                        // no click in the audio.
+                        let want = xlator_offset.load(Ordering::Relaxed);
+                        if want != applied_offset {
+                            xlator.set_offset(want as f32);
+                            applied_offset = want;
+                        }
+
                         // bytes: interleaved u8 IQ [I0,Q0,I1,Q1,...] at rtl_rate
                         // DSP right here
                         for (idx, pair) in bytes.chunks_exact(2).enumerate() {
                             // u8 → centered f32 in ~[-1, 1]
                             let (i, q) = center_iq(pair[0], pair[1]);
                             let (i, q) = dc_blocker.process(i, q);
-                            // Ahead of the FFT tap deliberately: the waterfall then
-                            // shows the tuned station centred, with the spike
-                            // parked off to the left where you can see it behaving.
-                            let (i, q) = xlator.process_sample(i, q);
+
+                            // The FFT tap sits *ahead* of the translator, and has
+                            // to. Shifting a sampled signal is a circular rotation
+                            // of its spectrum, so translating first wraps the
+                            // bottom of the span around to the top, where it gets
+                            // drawn under labels a whole sample rate off its real
+                            // frequency. Tapping here keeps the waterfall over the
+                            // true digitised span, centred on the LO.
                             (buf[2 * idx], buf[2 * idx + 1]) = (i, q);
+
+                            // Audio leg: bring the tuned channel down to DC.
+                            let (i, q) = xlator.process_sample(i, q);
                             buf_i[idx] = i;
                             buf_q[idx] = q;
                         }

@@ -46,6 +46,18 @@ pub struct TuiStates {
     pub audio_rate: Rc<Cell<u32>>,
     pub center_freq: Rc<Cell<u32>>,
 
+    /// The channel actually demodulated, which the `Xlator` brings down to DC.
+    ///
+    /// Distinct from `center_freq`: that one is the LO programmed into the
+    /// dongle and the centre of the waterfall, while this one is a channel
+    /// anywhere within `TUNE_SPAN_HZ` of it.
+    ///
+    /// Held at a fixed *offset* from the centre rather than at a fixed absolute
+    /// frequency: moving `center_freq` moves this by the same delta, so the
+    /// cursor keeps its place on the waterfall and the translator offset never
+    /// changes. What is demodulated does move with the centre.
+    pub tuned_freq: Rc<Cell<u32>>,
+
     pub step: Rc<Cell<u32>>,
     /// librtlsdr's units, and always a value from the tuner's own table — the
     /// UI steps that table rather than whole dB, so what is displayed is what
@@ -87,6 +99,7 @@ impl TuiStates {
         sample_rate: u32,
         audio_rate: u32,
         center_freq: u32,
+        tuned_freq: u32,
         step: u32,
         gain_tenths: i32,
         bandwidth: u32,
@@ -98,6 +111,7 @@ impl TuiStates {
             sample_rate: Rc::new(Cell::new(sample_rate)),
             audio_rate: Rc::new(Cell::new(audio_rate)),
             center_freq: Rc::new(Cell::new(center_freq)),
+            tuned_freq: Rc::new(Cell::new(tuned_freq)),
             step: Rc::new(Cell::new(step)),
             gain_tenths: Rc::new(Cell::new(gain_tenths)),
             agc: Rc::new(Cell::new(true)),
@@ -118,6 +132,7 @@ impl TuiStates {
     get_attr_clone!(sample_rate, u32);
     get_attr_clone!(audio_rate, u32);
     get_attr_clone!(center_freq, u32);
+    get_attr_clone!(tuned_freq, u32);
     get_attr_clone!(gain_tenths, i32);
     get_attr_clone!(floor_db, f32);
     get_attr_clone!(ceil_db, f32);
