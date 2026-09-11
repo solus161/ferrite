@@ -1,4 +1,5 @@
-use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, atomic::{AtomicU64, AtomicU32, AtomicI32}};
 use std::sync::RwLock;
 
 use cpal::{
@@ -12,7 +13,6 @@ use crate::source::source::{AUDIO_DECIM, CPAL_BLOCK, IQ_SLOTS};
 
 pub struct Speaker {
     stream: Stream,
-    volume_scale: Arc<RwLock<f32>>,
     pub rtl_rate: u32,
     pub audio_rate: u32,
 }
@@ -25,7 +25,12 @@ impl Speaker {
     /// a ~10.7 ms hard deadline, so it may not lock, allocate or log. Volume and
     /// mute arrive this way rather than over a channel for the same reason —
     /// see [`crate::log`] for the rule and PLAN.md §1 for why it exists.
-    pub fn new(consumer: RingConsumer<f32, IQ_SLOTS, CPAL_BLOCK>) -> Self {
+    pub fn new(
+        consumer: RingConsumer<f32, IQ_SLOTS, CPAL_BLOCK>,
+        volume_scale: Arc<AtomicU32>,
+        underruns: Arc<AtomicU64>,
+        rssi_dbfs_x10: Arc<AtomicI32>,
+        ) -> Self {
         let host = cpal::default_host();
         let device = host
             .default_output_device()
@@ -68,8 +73,8 @@ impl Speaker {
         // on a perfectly healthy radio, which is worse than not measuring at
         // all. An underrun is the ring running dry *after* it has been fed.
 
-        let volume_scale = Arc::new(RwLock::new(1.0_f32));
-        let volume_scale_clone = volume_scale.clone();
+        // let volume_scale = Arc::new(RwLock::new(1.0_f32));
+        // let volume_scale_clone = volume_scale.clone();
 
         let mut started = false;
         let stream = device
@@ -101,19 +106,10 @@ impl Speaker {
                                     started = true;
                                 }
                                 Err(_) => {
-                                    // Ring empty — underrun. Emit silence for this
-                                    // frame and retry on the next one, so a block
-                                    // landing mid-callback is picked up immediately.
-                                    //
-                                    // Counted once the stream has started, and
-                                    // never logged: this is the hot path. The
-                                    // Info panel renders it (PLAN.md R1.3) —
-                                    // "a full or empty ring is a defect to
-                                    // measure", and a nonzero count here means
-                                    // fix the rate mismatch, not the ring size.
+                                    // Error mean sample rate mismatch 
+                                    // Bump up underruns for display
                                     if started {
-                                        // TODO: add a health metric here
-                                        // app.health.underruns.fetch_add(1, Relaxed);
+                                        underruns.fetch_add(1, Ordering::Relaxed);
                                     }
                                     for out in frame.iter_mut() {
                                         *out = 0.0;
@@ -123,11 +119,7 @@ impl Speaker {
                             }
                         }
 
-                        let volume = match volume_scale_clone.try_read() {
-                            Ok(guard) => *guard,
-                            Err(_) => 1.0,
-                        };
-                        let s = staging[pos] * volume;
+                        let s = staging[pos] * volume_scale.load(Ordering::Relaxed) as f32 / 100.0;
                         pos += 1;
                         for out in frame.iter_mut() {
                             *out = s; // mono → every channel
@@ -141,7 +133,6 @@ impl Speaker {
 
         Self {
             stream,
-            volume_scale,
             rtl_rate,
             audio_rate,
         }

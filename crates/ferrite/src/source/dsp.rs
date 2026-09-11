@@ -1,4 +1,6 @@
 use std::array;
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, atomic::AtomicI32};
 
 use sdr_core::dsp::{
     DecimFIR, Deemphasis, Demodulation, FilterType, PolyphaseResampler, Window, create_taps, DcBlocker
@@ -89,7 +91,11 @@ impl DSPFlow {
         Box::new(Self::new())
     }
 
-    pub fn process(&mut self, i: &[f32; 8192], q: &[f32; 8192]) -> usize {
+    pub fn process(
+        &mut self,
+        i: &[f32; 8192],
+        q: &[f32; 8192],
+        ) -> (usize, i32) {
         assert_eq!(8192, i.len());
         assert_eq!(8192, q.len());
         // Returned number of sample processed
@@ -108,6 +114,15 @@ impl DSPFlow {
         self.demod
             .process(&self.out_i_decim, &self.out_q_decim, &mut self.out_demod);
 
+        // Update RSSI at bandwidth 300kHz
+        let mut acc = 0.0f32;
+        for (i, q) in self.out_i_decim.iter().zip(self.out_q_decim.iter()) {
+            acc += i * i + q * q;
+        };
+        let mean_pow = acc / self.out_q_decim.len() as f32;
+        let dbfs = 10.0 * mean_pow.max(1e-12).log10();
+        let rssi_dbfs_x10 = (dbfs * 10.0).round() as i32;
+
         // Resampler
         let resampler_count = self.resampler.process(&self.out_demod, &mut self.out);
 
@@ -122,8 +137,6 @@ impl DSPFlow {
         // contiguous, which `push` on the ring guarantees.
         self.deemph.process(&mut self.out[..resampler_count]);
 
-        
-
-        resampler_count
+        (resampler_count, rssi_dbfs_x10)
     }
 }

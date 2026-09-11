@@ -13,7 +13,7 @@ use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use std::sync::atomic::{AtomicI32, AtomicU64};
+use std::sync::atomic::{AtomicI32, AtomicU32, AtomicIsize, AtomicU64};
 
 use super::utils::get_attr_clone;
 
@@ -72,16 +72,13 @@ pub struct TuiStates {
 
     // ── Audio ───────────────────────────────────────────────────────────────
     /// 0..=100, applied in the cpal callback.
-    pub volume: Rc<Cell<f32>>,
+    pub volume: Arc<AtomicU32>,
     pub muted: Rc<Cell<bool>>,
     /// De-emphasis time constant in µs: 50 outside the Americas and South
     /// Korea, 75 inside.
     pub deemph_us: Rc<Cell<u32>>,
 
     pub mode: Rc<Cell<TunerMode>>,
-
-    // ── Measured ────────────────────────────────────────────────────────────
-    pub health: Arc<Health>,
     pub focus: Rc<Cell<Pane>>,
 
     /// Bottom of the colour range, in dB. Shared with the signal view.
@@ -94,6 +91,7 @@ pub struct TuiStates {
     pub log_scroll: Rc<Cell<usize>>,
 }
 
+#[allow(clippy::too_many_arguments)]
 impl TuiStates {
     pub fn new(
         sample_rate: u32,
@@ -106,6 +104,7 @@ impl TuiStates {
         ppm: i32,
         floor_db: f32,
         ceil_db: f32,
+        volumn_scale: Arc<AtomicU32>,
     ) -> Self {
         Self {
             sample_rate: Rc::new(Cell::new(sample_rate)),
@@ -117,11 +116,10 @@ impl TuiStates {
             agc: Rc::new(Cell::new(true)),
             bandwidth: Rc::new(Cell::new(bandwidth)),
             ppm: Rc::new(Cell::new(ppm)),
-            volume: Rc::new(Cell::new(1.0)),
+            volume: volumn_scale,
             muted: Rc::new(Cell::new(false)),
             deemph_us: Rc::new(Cell::new(50)),
             mode: Rc::new(Cell::new(TunerMode::WbFm)),
-            health: Arc::new(Health::new()),
             focus: Rc::new(Cell::new(Pane::Control)),
             floor_db: Rc::new(Cell::new(floor_db)),
             ceil_db: Rc::new(Cell::new(ceil_db)),
@@ -147,26 +145,25 @@ impl TuiStates {
 /// Counters are the *only* way the hot path is allowed to report anything —
 /// see the logging rules in [`crate::log`].
 pub struct Health {
-    /// Blocks the IQ ring producer could not place (PLAN.md R1.3).
-    pub iq_drops: AtomicU64,
-    /// Times a consumer was lapped and had to jump forward.
-    pub iq_laps: AtomicU64,
+    /// `lag` attribute from `RingProducer`
+    pub ring_audio_lag: Arc<AtomicIsize>,
+    pub ring_fft_lag: Arc<AtomicIsize>,
     /// cpal callbacks that found the audio ring empty and emitted silence.
-    pub underruns: AtomicU64,
+    pub underruns: Arc<AtomicU64>,
     /// Tenths of a dBFS, or [`UNMEASURED`]. PLAN.md R1.5.
-    pub rssi_dbfs_x10: AtomicI32,
-    /// Tenths of a dB, or [`UNMEASURED`]. PLAN.md R1.5.
-    pub snr_db_x10: AtomicI32,
+    pub rssi_dbfs_x10: Arc<AtomicI32>,
 }
 
 impl Health {
-    pub fn new() -> Self {
+    pub fn new(
+        ring_audio_lag: Arc<AtomicIsize>,
+        ring_fft_lag: Arc<AtomicIsize>,
+    ) ->Self {
         Self {
-            iq_drops: AtomicU64::new(0),
-            iq_laps: AtomicU64::new(0),
-            underruns: AtomicU64::new(0),
-            rssi_dbfs_x10: AtomicI32::new(UNMEASURED),
-            snr_db_x10: AtomicI32::new(UNMEASURED),
+            ring_audio_lag,
+            ring_fft_lag,
+            underruns: Arc::new(AtomicU64::new(0)),
+            rssi_dbfs_x10: Arc::new(AtomicI32::new(UNMEASURED)),
         }
     }
 }

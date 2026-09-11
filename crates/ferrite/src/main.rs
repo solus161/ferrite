@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::AtomicU32;
 use std::sync::mpsc::channel;
 
 #[macro_use]
@@ -103,7 +104,7 @@ fn main() -> Result<(), CustomError> {
     */
 
     // For speaker
-    let producer_sp = RingProducer::<f32, IQ_SLOTS, CPAL_BLOCK>::new(false);
+    let producer_audio = RingProducer::<f32, IQ_SLOTS, CPAL_BLOCK>::new(false);
 
     // For FFT
     let producer_fft = RingProducer::<f32, IQ_SLOTS, IQ_BLOCK>::new(false);
@@ -112,7 +113,7 @@ fn main() -> Result<(), CustomError> {
     // let producer_iq = RingProducer::<u8, IQ_SLOTS, IQ_BLOCK>::new(false);
 
     // A consumer for cpal/audio stream
-    let consumer_sp = producer_sp.subscribe();
+    let consumer_audio = producer_audio.subscribe();
 
     // A consumer for tui
     let consumer_fft = producer_fft.subscribe();
@@ -121,16 +122,24 @@ fn main() -> Result<(), CustomError> {
     let (ctrl_tx, ctrl_rx) = channel::<CtrlSignal>();
 
     // Health states is shared accross threads: source, fft, cpal, etc
-    let health = Arc::new(Health::new());
+    let health = Health::new(
+        consumer_audio.lag(),
+        consumer_fft.lag(),
+    );
+
+    let volumn_scale = Arc::new(AtomicU32::new(100));
+    let rssi_dbfs_x10 = health.rssi_dbfs_x10.clone();
 
     // Speaker. Fills in both rates, since it is what asks cpal for one.
-    let speaker = Speaker::new(consumer_sp);
+    let speaker = Speaker::new(
+        consumer_audio,
+        volumn_scale.clone(),
+        health.underruns.clone(),
+        health.rssi_dbfs_x10.clone()
+        );
     let rtl_rate = speaker.rtl_rate;
 
     // Some initial states
-    // Centre and channel start OFFSET_TUNING_HZ apart so the station does not
-    // open sitting on the residual LO spike. Freq then slides both together;
-    // only Tuned changes the offset between them.
     let states = TuiStates::new(
         speaker.rtl_rate,
         speaker.audio_rate,
@@ -142,6 +151,7 @@ fn main() -> Result<(), CustomError> {
         0,
         -90.0,
         0.0,
+        volumn_scale,
     );
 
     let source = Source::new(
@@ -175,7 +185,11 @@ fn main() -> Result<(), CustomError> {
         states.tuned_freq.get() as f64 / 1e6
     );
 
-    let (source_handle, ctrl_handle) = source.start_receive(producer_sp, producer_fft)?;
+    let (source_handle, ctrl_handle) = source.start_receive(
+        producer_audio,
+        producer_fft,
+        rssi_dbfs_x10,
+        )?;
 
     let tui =
         Tui::<IQ_SLOTS, IQ_BLOCK, FFT_N>::new(states, gain_table, consumer_fft, ctrl_tx, health);

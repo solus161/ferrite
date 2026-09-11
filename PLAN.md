@@ -534,7 +534,7 @@ Gaps in the signal path that exists today, roughly cheapest-first.
       smoothing, non-overlapping averaging is strictly better per CPU on a stream — overlap
       only reduces variance for a *fixed-length* record.
 
-- [ ] **R1.2 DC blocker on I and Q** — S
+- [x] **R1.2 DC blocker on I and Q** — S
       **Why:** no DC removal anywhere, so the tuner's DC offset is a permanent spike in the
       centre bin and an audible tone when tuned near it. One-pole high-pass on each of I
       and Q (`y[n] = x[n] − x[n−1] + a·y[n−1]`, a ≈ 0.999).
