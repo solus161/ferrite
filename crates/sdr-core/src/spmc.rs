@@ -6,6 +6,8 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 use std::{array, thread};
 
+use crossbeam_utils::CachePadded;
+
 use crate::buffer::Buffer;
 use crate::exceptions::CustomError;
 
@@ -59,7 +61,7 @@ const READ_RETRIES: usize = 4;
 /// deliberately conservative there: they may discard a block that happened to be
 /// intact, but never accept a torn one. That mode is lossy by definition.
 struct Ring<T: Copy + Default, const N: usize, const M: usize> {
-    slots: [UnsafeCell<Buffer<T, M>>; N],
+    slots: [CachePadded<UnsafeCell<Buffer<T, M>>>; N],
     head: AtomicU64,
 }
 
@@ -74,7 +76,7 @@ impl<T: Copy + Default, const N: usize, const M: usize> Ring<T, N, M> {
             "ring slot count N must be a power of two"
         );
         Self {
-            slots: array::from_fn(|_| UnsafeCell::new(Buffer::<T, M>::new())),
+            slots: array::from_fn(|_| CachePadded::new(UnsafeCell::new(Buffer::<T, M>::new()))),
             head: AtomicU64::new(0),
         }
     }
@@ -128,7 +130,7 @@ impl<T: Copy + Default, const N: usize, const M: usize> Ring<T, N, M> {
         self.head.store(head + 1, Ordering::Release);
     }
 
-    pub fn slot(&self, i: usize) -> Result<&UnsafeCell<Buffer<T, M>>, CustomError> {
+    pub fn slot(&self, i: usize) -> Result<&CachePadded<UnsafeCell<Buffer<T, M>>>, CustomError> {
         self.slots.get(i).ok_or(CustomError::InvalidIndex)
     }
 
