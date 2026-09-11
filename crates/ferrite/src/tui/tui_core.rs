@@ -64,7 +64,7 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
         gain_table: Vec<i32>,
         consumer: RingConsumer<f32, SLOTS, BLOCK>,
         ctrl_tx: Sender<CtrlSignal>,
-        health: Arc<Health>,
+        health: Health,
     ) -> Self {
         // Block size must be x*window size
         const { assert!(BLOCK.is_multiple_of(2 * N)) };
@@ -92,8 +92,7 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
         let control_view = ControlView::new(states.clone(), gain_table);
 
         Self {
-            states,
-            signal_view,
+            states, signal_view,
             control_view,
             info_view,
             log_view: LogView,

@@ -246,7 +246,7 @@ impl SignalView {
             return None;
         }
         let t = (hz as f32 - self.center_freq.0.get() as f32) / fs + 0.5;
-        (t >= 0.0 && t < 1.0).then(|| ((t * width as f32) as u16).min(width - 1))
+        (0.0..1.0).contains(&t).then(|| ((t * width as f32) as u16).min(width - 1))
     }
 
     /// The centre and channel markers, on their own row.

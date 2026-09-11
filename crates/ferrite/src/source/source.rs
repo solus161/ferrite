@@ -19,48 +19,26 @@ use sdr_core::dsp::center_iq;
 
 use super::dsp::DSPFlow;
 
-/// RTL sample rate = audio sample rate × this. 50 keeps both 48k and 44.1k in
-/// the RTL's valid range (2.4 MS/s and 2.205 MS/s). The DSP chain realises it
-/// as 4 × 2 × 25/4 — see [`DSPFlow`].
+/// Audio sample rate is fixed at 48kHz, this set the RTL sample rate at 2.4MHz
+/// pretty close to the hardware limit.
 pub const AUDIO_DECIM: u32 = 50;
 
 pub const CPAL_BLOCK: usize = 164; // ceil(8192 / 50) — the block is 163 or 164
 pub const IQ_SLOTS: usize = 16;
 pub const IQ_BLOCK: usize = 16384;
 
-/// How far below the tuned channel the LO is parked at startup.
-///
-/// The dongle's LO leakage and I/Q imbalance put a large spike at 0 Hz, which
-/// is exactly on the carrier if the channel sits on the LO. Starting the
-/// channel this far above it leaves the spike well outside, where the
-/// decimation filters bury it.
-///
-/// This is only the *initial* separation. `center_freq` is programmed into the
-/// dongle verbatim and `tuned_freq` is what the [`Xlator`] brings down to DC,
-/// and the channel can sit anywhere within [`TUNE_SPAN_HZ`] of the centre —
-/// including, deliberately, right on the spike.
-///
-/// The channel is pinned *relative* to the centre: retuning the dongle slides
-/// both together and leaves the translator offset alone, so the cursor holds
-/// its place on the waterfall and the DSP sees no change. The frequency being
-/// demodulated does follow the centre, so a retune lands on a different
-/// station; `Tuned` is what moves the channel within the span.
+/// This is the initial frequency deviation from center freq.
+/// In practice, tunning to left/right of the center freq improves sound quality.
+/// This is just initial deviation, and could later changed when running.
 pub const OFFSET_TUNING_HZ: u32 = 350_000;
 
 /// How far the tuned channel may sit from the centre, either side.
-///
-/// The invariant this has to satisfy is `TUNE_SPAN_HZ + channel_bw / 2 <
-/// sample_rate / 2`: the whole channel must stay inside the digitised span, or
-/// its far edge folds back across Nyquist. At 2.4 MS/s with a 300 kHz channel
-/// that ceiling is 1.05 MHz; 1.0 MHz keeps a 200 kHz guard for the decimation
-/// filters' transition bands and for the tuner's own roll-off near the edges.
+/// The invariant this has to satisfy is `TUNE_SPAN_HZ + bandwidth / 2 < sample_rate / 2`.
+/// The whole channel must stay inside the digitised span, or
+/// its far edge folds back across Nyquist. 
 pub const TUNE_SPAN_HZ: u32 = 1_000_000;
 
 /// Hold `tuned` inside [`TUNE_SPAN_HZ`] of `center`.
-///
-/// Both the UI (for what it displays) and the controller thread (for the
-/// translator offset it derives) clamp through here, so the two can never
-/// disagree about where the channel actually ended up.
 pub fn clamp_tuned(center: u32, tuned: u32) -> u32 {
     tuned.clamp(
         center.saturating_sub(TUNE_SPAN_HZ),
@@ -108,7 +86,7 @@ pub struct Source {
     // ctl: Controller,
     reader: Reader,
 
-    /// Handle for control signal threat
+    /// Handler for control signal threat
     ctrl_handle: JoinHandle<()>,
 
     /// What librtlsdr's divider actually rounded the requested rate to. Not
@@ -316,6 +294,7 @@ impl Source {
         mut self,
         mut producer_sp: RingProducer<f32, IQ_SLOTS, CPAL_BLOCK>,
         mut producer_fft: RingProducer<f32, IQ_SLOTS, IQ_BLOCK>,
+        rssi_dbfs_x10: Arc<AtomicI32>,
     ) -> Result<(JoinHandle<()>, JoinHandle<()>), CustomError> {
         // ── DSP: runs inside librtlsdr's async read callback ────────────────────
         // read_async blocks this (main) thread and invokes the closure per USB
@@ -328,10 +307,8 @@ impl Source {
         // and `push` keeps the fill position in the producer — which is exactly
         // what makes the misalignment harmless.
 
-        // TODO: an IqDcBlocker here measured 57→62 dB SNR at a = 0.99999.
-        // let mut highpass_filter = IqDcBlocker::<IQ_BLOCK>::new(self.sample_rate);
-
-        // DCBlocker, before all
+        // DC blocker on I and Q, ahead of the FFT tap so the tuner's LO spike
+        // is removed from the waterfall's centre bin as well as the audio leg.
         let mut dc_blocker = IqDcBlocker::new(self.sample_rate);
 
         // Brings the tuned channel down to DC for the demodulator. Positive
@@ -388,7 +365,8 @@ impl Source {
                         }
                         // 2.4 MHz -> 300 kHz, demodulate, resample to 48 kHz.
                         // Returns 163 or 164 live samples.
-                        let n = dsp.process(&buf_i, &buf_q);
+                        let (n, rssi) = dsp.process(&buf_i, &buf_q);
+                        rssi_dbfs_x10.store(rssi, Ordering::Relaxed);
 
                         // Feed speaker
                         dsp.out[..n].iter().for_each(|x| {

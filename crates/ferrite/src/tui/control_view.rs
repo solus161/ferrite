@@ -14,6 +14,7 @@
 
 use std::cell::Cell;
 use std::rc::Rc;
+use std::sync::atomic::Ordering;
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -130,7 +131,7 @@ impl Field {
             Field::Agc => on_off(states.agc.get()),
             Field::Bw => fmt_hz(states.bandwidth.get()),
             Field::Ppm => format!("{:+}", states.ppm.get()),
-            Field::Volume => format!("{}", states.volume.get()),
+            Field::Volume => format!("{}", states.volume.load(Ordering::Relaxed)),
             Field::Mute => on_off(states.muted.get()),
             Field::Deemph => format!("{} \u{b5}s", states.deemph_us.get()),
             Field::Floor => format!("{:.0} dB", states.floor_db.get()),
@@ -278,8 +279,8 @@ impl Field {
             }
 
             Field::Volume => {
-                let vol = (states.volume.get() as i64 + 5 * dir as i64).clamp(0, 100) as u32;
-                states.volume.set(vol as f32);
+                let vol = (states.volume.load(Ordering::Relaxed) as i64 + 5 * dir as i64).clamp(0, 100) as u32;
+                states.volume.store(vol, Ordering::Relaxed);
                 None
             }
 
