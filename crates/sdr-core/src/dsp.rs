@@ -1,9 +1,12 @@
+use std::sync::atomic::Ordering;
 use std::{array, usize};
+use std::sync::{Arc, atomic::AtomicI32};
 
 use crate::complex::ComplexF32;
 
 /// Next index + 1, but wrap around to 0 if reach max index
 /// size must be power of 2
+#[inline]
 pub fn next_wrapped(i: usize, size: usize) -> usize {
     let mask = size - 1;
     (i + 1) & mask
@@ -540,6 +543,75 @@ pub fn windowed_sinc_resample(
             sum += input[i as usize] * fc * sinc(fc * t) * hann(t, span as f32);
         }
         output[n] = sum;
+    }
+}
+
+/// Compute Reiceived Signal Strength Indicator
+/// The reference is full scale (0 db)
+/// Rounded to integer for ease of processing
+pub fn rssi_dbfs_x10(buf_i: &[f32], buf_q: &[f32]) -> i32 {
+    assert_eq!(buf_i.len(), buf_q.len());
+    let mut acc = 0.0f32;
+    for (i, q) in buf_i.iter().zip(buf_q.iter()) {
+        acc += i * i + q * q;
+    };
+    let mean_pow = acc / buf_i.len() as f32;
+
+    // Convert to db
+    let dbfs = 10.0 * mean_pow.max(1e-12).log10();
+
+    // x10 to encode as deicmal
+    (dbfs * 10.0).round() as i32
+}
+
+/// Squelch with hysteresis and attack/decay
+pub struct Squelch {
+    /// Threshold at wich squelch opens when signal rising
+    open: Arc<AtomicI32>,
+    /// Lower band, squelch close
+    close_band: f32,
+    is_open: bool,
+    envelop: f32,
+    /// Attack speed
+    attack: f32,
+    /// Decay speed
+    decay: f32,
+}
+
+impl Squelch {
+    pub fn new(open: Arc<AtomicI32>, close_band: f32, attack: f32, decay: f32) -> Self{
+        assert!(close_band > 0.0);
+        Self { open, close_band, is_open: false, envelop: 0.0, attack, decay }
+    }
+
+    pub fn process(&mut self, buf_i: &[f32], buf_q: &[f32], output: &mut [f32]) {
+        assert_eq!(buf_i.len(), buf_q.len());
+        assert_eq!(buf_i.len(), output.len());
+
+        let mut magnitude: f32 = 0.0;
+        let open = self.open.load(Ordering::Relaxed) as f32;
+        buf_i.iter().zip(buf_q.iter()).zip(output.iter_mut()).for_each(|((i, q), o)| {
+            magnitude = (i*i + q*q).sqrt();
+
+            // Envelop is smoothed out based on attack/decay rate
+            // These two may not be the same
+            if magnitude > self.envelop {
+                self.envelop += self.attack * (magnitude - self.envelop);
+            } else {
+                self.envelop += self.decay * (magnitude - self.envelop)
+            }
+
+            // db for volts, amperes, sound pressure
+            let db = (20.0 * self.envelop.log10()).max(-90.0);
+            
+            if !self.is_open && db > open {
+                self.is_open = true;
+            } else if self.is_open && db < open - self.close_band {
+                self.is_open = false;
+            };
+
+            *o = if self.is_open { 1.0 } else { 0.0 }
+        });
     }
 }
 

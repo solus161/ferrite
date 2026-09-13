@@ -7,7 +7,7 @@
 use std::cell::Cell;
 use std::collections::VecDeque;
 use std::rc::Rc;
-use std::{array, usize};
+use std::array;
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};

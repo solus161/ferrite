@@ -74,6 +74,10 @@ pub struct TuiStates {
     /// 0..=100, applied in the cpal callback.
     pub volume: Arc<AtomicU32>,
     pub muted: Rc<Cell<bool>>,
+    
+    /// Squelch limit, from -100 to 0 db
+    pub squelch: Arc<AtomicI32>,
+
     /// De-emphasis time constant in µs: 50 outside the Americas and South
     /// Korea, 75 inside.
     pub deemph_us: Rc<Cell<u32>>,
@@ -105,6 +109,7 @@ impl TuiStates {
         floor_db: f32,
         ceil_db: f32,
         volumn_scale: Arc<AtomicU32>,
+        squelch: Arc<AtomicI32>
     ) -> Self {
         Self {
             sample_rate: Rc::new(Cell::new(sample_rate)),
@@ -118,6 +123,7 @@ impl TuiStates {
             ppm: Rc::new(Cell::new(ppm)),
             volume: volumn_scale,
             muted: Rc::new(Cell::new(false)),
+            squelch,
             deemph_us: Rc::new(Cell::new(50)),
             mode: Rc::new(Cell::new(TunerMode::WbFm)),
             focus: Rc::new(Cell::new(Pane::Control)),
@@ -131,7 +137,6 @@ impl TuiStates {
     get_attr_clone!(audio_rate, u32);
     get_attr_clone!(center_freq, u32);
     get_attr_clone!(tuned_freq, u32);
-    get_attr_clone!(gain_tenths, i32);
     get_attr_clone!(floor_db, f32);
     get_attr_clone!(ceil_db, f32);
 
@@ -203,12 +208,5 @@ impl TunerMode {
     /// Whether the DSP can actually run this mode today.
     pub fn implemented(self) -> bool {
         matches!(self, TunerMode::WbFm)
-    }
-
-    fn from_u8(v: u8) -> Self {
-        Self::ALL
-            .get(v as usize)
-            .copied()
-            .unwrap_or(TunerMode::WbFm)
     }
 }

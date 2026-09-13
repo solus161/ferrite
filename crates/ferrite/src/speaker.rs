@@ -1,6 +1,5 @@
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, atomic::{AtomicU64, AtomicU32, AtomicI32}};
-use std::sync::RwLock;
 
 use cpal::{
     Stream,
@@ -29,7 +28,6 @@ impl Speaker {
         consumer: RingConsumer<f32, IQ_SLOTS, CPAL_BLOCK>,
         volume_scale: Arc<AtomicU32>,
         underruns: Arc<AtomicU64>,
-        rssi_dbfs_x10: Arc<AtomicI32>,
         ) -> Self {
         let host = cpal::default_host();
         let device = host
@@ -142,4 +140,13 @@ impl Speaker {
         self.stream.play()?;
         Ok(())
     }
+}
+
+/// Apply squelch to volume scale, based on RSSI level
+/// `TRANSITION_BAND` is needed so volume does not changed drastically
+fn squelch_scale(rssi_dbfs_x10: &Arc<AtomicI32>, squelch: &Arc<AtomicI32>) -> f32 {
+    // It's 5.0 db but x10 to match with RSSI dbfs x10
+    const TRANSITION_BAND: i32 = 50;    
+    let squelch_start = squelch.load(Ordering::Relaxed) * 10 - TRANSITION_BAND;
+    rssi_dbfs_x10.load(Ordering::Relaxed).saturating_sub(squelch_start).clamp(0, TRANSITION_BAND) as f32 / TRANSITION_BAND as f32
 }

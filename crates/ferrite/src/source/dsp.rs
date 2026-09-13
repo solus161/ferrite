@@ -1,9 +1,9 @@
 use std::array;
-use std::sync::atomic::Ordering;
-use std::sync::{Arc, atomic::AtomicI32};
+use std::sync::{Arc, atomic::{AtomicU32, AtomicI32, Ordering}};
 
 use sdr_core::dsp::{
-    DecimFIR, Deemphasis, Demodulation, FilterType, PolyphaseResampler, Window, create_taps, DcBlocker
+    DecimFIR, Deemphasis, Demodulation, FilterType, PolyphaseResampler, Window, create_taps, DcBlocker,
+    rssi_dbfs_x10, Squelch
 };
 
 /// De-emphasis time constant. 50 µs everywhere except the Americas and South
@@ -27,19 +27,21 @@ const DEEMPHASIS_TAU: f32 = 50e-6;
 pub struct DSPFlow {
     stage_1: DecimFIR<8218, 8192, 27>, // 26 + 8192, 27 taps, 2048 output
     stage_2: DecimFIR<2116, 2048, 69>, // 68 + 2048, 69 taps, 1024 output
+    squelch: Squelch,
     demod: Demodulation,
     resampler: PolyphaseResampler, // 1024, up 4 down 25
     deemph: Deemphasis,            // runs last, at 48 kHz
     dc_blocker: DcBlocker,
     out_i_decim: [f32; 1024],
     out_q_decim: [f32; 1024],
+    out_squelch: [f32; 1024],
     out_demod: [f32; 1024], 
     /// Only `[..n]` is live, where `n` is what [`process`](Self::process) returns.
     pub out: [f32; 164],
 }
 
 impl DSPFlow {
-    pub fn new() -> Self {
+    pub fn new(squelch: Arc<AtomicI32>) -> Self {
         // Generate lowpass filters
         // TODO: This could be half-band filter
         // Half-band FIR — every even tap (except center) is exactly 0.0
@@ -76,19 +78,21 @@ impl DSPFlow {
         Self {
             stage_1: DecimFIR::<8218, 8192, 27>::new(&lpf_taps_1),
             stage_2: DecimFIR::<2116, 2048, 69>::new(&lpf_taps_2),
+            squelch: Squelch::new(squelch, 5.0, 0.01, 0.001),
             demod: Demodulation::new(75_000.0, 300_000.0),
             resampler: PolyphaseResampler::new(4, 25, &lpf_taps_resampler),
             deemph: Deemphasis::new(DEEMPHASIS_TAU, 48_000.0),
             dc_blocker: DcBlocker::new(48_000),
             out_i_decim: array::from_fn(|_| 0.0f32),
             out_q_decim: array::from_fn(|_| 0.0f32),
+            out_squelch: array::from_fn(|_| 0.0f32),
             out_demod: array::from_fn(|_| 0.0f32),
             out: array::from_fn(|_| 0.0f32),
         }
     }
 
-    pub fn new_boxed() -> Box<Self> {
-        Box::new(Self::new())
+    pub fn new_boxed(squelch: Arc<AtomicI32>) -> Box<Self> {
+        Box::new(Self::new(squelch))
     }
 
     pub fn process(
@@ -110,18 +114,27 @@ impl DSPFlow {
         self.stage_2
             .process(2, &mut self.out_i_decim, &mut self.out_q_decim);
 
+        // Squelch must be before demod
+        self.squelch.process(&self.out_i_decim, &self.out_q_decim, &mut self.out_squelch);
+
         // Demod must run before resampling
         self.demod
             .process(&self.out_i_decim, &self.out_q_decim, &mut self.out_demod);
 
+        // Apply squelch filter
+        self.out_demod.iter_mut().zip(self.out_squelch.iter()).for_each(|(o, f)| {
+            *o *= *f
+        });
+
         // Update RSSI at bandwidth 300kHz
-        let mut acc = 0.0f32;
-        for (i, q) in self.out_i_decim.iter().zip(self.out_q_decim.iter()) {
-            acc += i * i + q * q;
-        };
-        let mean_pow = acc / self.out_q_decim.len() as f32;
-        let dbfs = 10.0 * mean_pow.max(1e-12).log10();
-        let rssi_dbfs_x10 = (dbfs * 10.0).round() as i32;
+        // let mut acc = 0.0f32;
+        // for (i, q) in self.out_i_decim.iter().zip(self.out_q_decim.iter()) {
+        //     acc += i * i + q * q;
+        // };
+        // let mean_pow = acc / self.out_q_decim.len() as f32;
+        // let dbfs = 10.0 * mean_pow.max(1e-12).log10();
+        // let rssi_dbfs_x10 = (dbfs * 10.0).round() as i32;
+        let rssi = rssi_dbfs_x10(&self.out_i_decim, &self.out_q_decim);
 
         // Resampler
         let resampler_count = self.resampler.process(&self.out_demod, &mut self.out);
@@ -137,6 +150,6 @@ impl DSPFlow {
         // contiguous, which `push` on the ring guarantees.
         self.deemph.process(&mut self.out[..resampler_count]);
 
-        (resampler_count, rssi_dbfs_x10)
+        (resampler_count, rssi)
     }
 }

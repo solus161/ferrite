@@ -1,8 +1,7 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use std::sync::mpsc::Receiver;
-use std::{
-    array,
+use std::{ array,
     thread::{self, JoinHandle},
 };
 
@@ -294,6 +293,7 @@ impl Source {
         mut self,
         mut producer_sp: RingProducer<f32, IQ_SLOTS, CPAL_BLOCK>,
         mut producer_fft: RingProducer<f32, IQ_SLOTS, IQ_BLOCK>,
+        squelch: Arc<AtomicI32>,
         rssi_dbfs_x10: Arc<AtomicI32>,
     ) -> Result<(JoinHandle<()>, JoinHandle<()>), CustomError> {
         // ── DSP: runs inside librtlsdr's async read callback ────────────────────
@@ -319,7 +319,7 @@ impl Source {
         let mut applied_offset = xlator_offset.load(Ordering::Relaxed);
         let mut xlator = Xlator::new(applied_offset as f32, self.sample_rate as f32);
         // Multi phase decimator
-        let mut dsp = DSPFlow::new_boxed();
+        let mut dsp = DSPFlow::new_boxed(squelch);
 
         let mut buf: [f32; IQ_BLOCK] = array::from_fn(|_| 0.0f32);
         let mut buf_i: [f32; 8192] = array::from_fn(|_| 0.0f32);

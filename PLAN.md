@@ -541,7 +541,13 @@ Gaps in the signal path that exists today, roughly cheapest-first.
       **Where:** `source.rs`, right after the `u8 → f32` centring, before stage-1 decimation.
       **Done when:** the centre bin sits at the noise floor with no signal present.
 
-- [ ] **R1.3 Surface ring health; get `eprintln!` out of the callback** — S
+- [x] **R1.3 Surface ring health; get `eprintln!` out of the callback** — S
+      **Done:** `tui/info_view.rs` shows Audio Lag and FFT Lag as bars over `IQ_SLOTS`
+      (a full bar is one write from being lapped) plus a cpal Underrun counter; the hot
+      paths report through atomics only (`crate::log` rules). Landed in `info_view.rs`,
+      not a separate `stats_view.rs`. Still open: `source.rs` discards
+      `producer_fft.write(..)`'s result, so laps/drops are inferred from lag rather than
+      counted — `Health.iq_drops` / `iq_laps` in `app_states.rs` are unused.
       **Why:** two problems, one fix. `spmc.rs` has drop/lap semantics but `source.rs`
       throws the result away (`let _ = producer_iq.write(..)`) or prints it — and
       `eprintln!` in the read callback takes the stdout lock and can block on a slow
@@ -552,7 +558,11 @@ Gaps in the signal path that exists today, roughly cheapest-first.
       **Done when:** overruns, laps and cpal underruns are visible on screen, and no hot
       path formats a string.
 
-- [ ] **R1.4 Real low-pass FIR + polyphase decimation** — M
+- [x] **R1.4 Real low-pass FIR + polyphase decimation** — M
+      **Done:** `source/dsp.rs` `DSPFlow` — Kaiser-windowed-sinc `DecimFIR` stages
+      (27 taps ÷4 → 600 kHz, 69 taps ÷2 → 300 kHz, computing only the kept samples),
+      then a 1901-tap 4/25 `PolyphaseResampler` to 48 kHz. Both boxcars are gone.
+      Not verified against the THD baseline — R4.1 is still open.
       **Why:** `IQ_DECIM` and `POST_DECIM` are both boxcars. The first null lands where you
       want it but the stopband is only ~13 dB down, so adjacent-channel rejection is poor
       and stage 2 folds junk into the audio band. A designed FIR run polyphase (compute
@@ -562,7 +572,14 @@ Gaps in the signal path that exists today, roughly cheapest-first.
       **Done when:** a strong neighbour 200 kHz away is inaudible, and R4.1's THD test
       improves against the boxcar baseline.
 
-- [ ] **R1.5 Signal-quality metering (RSSI / SNR)** — S
+- [x] **R1.5 Signal-quality metering (RSSI / SNR)** — S
+      **Done — RSSI only.** Mean |IQ|² in `DSPFlow::process`, published as tenths of a
+      dBFS in `Health.rssi_dbfs_x10`, drawn as a bar over `RSSI_BAR_DB` in `info_view.rs`.
+      **SNR dropped, deliberately.** Squelch (R1.6) and a scanner are RSSI thresholds; the
+      only question SNR answers that RSSI doesn't — did a gain change lift the signal or
+      just the floor — is what the spectrum view already shows as peak-vs-floor. An FFT
+      based estimate would also live on the UI thread at frame rate, not in the DSP.
+      `Health.snr_db_x10` is a leftover to remove.
       **Why:** `Field` shows Freq/Step/Gain/BW/PPM — every one an input, none a measurement.
       Without RSSI there is no squelch, no scanner, and no way to tell whether a gain change
       helped. Mean |IQ|² for RSSI; in-band vs out-of-band power from the FFT for SNR.

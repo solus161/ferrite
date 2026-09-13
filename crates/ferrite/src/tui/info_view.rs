@@ -165,7 +165,10 @@ fn bar_line(t: f32, reading: String, color: Color, width: usize) -> Line<'static
 /// at ⅛-cell resolution using the left-block glyphs. The unfilled remainder
 /// is blank, padded to `width` so the reading after it stays put.
 fn hbar(t: f32, width: usize) -> String {
-    const EIGHTHS: [&str; 8] = ["", "▏", "▎", "▍", "▌", "▋", "▊", "▉"];
+    // A space at index 0 so the slot is always one cell; an empty string
+    // there left the line a cell short whenever the fraction rounded to
+    // zero, and right-alignment then shifted the bar off its left edge.
+    const EIGHTHS: [&str; 8] = [" ", "▏", "▎", "▍", "▌", "▋", "▊", "▉"];
     let cells = t.clamp(0.0, 1.0) * width as f32;
     let full = (cells as usize).min(width);
     let frac = ((cells - full as f32) * 8.0) as usize;
