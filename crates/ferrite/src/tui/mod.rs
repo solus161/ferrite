@@ -1,4 +1,3 @@
-pub mod app_states;
 mod colors;
 pub mod control_view;
 pub mod info_view;

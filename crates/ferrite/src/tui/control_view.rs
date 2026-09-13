@@ -42,6 +42,9 @@ const PPM_RANGE: (i32, i32) = (-100, 100);
 /// an NFM channel.
 const STEP_LADDER: [u32; 6] = [1_000, 5_000, 10_000, 50_000, 100_000, 1_000_000];
 
+/// Squelch threshold min at -100 db, max at 0 db
+const SQUELCH_RANGE: (i32, i32) = (-100, 0);
+
 /// Channel widths worth offering. This is the *channel*, not the tuner's IF
 /// filter — `source::source` widens it to clear the offset-tuning gap.
 const BW_LADDER: [u32; 6] = [50_000, 100_000, 200_000, 300_000, 500_000, 1_000_000];
@@ -68,6 +71,7 @@ pub enum Field {
     Agc,
     Bw,
     Ppm,
+    Squelch,    // Simple power squelch
     Volume,
     Mute,
     Deemph,
@@ -76,7 +80,7 @@ pub enum Field {
 }
 
 impl Field {
-    const ALL: [Field; 13] = [
+    const ALL: [Field; 14] = [
         Field::Mode,
         Field::Freq,
         Field::Tuned,
@@ -87,6 +91,7 @@ impl Field {
         Field::Ppm,
         Field::Volume,
         Field::Mute,
+        Field::Squelch,
         Field::Deemph,
         Field::Floor,
         Field::Ceil,
@@ -114,6 +119,7 @@ impl Field {
             Field::Ppm => "PPM",
             Field::Volume => "Volume",
             Field::Mute => "Mute",
+            Field::Squelch => "Squelch",
             Field::Deemph => "De-emph",
             Field::Floor => "Floor",
             Field::Ceil => "Ceiling",
@@ -131,6 +137,7 @@ impl Field {
             Field::Agc => on_off(states.agc.get()),
             Field::Bw => fmt_hz(states.bandwidth.get()),
             Field::Ppm => format!("{:+}", states.ppm.get()),
+            Field::Squelch => format!("{} db", states.squelch.load(Ordering::Relaxed)),
             Field::Volume => format!("{}", states.volume.load(Ordering::Relaxed)),
             Field::Mute => on_off(states.muted.get()),
             Field::Deemph => format!("{} \u{b5}s", states.deemph_us.get()),
@@ -278,6 +285,12 @@ impl Field {
                 Some(CtrlSignal::Ppm(ppm))
             }
 
+            Field::Squelch => {
+                let squelch = (states.squelch.load(Ordering::Relaxed) + dir).clamp(SQUELCH_RANGE.0, SQUELCH_RANGE.1);
+                states.squelch.store(squelch, Ordering::Relaxed);
+                None
+            }
+
             Field::Volume => {
                 let vol = (states.volume.load(Ordering::Relaxed) as i64 + 5 * dir as i64).clamp(0, 100) as u32;
                 states.volume.store(vol, Ordering::Relaxed);
@@ -388,7 +401,7 @@ impl ControlView {
 
         let [marker, label, value] = Layout::horizontal([
             Constraint::Length(2),
-            Constraint::Length(8),
+            Constraint::Length(12),
             Constraint::Fill(1),
         ])
         .areas(area);

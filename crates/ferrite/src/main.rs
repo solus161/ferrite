@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicI32, AtomicU32};
 use std::sync::mpsc::channel;
 
 #[macro_use]
@@ -129,13 +129,15 @@ fn main() -> Result<(), CustomError> {
 
     let volumn_scale = Arc::new(AtomicU32::new(100));
     let rssi_dbfs_x10 = health.rssi_dbfs_x10.clone();
+    
+    // Squelch's open threshold
+    let squelch = Arc::new(AtomicI32::new(-30));
 
     // Speaker. Fills in both rates, since it is what asks cpal for one.
     let speaker = Speaker::new(
         consumer_audio,
         volumn_scale.clone(),
         health.underruns.clone(),
-        health.rssi_dbfs_x10.clone()
         );
     let rtl_rate = speaker.rtl_rate;
 
@@ -152,6 +154,7 @@ fn main() -> Result<(), CustomError> {
         -90.0,
         0.0,
         volumn_scale,
+        squelch,
     );
 
     let source = Source::new(
@@ -188,6 +191,7 @@ fn main() -> Result<(), CustomError> {
     let (source_handle, ctrl_handle) = source.start_receive(
         producer_audio,
         producer_fft,
+        states.squelch.clone(),
         rssi_dbfs_x10,
         )?;
 
