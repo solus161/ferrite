@@ -587,12 +587,13 @@ Gaps in the signal path that exists today, roughly cheapest-first.
       `tui/stats_view.rs`.
       **Done when:** a dBFS bar tracks tuning across the band.
 
-- [ ] **R1.6 Squelch** — S
+- [x] **R1.6 Squelch** — S
+      Done. Squelch with hysteresis and atack/decay. 
       **Why:** mutes the hiss between stations; needs R1.5. Threshold with hysteresis and a
       short attack/release so it doesn't chatter on a marginal signal.
       **Where:** `source.rs` (gate the audio sample); threshold as a new `Field` + `CtrlSignal`.
 
-- [ ] **R1.7 Volume and mute as controls** — S
+- [x] **R1.7 Volume and mute as controls** — S
       **Why:** `volume` is a hardcoded `0.3` inside the DSP closure.
       **Where:** new `CtrlSignal::Volume`, new `Field`; apply on the audio side.
       **Done when:** volume and mute are keyboard-adjustable and survive into R2.3's config.

@@ -1,5 +1,5 @@
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, atomic::{AtomicU64, AtomicU32, AtomicI32}};
+use std::sync::{Arc, atomic::{AtomicU64, AtomicU32, AtomicI32, AtomicBool}};
 
 use cpal::{
     Stream,
@@ -27,6 +27,7 @@ impl Speaker {
     pub fn new(
         consumer: RingConsumer<f32, IQ_SLOTS, CPAL_BLOCK>,
         volume_scale: Arc<AtomicU32>,
+        muted: Arc<AtomicBool>,
         underruns: Arc<AtomicU64>,
         ) -> Self {
         let host = cpal::default_host();
@@ -96,6 +97,9 @@ impl Speaker {
                     // usefully change inside 10.7 ms, and a per-sample atomic
                     // read would defeat autovectorisation of the copy loop.
 
+                    let volume = volume_scale.load(Ordering::Relaxed) as f32 / 100.0;
+                    // let muted_flag: f32 = if muted.load(Ordering::Relaxed) { 0.0 } else { 1.0 };
+                    let muted_flag = muted.load(Ordering::Relaxed);
                     for frame in data.chunks_mut(channels) {
                         if pos == CPAL_BLOCK {
                             match consumer.read_into(&mut staging) {
@@ -117,10 +121,16 @@ impl Speaker {
                             }
                         }
 
-                        let s = staging[pos] * volume_scale.load(Ordering::Relaxed) as f32 / 100.0;
+                        let s = staging[pos] * volume;
                         pos += 1;
-                        for out in frame.iter_mut() {
-                            *out = s; // mono → every channel
+                        if muted_flag {
+                            for out in frame.iter_mut() {
+                                *out = 0.0; // mono → every channel
+                            }
+                        } else {
+                            for out in frame.iter_mut() {
+                                *out = s; // mono → every channel
+                            }
                         }
                     }
                 },

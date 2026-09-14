@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI32, AtomicU32};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32};
 use std::sync::mpsc::channel;
 
 #[macro_use]
@@ -128,6 +128,7 @@ fn main() -> Result<(), CustomError> {
     );
 
     let volumn_scale = Arc::new(AtomicU32::new(100));
+    let muted = Arc::new(AtomicBool::new(false));
     let rssi_dbfs_x10 = health.rssi_dbfs_x10.clone();
     
     // Squelch's open threshold
@@ -137,6 +138,7 @@ fn main() -> Result<(), CustomError> {
     let speaker = Speaker::new(
         consumer_audio,
         volumn_scale.clone(),
+        muted.clone(),
         health.underruns.clone(),
         );
     let rtl_rate = speaker.rtl_rate;
@@ -154,6 +156,7 @@ fn main() -> Result<(), CustomError> {
         -90.0,
         0.0,
         volumn_scale,
+        muted,
         squelch,
     );
 

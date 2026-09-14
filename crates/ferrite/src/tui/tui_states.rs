@@ -13,7 +13,7 @@ use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use std::sync::atomic::{AtomicI32, AtomicU32, AtomicIsize, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicU32, AtomicU64};
 
 use super::utils::get_attr_clone;
 
@@ -73,7 +73,7 @@ pub struct TuiStates {
     // ── Audio ───────────────────────────────────────────────────────────────
     /// 0..=100, applied in the cpal callback.
     pub volume: Arc<AtomicU32>,
-    pub muted: Rc<Cell<bool>>,
+    pub muted: Arc<AtomicBool>,
     
     /// Squelch limit, from -100 to 0 db
     pub squelch: Arc<AtomicI32>,
@@ -109,6 +109,7 @@ impl TuiStates {
         floor_db: f32,
         ceil_db: f32,
         volumn_scale: Arc<AtomicU32>,
+        muted: Arc<AtomicBool>,
         squelch: Arc<AtomicI32>
     ) -> Self {
         Self {
@@ -122,7 +123,7 @@ impl TuiStates {
             bandwidth: Rc::new(Cell::new(bandwidth)),
             ppm: Rc::new(Cell::new(ppm)),
             volume: volumn_scale,
-            muted: Rc::new(Cell::new(false)),
+            muted,
             squelch,
             deemph_us: Rc::new(Cell::new(50)),
             mode: Rc::new(Cell::new(TunerMode::WbFm)),

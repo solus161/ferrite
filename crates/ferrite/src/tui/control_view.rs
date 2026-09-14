@@ -139,7 +139,7 @@ impl Field {
             Field::Ppm => format!("{:+}", states.ppm.get()),
             Field::Squelch => format!("{} db", states.squelch.load(Ordering::Relaxed)),
             Field::Volume => format!("{}", states.volume.load(Ordering::Relaxed)),
-            Field::Mute => on_off(states.muted.get()),
+            Field::Mute => on_off(states.muted.load(Ordering::Relaxed)),
             Field::Deemph => format!("{} \u{b5}s", states.deemph_us.get()),
             Field::Floor => format!("{:.0} dB", states.floor_db.get()),
             Field::Ceil => format!("{:.0} dB", states.ceil_db.get()),
@@ -155,7 +155,7 @@ impl Field {
         match self {
             Field::Mode => !v.states.mode.get().implemented(),
             Field::Gain => v.states.agc.get(),
-            Field::Volume => v.states.muted.get(),
+            // Field::Volume => v.states.muted.get(),
             _ => false,
         }
     }
@@ -286,7 +286,8 @@ impl Field {
             }
 
             Field::Squelch => {
-                let squelch = (states.squelch.load(Ordering::Relaxed) + dir).clamp(SQUELCH_RANGE.0, SQUELCH_RANGE.1);
+                let squelch = (states.squelch.load(Ordering::Relaxed) + dir)
+                    .clamp(SQUELCH_RANGE.0, SQUELCH_RANGE.1);
                 states.squelch.store(squelch, Ordering::Relaxed);
                 None
             }
@@ -298,8 +299,8 @@ impl Field {
             }
 
             Field::Mute => {
-                let muted = !states.muted.get();
-                states.muted.set(muted);
+                let muted = states.muted.load(Ordering::Relaxed);
+                states.muted.store(!muted, Ordering::Relaxed);
                 None
             }
 

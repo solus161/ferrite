@@ -1,6 +1,7 @@
 use std::io;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
@@ -192,8 +193,8 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
             // Mute earns a global key for the same reason every media player
             // gives it one.
             KeyCode::Char('m') => {
-                let muted = !self.states.muted.get();
-                self.states.muted.set(muted);
+                let muted = !self.states.muted.load(Ordering::Relaxed);
+                self.states.muted.store(muted, Ordering::Relaxed);
                 self.set_status(if muted { "Muted" } else { "Unmuted" });
             }
 
