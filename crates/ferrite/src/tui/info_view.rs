@@ -30,7 +30,8 @@ use crate::source::source::IQ_SLOTS;
 
 /// Rows plus border. Kept beside the row list for the same reason
 /// [`control_view::HEIGHT`](super::control_view::HEIGHT) is.
-pub const HEIGHT: u16 = 8 + 2;
+pub const HEIGHT: u16 = ROWS as u16 + 2;
+const ROWS: usize = 9;
 
 /// Span of the RSSI bar, in dBFS. Fixed rather than the waterfall's
 /// `[floor, ceil]`: RSSI is *channel* power, ~22 dB above the per-bin level
@@ -107,6 +108,13 @@ impl InfoView {
                 plain(format!("{:.3} MHz", self.tuned_freq.get() as f64 / 1e6)),
             ),
             ("RSSI", rssi_line(rssi, value_w)),
+            (
+                "Stereo",
+                stereo_line(
+                    self.health.stereo.load(Relaxed),
+                    self.health.pilot_x10.load(Relaxed),
+                ),
+            ),
             ("Audio Lag", lag_line(audio_lag, value_w)),
             ("FFT Lag", lag_line(fft_lag, value_w)),
             (
@@ -119,7 +127,7 @@ impl InfoView {
         // stretched — a readout reads as a list, not as evenly spread lines. In
         // a pane too short for all of them the trailing rows come back
         // zero-height and `Line::render` skips them on its own.
-        let areas = Layout::vertical([Constraint::Length(1); 8]).split(inner);
+        let areas = Layout::vertical([Constraint::Length(1); ROWS]).split(inner);
 
         for (r, (label, value)) in areas.iter().zip(rows) {
             let [label_area, value_area] =
@@ -141,6 +149,25 @@ fn rssi_line(tenths: i32, width: usize) -> Line<'static> {
     let (floor, ceil) = RSSI_BAR_DB;
     let t = (dbfs - floor) / (ceil - floor);
     bar_line(t, format!(" {dbfs:>6.1}"), rssi_color(dbfs), width)
+}
+
+/// `● ST   9.1%` when the pilot PLL is locked, `mono   0.3%` otherwise. The
+/// level is the coherent pilot injection, so it reads near zero off-station
+/// rather than reporting noise as a pilot.
+fn stereo_line(stereo: bool, pilot_x10: i32) -> Line<'static> {
+    if pilot_x10 == UNMEASURED {
+        return Line::styled("\u{2014}", Style::new().fg(colors::TEXT));
+    }
+    let pct = format!(" {:>5.1}%", pilot_x10.max(0) as f32 / 10.0);
+    let (tag, color) = if stereo {
+        ("\u{25cf} ST", CYAN_GLOW)
+    } else {
+        ("mono", colors::LABEL)
+    };
+    Line::from(vec![
+        Span::styled(tag, Style::new().fg(color)),
+        Span::styled(pct, Style::new().fg(colors::TEXT)),
+    ])
 }
 
 /// Consumer lag in blocks over the ring's [`IQ_SLOTS`]: a full bar is one

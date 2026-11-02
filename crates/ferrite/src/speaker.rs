@@ -8,7 +8,7 @@ use cpal::{
 
 use sdr_core::spmc::RingConsumer;
 
-use crate::source::source::{AUDIO_DECIM, CPAL_BLOCK, IQ_SLOTS};
+use crate::source::source::{AUDIO_CHANNELS, AUDIO_DECIM, CPAL_BLOCK, IQ_SLOTS};
 
 pub struct Speaker {
     stream: Stream,
@@ -121,15 +121,26 @@ impl Speaker {
                             }
                         }
 
-                        let s = staging[pos] * volume;
-                        pos += 1;
+                        // The ring is L/R interleaved and CPAL_BLOCK is a
+                        // whole number of frames, so `pos` is always on an L.
+                        let (l, r) = (staging[pos] * volume, staging[pos + 1] * volume);
+                        pos += AUDIO_CHANNELS;
                         if muted_flag {
-                            for out in frame.iter_mut() {
-                                *out = 0.0; // mono → every channel
-                            }
+                            frame.fill(0.0);
                         } else {
-                            for out in frame.iter_mut() {
-                                *out = s; // mono → every channel
+                            match frame {
+                                // A mono device gets the downmix, which is
+                                // exactly the old (L+R)/2 output.
+                                [m] => *m = 0.5 * (l + r),
+                                // Front pair carries the programme; anything
+                                // beyond it (centre, LFE, surrounds) stays
+                                // silent rather than doubling L or R.
+                                [fl, fr, rest @ ..] => {
+                                    *fl = l;
+                                    *fr = r;
+                                    rest.fill(0.0);
+                                }
+                                [] => {}
                             }
                         }
                     }

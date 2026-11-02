@@ -606,7 +606,26 @@ Gaps in the signal path that exists today, roughly cheapest-first.
       **Where:** `source.rs` output stage; fill level read from the `spmc` consumer.
       **Done when:** R1.3's underrun counter still reads zero after an hour.
 
-- [ ] **R1.9 Stereo (MPX decode)** — L
+- [x] **R1.9 Stereo (MPX decode)** — L
+      **Done:** `PilotPll` in `sdr-core/src/dsp.rs` (kept beside the other DSP blocks
+      rather than a new `dsp/pll.rs`). The phase detector is quadrature, not a bare
+      multiply: mix with sin/cos φ, two cascaded 250 Hz one-poles per arm, error =
+      `atan2(Q, I)`. That makes loop gain 1 rad/rad regardless of pilot injection, and the
+      in-phase arm doubles as the lock detector. 50 Hz loop noise bandwidth, ζ 0.707, ±100 Hz
+      pull-in; stereo on above 4 % injection, off below 2.5 %, with a ~16 ms blend ramp so
+      the switch fades instead of clicking. L−R = `2·mpx·sin 2φ` at 300 kHz.
+      `DSPFlow` runs twin 4/25 resamplers on sum and diff (the 15 kHz prototype is also the
+      L−R baseband filter), DC-blocks the sum, matrixes `L = s + d`, `R = s − d`, then
+      de-emphasises each channel. No pilot → diff is silent → identical to the old mono.
+      Audio ring carries L/R interleaved (`CPAL_BLOCK = 164 × AUDIO_CHANNELS`, whole frames
+      so a dropped block cannot swap channels). `speaker.rs` writes FL/FR, downmixes for a
+      mono device, silences any further channels. Info panel has a Stereo row
+      (`● ST 9.1%` / `mono`) from `Health.stereo` / `Health.pilot_x10`.
+      Tests (`stereo_tests`, synthetic MPX, pilot 0.7 Hz off nominal): locks, reads 9.0 %
+      injection, 71.7 dB separation, correct matrix sign, mono with no pilot.
+      **Still open:** not yet confirmed on air. And the MPX rate is hardcoded at 300 kHz like
+      `Demodulation`, so on a non-48 kHz audio device the pilot lands outside the pull-in
+      range and the decoder stays mono (safe, but not stereo).
       **Why:** the biggest audible upgrade available, and the gateway to R1.10 since both
       subcarriers live in the same multiplex. Currently mono by construction: de-emphasis at
       240 kS/s deliberately buries the 38 kHz subcarrier before it can alias.
@@ -620,7 +639,8 @@ Gaps in the signal path that exists today, roughly cheapest-first.
 - [ ] **R1.10 RDS** — L
       **Why:** station name, radiotext, PI code, clock. The most satisfying payoff in the
       project — the TUI stops being a waterfall and starts naming what you're listening to.
-      The 57 kHz subcarrier is 3× the pilot, so R1.9's PLL hands you the carrier for free.
+      The 57 kHz subcarrier is 3× the pilot, so R1.9's PLL hands you the carrier for free
+      (`sin 3φ` from the `sin_cos` `PilotPll::process` already computes per sample).
       **How:** BPSK at 1187.5 bps → matched filter → timing recovery → differential decode →
       block sync via the offset words/syndromes → group decode (0A = PS, 2A = radiotext).
       **Where:** new `rds/` module; a display panel in `tui/`.
@@ -922,6 +942,9 @@ atomic and is rendered by the UI thread, with [`UNMEASURED`] where nothing has w
       actually receivable, and tuning to a listed peak plays it.
 
 - [ ] **R5.11 FM deviation, MPX and pilot meter** — M — *pre-work for R1.9.*
+      **Partly superseded:** R1.9 landed first, so pilot presence and injection % already
+      exist (`PilotPll::pilot_level`, Info panel Stereo row). What remains is peak/RMS
+      deviation and the MPX spectrum.
       **Why:** this is the one place ferrite can go further than sdrtop rather than catching
       up, because ferrite actually demodulates. And it front-loads the risky half of R1.9:
       the pilot detector built here as a meter becomes that item's PLL, tested against real

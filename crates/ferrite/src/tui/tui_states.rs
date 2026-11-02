@@ -158,6 +158,11 @@ pub struct Health {
     pub underruns: Arc<AtomicU64>,
     /// Tenths of a dBFS, or [`UNMEASURED`]. PLAN.md R1.5.
     pub rssi_dbfs_x10: Arc<AtomicI32>,
+    /// The stereo decoder's PLL is locked on a pilot. PLAN.md R1.9.
+    pub stereo: Arc<AtomicBool>,
+    /// Coherent pilot level in tenths of a percent of full deviation, or
+    /// [`UNMEASURED`]. A healthy stereo station reads 80–100.
+    pub pilot_x10: Arc<AtomicI32>,
 }
 
 impl Health {
@@ -170,6 +175,8 @@ impl Health {
             ring_fft_lag,
             underruns: Arc::new(AtomicU64::new(0)),
             rssi_dbfs_x10: Arc::new(AtomicI32::new(UNMEASURED)),
+            stereo: Arc::new(AtomicBool::new(false)),
+            pilot_x10: Arc::new(AtomicI32::new(UNMEASURED)),
         }
     }
 }
