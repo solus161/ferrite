@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI32, AtomicU32};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32};
 use std::sync::mpsc::channel;
 
 #[macro_use]
@@ -28,7 +28,8 @@ const DEFAULT_STEP_HZ: u32 = 100_000;
 /// Ring geometry lives with the producers: audio is `IQ_SLOTS × CPAL_BLOCK`,
 /// raw IQ is `IQ_SLOTS × IQ_BLOCK` (see `source::source`). A block only becomes
 /// readable once it is full, so the block size is a latency floor paid by every
-/// consumer — CPAL_BLOCK @ 48 kHz is ~3.4 ms, ~55 ms for the whole ring.
+/// consumer — CPAL_BLOCK (164 stereo frames) @ 48 kHz is ~3.4 ms, ~55 ms for
+/// the whole ring.
 /// Consumers wanting a larger window (an FFT, say) accumulate blocks on their
 /// own side; that is cheap, whereas splitting a large block down to cpal's
 /// ~512-frame callbacks would mean holding a borrow into a ring slot across
@@ -96,7 +97,12 @@ fn main() -> Result<(), CustomError> {
       | |                     `create_taps` normalises DC gain to 1.0 and each
       | |                     of the 4 branches would otherwise carry a quarter.
       | |                     -> 163 or 164 samples (8192/50 = 163.84)
-      | |―De-emphasis, 50us one-pole, at 48kHz, in place over `out[..n]` only
+      | |―Stereo (R1.9): PLL on the 19kHz pilot gives a coherent 38kHz;
+      | |                2·MPX·sin 2φ is L−R, resampled by a twin of the
+      | |                above. L = sum + diff, R = sum − diff. No pilot ->
+      | |                diff is silent and the output is plain mono.
+      | |―De-emphasis, 50us one-pole, at 48kHz, per channel after the matrix
+      | |―Audio ring carries L/R interleaved; CPAL_BLOCK is 164 frames
       |―FFT: convert to ComplexF32 for more graceful api. Untranslated, so bin
       |      centre is the LO and the MHz axis can be labelled on center_freq
       |      directly. Two cursors mark centre (cyan) and channel (orange).
@@ -128,6 +134,7 @@ fn main() -> Result<(), CustomError> {
     );
 
     let volumn_scale = Arc::new(AtomicU32::new(100));
+    let muted = Arc::new(AtomicBool::new(false));
     let rssi_dbfs_x10 = health.rssi_dbfs_x10.clone();
     
     // Squelch's open threshold
@@ -137,6 +144,7 @@ fn main() -> Result<(), CustomError> {
     let speaker = Speaker::new(
         consumer_audio,
         volumn_scale.clone(),
+        muted.clone(),
         health.underruns.clone(),
         );
     let rtl_rate = speaker.rtl_rate;
@@ -154,6 +162,7 @@ fn main() -> Result<(), CustomError> {
         -90.0,
         0.0,
         volumn_scale,
+        muted,
         squelch,
     );
 
@@ -193,6 +202,8 @@ fn main() -> Result<(), CustomError> {
         producer_fft,
         states.squelch.clone(),
         rssi_dbfs_x10,
+        health.stereo.clone(),
+        health.pilot_x10.clone(),
         )?;
 
     let tui =

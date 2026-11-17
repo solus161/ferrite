@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::mpsc::Receiver;
 use std::{ array,
     thread::{self, JoinHandle},
@@ -22,7 +22,13 @@ use super::dsp::DSPFlow;
 /// pretty close to the hardware limit.
 pub const AUDIO_DECIM: u32 = 50;
 
-pub const CPAL_BLOCK: usize = 164; // ceil(8192 / 50) — the block is 163 or 164
+/// The audio ring carries L/R interleaved, `[L0, R0, L1, R1, ...]`.
+pub const AUDIO_CHANNELS: usize = 2;
+
+/// ceil(8192 / 50) = 164 frames — a transfer yields 163 or 164 — interleaved,
+/// so 328 samples. Must stay a whole number of frames: the ring only ever drops
+/// whole blocks, and that is what keeps L and R from swapping after a resync.
+pub const CPAL_BLOCK: usize = 164 * AUDIO_CHANNELS;
 pub const IQ_SLOTS: usize = 16;
 pub const IQ_BLOCK: usize = 16384;
 
@@ -295,6 +301,8 @@ impl Source {
         mut producer_fft: RingProducer<f32, IQ_SLOTS, IQ_BLOCK>,
         squelch: Arc<AtomicI32>,
         rssi_dbfs_x10: Arc<AtomicI32>,
+        stereo: Arc<AtomicBool>,
+        pilot_x10: Arc<AtomicI32>,
     ) -> Result<(JoinHandle<()>, JoinHandle<()>), CustomError> {
         // ── DSP: runs inside librtlsdr's async read callback ────────────────────
         // read_async blocks this (main) thread and invokes the closure per USB
@@ -367,11 +375,15 @@ impl Source {
                         // Returns 163 or 164 live samples.
                         let (n, rssi) = dsp.process(&buf_i, &buf_q);
                         rssi_dbfs_x10.store(rssi, Ordering::Relaxed);
+                        stereo.store(dsp.is_stereo(), Ordering::Relaxed);
+                        // Tenths of a percent of full deviation.
+                        pilot_x10.store((dsp.pilot_level() * 1000.0).round() as i32, Ordering::Relaxed);
 
-                        // Feed speaker
-                        dsp.out[..n].iter().for_each(|x| {
-                            let _ = producer_sp.push(*x);
-                        });
+                        // Feed speaker, one interleaved frame at a time.
+                        for (l, r) in dsp.out_l[..n].iter().zip(dsp.out_r[..n].iter()) {
+                            let _ = producer_sp.push(*l);
+                            let _ = producer_sp.push(*r);
+                        }
 
                         // Feed FFT
                         let _ = producer_fft.write(&buf);

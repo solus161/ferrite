@@ -1,5 +1,5 @@
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, atomic::{AtomicU64, AtomicU32, AtomicI32}};
+use std::sync::{Arc, atomic::{AtomicU64, AtomicU32, AtomicI32, AtomicBool}};
 
 use cpal::{
     Stream,
@@ -8,7 +8,7 @@ use cpal::{
 
 use sdr_core::spmc::RingConsumer;
 
-use crate::source::source::{AUDIO_DECIM, CPAL_BLOCK, IQ_SLOTS};
+use crate::source::source::{AUDIO_CHANNELS, AUDIO_DECIM, CPAL_BLOCK, IQ_SLOTS};
 
 pub struct Speaker {
     stream: Stream,
@@ -27,6 +27,7 @@ impl Speaker {
     pub fn new(
         consumer: RingConsumer<f32, IQ_SLOTS, CPAL_BLOCK>,
         volume_scale: Arc<AtomicU32>,
+        muted: Arc<AtomicBool>,
         underruns: Arc<AtomicU64>,
         ) -> Self {
         let host = cpal::default_host();
@@ -96,6 +97,9 @@ impl Speaker {
                     // usefully change inside 10.7 ms, and a per-sample atomic
                     // read would defeat autovectorisation of the copy loop.
 
+                    let volume = volume_scale.load(Ordering::Relaxed) as f32 / 100.0;
+                    // let muted_flag: f32 = if muted.load(Ordering::Relaxed) { 0.0 } else { 1.0 };
+                    let muted_flag = muted.load(Ordering::Relaxed);
                     for frame in data.chunks_mut(channels) {
                         if pos == CPAL_BLOCK {
                             match consumer.read_into(&mut staging) {
@@ -117,10 +121,27 @@ impl Speaker {
                             }
                         }
 
-                        let s = staging[pos] * volume_scale.load(Ordering::Relaxed) as f32 / 100.0;
-                        pos += 1;
-                        for out in frame.iter_mut() {
-                            *out = s; // mono → every channel
+                        // The ring is L/R interleaved and CPAL_BLOCK is a
+                        // whole number of frames, so `pos` is always on an L.
+                        let (l, r) = (staging[pos] * volume, staging[pos + 1] * volume);
+                        pos += AUDIO_CHANNELS;
+                        if muted_flag {
+                            frame.fill(0.0);
+                        } else {
+                            match frame {
+                                // A mono device gets the downmix, which is
+                                // exactly the old (L+R)/2 output.
+                                [m] => *m = 0.5 * (l + r),
+                                // Front pair carries the programme; anything
+                                // beyond it (centre, LFE, surrounds) stays
+                                // silent rather than doubling L or R.
+                                [fl, fr, rest @ ..] => {
+                                    *fl = l;
+                                    *fr = r;
+                                    rest.fill(0.0);
+                                }
+                                [] => {}
+                            }
                         }
                     }
                 },

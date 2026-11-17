@@ -329,7 +329,7 @@ impl PolyphaseResampler {
             // Advance phase and position
             self.phase += self.decim;
             pos += self.phase / self.interp; // integer div = input samples to skip
-            self.phase = self.phase % self.interp;
+            self.phase %= self.interp;
         }
 
         // Save carry: how far into next input block we already are
@@ -615,6 +615,174 @@ impl Squelch {
     }
 }
 
+/// FM Stereo L-R lives at 23-53kHz of a 300kHz bandwidth.
+/// This one emits a coherent 38kHz reference for the L-R downmix.
+///
+/// The multiplex, with `θ` the pilot phase (FCC 73.322: the 38 kHz subcarrier
+/// crosses zero with positive slope together with the pilot):
+///
+/// ```text
+/// mpx = (L+R)/2  +  p·sin θ  +  (L−R)/2 · sin 2θ  (+ RDS at 57 kHz)
+/// ```
+///
+/// The phase detector is quadrature, not a bare multiply: `mpx` is mixed with
+/// `sin φ` and `cos φ`, both products are low-passed, and the error is
+/// `atan2(Q, I) = θ − φ`. A bare `mpx · cos φ` detector has a gain proportional
+/// to the pilot amplitude `p`, which is 8–10 % of deviation and varies by
+/// station — the loop bandwidth would be ~20× narrower than asked for and
+/// station-dependent. `atan2` makes it exactly 1 rad/rad, and the same `I` is
+/// the pilot-presence measurement for free.
+pub struct PilotPll {
+    /// NCO phase in rad, wrapped to [0, 2π)
+    phase: f32,
+    /// NCO freq rad/sample
+    freq: f32,
+    w_min: f32,
+    w_max: f32,
+    /// PI loop filter
+    alpha: f32,
+    beta: f32,
+    /// Two cascaded one-poles per arm. One pole leaves L+R content near 15 kHz
+    /// (pre-emphasised, so not small) beating against the NCO at ~4 kHz only
+    /// 10× down — comparable to the pilot itself. Two give ~250×, and still
+    /// put only ~14° of lag at the loop's crossover.
+    i_lp: [f32; 2],
+    q_lp: [f32; 2],
+    iq_alpha: f32,
+    /// Smoothed in-phase pilot amplitude. Zero-mean when unlocked, `p/2` when
+    /// locked.
+    lock: f32,
+    lock_alpha: f32,
+    stereo: bool,
+    /// 0 = mono, 1 = full stereo. Ramped, so a lock change fades rather than
+    /// switching the L−R channel in or out mid-waveform.
+    blend: f32,
+    blend_alpha: f32,
+}
+
+impl PilotPll {
+    const PILOT_HZ: f32 = 19_000.0;
+    const DAMPING: f32 = 0.707;
+    /// I/Q arm corner. ~15× the loop's natural frequency at 50 Hz noise
+    /// bandwidth, so the filter barely touches loop dynamics.
+    const IQ_CORNER_HZ: f32 = 250.0;
+    /// Pilot injection, as a fraction of full deviation, at which stereo
+    /// switches on and back off. The spec puts the pilot at 8–10 %; the gap is
+    /// hysteresis so a fade near threshold does not flap.
+    const LOCK_ON: f32 = 0.04;
+    const LOCK_OFF: f32 = 0.025;
+
+    /// `loop_bw_hz` is the one-sided noise bandwidth — how fast the loop
+    /// tracks, and how much of the MPX's own energy it lets through. 50 Hz at
+    /// 300 kHz is a 6000:1 ratio, narrow enough that L+R and RDS average to
+    /// nothing in the detector.
+    ///
+    /// `pull_in_hz` only has to cover the dongle's sample-rate error: at 50 ppm
+    /// a true 19 kHz pilot lands 0.95 Hz off, and the broadcast spec holds the
+    /// pilot itself to ±2 Hz. 100 Hz is generous.
+    pub fn new(sample_rate: f32, loop_bw_hz: f32, pull_in_hz: f32) -> Self {
+        let w0 = std::f32::consts::TAU * Self::PILOT_HZ / sample_rate;
+        let pull = std::f32::consts::TAU * pull_in_hz / sample_rate;
+
+        // Analog prototype, normalised to rad/sample. For a second-order loop
+        // B_n = (ω_n / 2)·(ζ + 1/(4ζ)) with B_n in Hz and ω_n in rad/s, so
+        // ω_n = 2·B_n / (ζ + 1/(4ζ)) — a factor of 2, not 2π. The 1.0607 is
+        // ζ + 1/(4ζ) at ζ = 0.707.
+        let wn = 2.0 * loop_bw_hz
+            / (sample_rate * (Self::DAMPING + 1.0 / (4.0 * Self::DAMPING)));
+
+        let one_pole = |hz: f32| 1.0 - (-std::f32::consts::TAU * hz / sample_rate).exp();
+
+        Self {
+            phase: 0.0,
+            freq: w0,
+            w_min: w0 - pull,
+            w_max: w0 + pull,
+            alpha: 2.0 * Self::DAMPING * wn,
+            beta: wn * wn,
+            i_lp: [0.0; 2],
+            q_lp: [0.0; 2],
+            iq_alpha: one_pole(Self::IQ_CORNER_HZ),
+            lock: 0.0,
+            // ~16 Hz one-pole: fast enough to drop to mono on a station change,
+            // slow enough to ride out a fade.
+            lock_alpha: one_pole(16.0),
+            stereo: false,
+            blend: 0.0,
+            // ~16 ms time constant.
+            blend_alpha: one_pole(10.0),
+        }
+    }
+
+    /// Track the pilot through `mpx` and write the recovered L−R into `diff`,
+    /// still at the MPX rate and not yet low-passed.
+    ///
+    /// `diff[k] = 2 · mpx[k] · sin 2φ · blend`. At lock `φ = θ`, and
+    /// `(L−R)/2 · sin²2θ` averages to `(L−R)/4`, hence the 2: what comes out of
+    /// the caller's 15 kHz low-pass is `(L−R)/2`, the same scale the `(L+R)/2`
+    /// mono channel is already at, so `L = sum + diff` and `R = sum − diff`
+    /// need no further gain. Every other product (L+R at 23–53 kHz, pilot at
+    /// 19 and 57 kHz, RDS at 19 and 95 kHz) lands outside that low-pass.
+    ///
+    /// Unlocked, `blend` is 0 and `diff` is silent, so the matrix degrades to
+    /// mono at exactly the old level.
+    pub fn process(&mut self, mpx: &[f32], diff: &mut [f32]) {
+        assert_eq!(mpx.len(), diff.len());
+        let tau = std::f32::consts::TAU;
+
+        for (&x, d) in mpx.iter().zip(diff.iter_mut()) {
+            let (s, c) = self.phase.sin_cos();
+
+            // x = p·sin θ  →  x·sin φ → (p/2)·cos(θ−φ),  x·cos φ → (p/2)·sin(θ−φ)
+            let a = self.iq_alpha;
+            self.i_lp[0] += a * (x * s - self.i_lp[0]);
+            self.i_lp[1] += a * (self.i_lp[0] - self.i_lp[1]);
+            self.q_lp[0] += a * (x * c - self.q_lp[0]);
+            self.q_lp[1] += a * (self.q_lp[0] - self.q_lp[1]);
+            let (i, q) = (self.i_lp[1], self.q_lp[1]);
+
+            // sin 2φ, from the sin/cos already in hand.
+            *d = 2.0 * x * (2.0 * s * c) * self.blend;
+
+            // θ − φ. Positive means the NCO lags, so step faster.
+            let err = q.atan2(i);
+            // Clamping the integrator is also the anti-windup: off-station it
+            // would otherwise wander without bound on noise.
+            self.freq = (self.freq + self.beta * err).clamp(self.w_min, self.w_max);
+            self.phase += self.freq + self.alpha * err;
+            if self.phase >= tau {
+                self.phase -= tau;
+            } else if self.phase < 0.0 {
+                self.phase += tau;
+            }
+
+            // Lock detector, on the in-phase arm: averages to zero unless the
+            // loop is actually sitting on a pilot.
+            self.lock += self.lock_alpha * (i - self.lock);
+            let level = self.pilot_level();
+            if !self.stereo && level > Self::LOCK_ON {
+                self.stereo = true;
+            } else if self.stereo && level < Self::LOCK_OFF {
+                self.stereo = false;
+            }
+
+            let target = if self.stereo { 1.0 } else { 0.0 };
+            self.blend += self.blend_alpha * (target - self.blend);
+        }
+    }
+
+    /// Whether the decoder is (switching to) stereo. Drives the indicator.
+    pub fn is_stereo(&self) -> bool {
+        self.stereo
+    }
+
+    /// Coherent pilot amplitude as a fraction of full deviation — the stereo
+    /// injection level, ~0.08–0.10 on a well-behaved station.
+    pub fn pilot_level(&self) -> f32 {
+        2.0 * self.lock
+    }
+}
+
 #[cfg(test)]
 mod xlator_tests {
     use super::*;
@@ -675,6 +843,115 @@ mod xlator_tests {
         }
         let m = (x.phase.real.powi(2) + x.phase.img.powi(2)).sqrt();
         assert!((m - 1.0).abs() < 1e-4, "phasor magnitude drifted to {m}");
+    }
+}
+
+#[cfg(test)]
+mod stereo_tests {
+    use super::*;
+
+    const FS: f32 = 300_000.0;
+    const TONE_HZ: f32 = 1_000.0;
+
+    /// Build a stereo MPX with a 1 kHz tone on `left`/`right` at the given
+    /// amplitudes, `pilot` injection, and a pilot slightly off nominal and
+    /// starting at an arbitrary phase — what a real dongle with ppm error hands
+    /// the loop. Phase is accumulated in f64 so the test signal itself has no
+    /// float drift over a second of samples.
+    fn mpx(n: usize, left: f32, right: f32, pilot: f32) -> Vec<f32> {
+        let (mut th, mut ph) = (1.3f64, 0.0f64);
+        let dth = std::f64::consts::TAU * 19_000.7 / FS as f64;
+        let dph = std::f64::consts::TAU * TONE_HZ as f64 / FS as f64;
+        (0..n)
+            .map(|_| {
+                let a = ph.sin() as f32;
+                let (l, r) = (left * a, right * a);
+                let x = 0.5 * (l + r)
+                    + pilot * (th.sin() as f32)
+                    + 0.5 * (l - r) * ((2.0 * th).sin() as f32);
+                th += dth;
+                ph += dph;
+                x
+            })
+            .collect()
+    }
+
+    /// Run `x` through the same chain `DSPFlow` uses — PLL, then twin 4/25
+    /// resamplers — and return (L, R) at 48 kHz.
+    fn decode(x: &[f32], pll: &mut PilotPll) -> (Vec<f32>, Vec<f32>) {
+        let mut taps = create_taps::<1901>(
+            FilterType::Lowpass,
+            15_000.0,
+            1_200_000.0,
+            Window::Kaiser,
+            None,
+        );
+        taps.iter_mut().for_each(|h| *h *= 4.0);
+        let mut rs_sum = PolyphaseResampler::new(4, 25, &taps);
+        let mut rs_diff = PolyphaseResampler::new(4, 25, &taps);
+
+        let (mut l, mut r) = (Vec::new(), Vec::new());
+        let mut diff = [0.0f32; 1024];
+        let (mut s48, mut d48) = ([0.0f32; 164], [0.0f32; 164]);
+        for block in x.chunks_exact(1024) {
+            pll.process(block, &mut diff);
+            let n = rs_sum.process(block, &mut s48);
+            assert_eq!(n, rs_diff.process(&diff, &mut d48));
+            for k in 0..n {
+                l.push(s48[k] + d48[k]);
+                r.push(s48[k] - d48[k]);
+            }
+        }
+        (l, r)
+    }
+
+    fn rms(x: &[f32]) -> f32 {
+        (x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32).sqrt()
+    }
+
+    #[test]
+    fn locks_and_separates_left_only() {
+        let mut pll = PilotPll::new(FS, 50.0, 100.0);
+        let x = mpx(300 * 1024, 0.8, 0.0, 0.09); // ~1 s
+        let (l, r) = decode(&x, &mut pll);
+
+        assert!(pll.is_stereo(), "a 9 % pilot must light the indicator");
+        let level = pll.pilot_level();
+        assert!((level - 0.09).abs() < 0.01, "pilot level read {level}");
+
+        // Last quarter second, well after lock and the blend ramp.
+        let tail = l.len() - 12_000;
+        let (lr, rr) = (rms(&l[tail..]), rms(&r[tail..]));
+        let sep_db = 20.0 * (lr / rr).log10();
+        println!("separation {sep_db:.1} dB, pilot {level:.4}");
+        // 0.8 peak → 0.566 RMS; the left channel must come out at full level.
+        assert!((lr - 0.566).abs() < 0.03, "left RMS {lr}");
+        assert!(sep_db > 30.0, "separation only {sep_db:.1} dB");
+    }
+
+    #[test]
+    fn right_only_lands_on_the_right() {
+        let mut pll = PilotPll::new(FS, 50.0, 100.0);
+        let x = mpx(300 * 1024, 0.0, 0.8, 0.09);
+        let (l, r) = decode(&x, &mut pll);
+        let tail = l.len() - 12_000;
+        assert!(
+            rms(&r[tail..]) > 10.0 * rms(&l[tail..]),
+            "matrix sign is backwards"
+        );
+    }
+
+    /// No pilot: stay mono, emit a silent L−R, and so leave the old mono
+    /// output untouched.
+    #[test]
+    fn no_pilot_stays_mono() {
+        let mut pll = PilotPll::new(FS, 50.0, 100.0);
+        let x = mpx(300 * 1024, 0.8, 0.0, 0.0);
+        let (l, r) = decode(&x, &mut pll);
+        assert!(!pll.is_stereo());
+        let tail = l.len() - 12_000;
+        let d: Vec<f32> = l[tail..].iter().zip(&r[tail..]).map(|(a, b)| a - b).collect();
+        assert!(rms(&d) < 1e-4, "L and R must be identical in mono");
     }
 }
 
