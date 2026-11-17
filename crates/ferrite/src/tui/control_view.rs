@@ -526,6 +526,8 @@ fn rung(ladder: &[u32], cur: u32, dir: i32) -> u32 {
 mod test {
     use super::*;
     use crate::source::source::TUNE_SPAN_HZ;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32};
 
     #[test]
     fn a_ladder_starts_from_the_nearest_rung_and_saturates() {
@@ -562,6 +564,9 @@ mod test {
             0,
             floor_db,
             ceil_db,
+            Arc::new(AtomicU32::new(100)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicI32::new(-30)),
         ))
     }
 

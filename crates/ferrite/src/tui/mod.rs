@@ -1,4 +1,5 @@
 mod colors;
+mod help_view;
 pub mod control_view;
 pub mod info_view;
 mod signal_view;

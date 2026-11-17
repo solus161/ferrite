@@ -16,6 +16,7 @@ use sdr_core::{control_signal::CtrlSignal, fft::Fft};
 use crate::log::{self, Level};
 use crate::tui::colors;
 use crate::tui::control_view::{self, ControlView};
+use crate::tui::help_view::HelpView;
 use crate::tui::info_view::InfoView;
 use crate::tui::status_bar::StatusBar;
 use crate::tui::tui_states::{Health, Pane, TuiStates};
@@ -48,6 +49,10 @@ pub struct Tui<const SLOTS: usize, const BLOCK: usize, const N: usize> {
     info_view: InfoView,
     status_bar: StatusBar,
     status: Option<(Level, String, Instant)>,
+
+    /// Whether the help popup is up. While it is, it takes every key except
+    /// its own close keys and `q`.
+    help: bool,
 
     /// IQ stream buffer, after centered and high-pass filter
     block: [f32; BLOCK],
@@ -97,6 +102,7 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
             info_view,
             status_bar: StatusBar,
             status: None,
+            help: false,
             consumer,
             fft: Fft::new(),
             block: [0.0f32; BLOCK],
@@ -154,7 +160,16 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
             // Raw mode swallows SIGINT, so Ctrl-C has to be handled like any
             // other key or `q` is the only way out.
             KeyCode::Char('c') if ctrl => return self.quit(),
-            KeyCode::Char('q') | KeyCode::Esc => return self.quit(),
+            // Only `q`. Esc used to quit too, and on a handheld it is the key
+            // you hit by accident; it now only closes the help popup.
+            KeyCode::Char('q') => return self.quit(),
+
+            KeyCode::Char('h') => self.help = !self.help,
+            KeyCode::Esc => self.help = false,
+
+            // The popup covers the panels, so a key that changed them would
+            // change something you cannot see.
+            _ if self.help => {}
 
             KeyCode::Tab | KeyCode::BackTab => {
                 self.states
@@ -321,6 +336,11 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
         self.signal_view.gen_marked_labels(true);
         frame.render_widget(&self.signal_view, signal);
         self.status_bar
-            .render(status, frame.buffer_mut(), &self.states, self.status());
+            .render(status, frame.buffer_mut(), self.status());
+
+        // Last, so it sits over everything else.
+        if self.help {
+            HelpView.render(main, frame.buffer_mut());
+        }
     }
 }
