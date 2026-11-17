@@ -89,6 +89,10 @@ pub struct TuiStates {
     /// one; a collapsed panel is a one-row header that gives its height to the
     /// other.
     pub control_open: Rc<Cell<bool>>,
+
+    /// Streaming stopped by `Space`: no RTL samples, no audio, no FFT, and the
+    /// waterfall frozen on its last frame.
+    pub paused: Rc<Cell<bool>>,
     pub info_open: Rc<Cell<bool>>,
 
     /// Bottom of the colour range, in dB. Shared with the signal view.
@@ -131,6 +135,7 @@ impl TuiStates {
             mode: Rc::new(Cell::new(TunerMode::WbFm)),
             focus: Rc::new(Cell::new(Pane::Control)),
             control_open: Rc::new(Cell::new(true)),
+            paused: Rc::new(Cell::new(false)),
             info_open: Rc::new(Cell::new(true)),
             floor_db: Rc::new(Cell::new(floor_db)),
             ceil_db: Rc::new(Cell::new(ceil_db)),
@@ -143,6 +148,7 @@ impl TuiStates {
     get_attr_clone!(tuned_freq, u32);
     get_attr_clone!(floor_db, f32);
     get_attr_clone!(ceil_db, f32);
+    get_attr_clone!(paused, bool);
 
     pub fn set_mode(&self, mode: TunerMode) {
         self.mode.set(mode);

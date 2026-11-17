@@ -12,6 +12,14 @@ use crate::source::source::{AUDIO_CHANNELS, AUDIO_DECIM, CPAL_BLOCK, IQ_SLOTS};
 
 pub struct Speaker {
     stream: Stream,
+    /// Read by the callback: while set it writes silence and leaves the ring
+    /// alone. Needed even though [`pause`](Self::pause) stops the stream,
+    /// because not every backend can pause one.
+    paused: Arc<AtomicBool>,
+    /// Bumped on every resume. The callback compares it with the last value it
+    /// saw and, on a change, skips to the newest audio and stops counting
+    /// underruns until the source is feeding it again.
+    resumes: Arc<AtomicU32>,
     pub rtl_rate: u32,
     pub audio_rate: u32,
 }
@@ -76,6 +84,12 @@ impl Speaker {
         // let volume_scale_clone = volume_scale.clone();
 
         let mut started = false;
+
+        let paused = Arc::new(AtomicBool::new(false));
+        let resumes = Arc::new(AtomicU32::new(0));
+        let (cb_paused, cb_resumes) = (paused.clone(), resumes.clone());
+        let mut seen_resumes = 0;
+
         let stream = device
             .build_output_stream(
                 config,
@@ -96,6 +110,23 @@ impl Speaker {
                     // One load per callback, not per frame: volume cannot
                     // usefully change inside 10.7 ms, and a per-sample atomic
                     // read would defeat autovectorisation of the copy loop.
+
+                    if cb_paused.load(Ordering::Relaxed) {
+                        data.fill(0.0);
+                        return;
+                    }
+
+                    // First callback after a resume. The ring still holds the
+                    // audio from before the pause; skip to the newest, and treat
+                    // the gap until the source restarts like the one at startup
+                    // — starvation, not an underrun.
+                    let r = cb_resumes.load(Ordering::Relaxed);
+                    if r != seen_resumes {
+                        seen_resumes = r;
+                        consumer.seek_latest();
+                        pos = CPAL_BLOCK;
+                        started = false;
+                    }
 
                     let volume = volume_scale.load(Ordering::Relaxed) as f32 / 100.0;
                     // let muted_flag: f32 = if muted.load(Ordering::Relaxed) { 0.0 } else { 1.0 };
@@ -152,8 +183,28 @@ impl Speaker {
 
         Self {
             stream,
+            paused,
+            resumes,
             rtl_rate,
             audio_rate,
+        }
+    }
+
+    /// Stop audio output. Falls back to writing silence if the backend cannot
+    /// pause a stream.
+    pub fn pause(&self) {
+        self.paused.store(true, Ordering::Relaxed);
+        if let Err(e) = self.stream.pause() {
+            log_warn!("audio: cannot pause the stream ({e}); writing silence instead");
+        }
+    }
+
+    /// Restart audio output after [`pause`](Self::pause).
+    pub fn resume(&self) {
+        self.resumes.fetch_add(1, Ordering::Relaxed);
+        self.paused.store(false, Ordering::Relaxed);
+        if let Err(e) = self.stream.play() {
+            log_error!("audio: cannot restart the stream: {e}");
         }
     }
 

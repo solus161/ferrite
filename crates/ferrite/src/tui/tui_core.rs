@@ -16,6 +16,7 @@ use sdr_core::{control_signal::CtrlSignal, fft::Fft};
 use crate::log::{self, Level};
 use crate::tui::colors;
 use crate::tui::control_view::{self, ControlView};
+use crate::speaker::Speaker;
 use crate::tui::help_view::HelpView;
 use crate::tui::info_view::InfoView;
 use crate::tui::status_bar::StatusBar;
@@ -58,6 +59,10 @@ pub struct Tui<const SLOTS: usize, const BLOCK: usize, const N: usize> {
     /// Toggled by `f`.
     fullscreen: bool,
 
+    /// Owned here so `Space` can stop and restart the audio stream. cpal's
+    /// `Stream` stays on the thread that made it, which is this one.
+    speaker: Speaker,
+
     /// Whether the help popup is up. While it is, it takes every key except
     /// its own close keys and `q`.
     help: bool,
@@ -78,6 +83,7 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
         consumer: RingConsumer<f32, SLOTS, BLOCK>,
         ctrl_tx: Sender<CtrlSignal>,
         health: Health,
+        speaker: Speaker,
     ) -> Self {
         // Block size must be x*window size
         const { assert!(BLOCK.is_multiple_of(2 * N)) };
@@ -99,6 +105,7 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
             states.tuned_freq(),
             states.sample_rate(),
             states.audio_rate(),
+            states.paused(),
             health,
         );
 
@@ -112,6 +119,7 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
             status: None,
             help: false,
             fullscreen: false,
+            speaker,
             consumer,
             fft: Fft::new(),
             block: [0.0f32; BLOCK],
@@ -129,7 +137,11 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
     fn event_loop(&mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
         loop {
             let deadline = Instant::now() + FRAME;
-            self.sample();
+            // Paused, the ring holds only stale blocks; reading them would
+            // scroll the waterfall with repeats instead of freezing it.
+            if !self.states.paused.get() {
+                self.sample();
+            }
             self.poll_alert();
             terminal.draw(|f| self.draw(f))?;
 
@@ -183,6 +195,8 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
             // The time axis follows on its own: `draw` rescales it from the
             // waterfall height every frame.
             KeyCode::Char('f') => self.fullscreen = !self.fullscreen,
+
+            KeyCode::Char(' ') => self.toggle_pause(),
 
             // Both act on panels that are not on screen in fullscreen.
             KeyCode::Tab | KeyCode::BackTab | KeyCode::Enter if self.fullscreen => {}
@@ -254,6 +268,26 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
     fn quit(&mut self) -> bool {
         let _ = self.ctrl_tx.send(CtrlSignal::Quit);
         true
+    }
+
+    /// Stop or restart the radio: the RTL stream through the controller, and
+    /// the audio stream here. Device settings changed while paused still go to
+    /// the dongle and are in effect on resume.
+    ///
+    /// Resume starts the source before the speaker, so the audio callback finds
+    /// fresh blocks arriving rather than a ring that is only stale.
+    fn toggle_pause(&mut self) {
+        let paused = !self.states.paused.get();
+        self.states.paused.set(paused);
+        if paused {
+            let _ = self.ctrl_tx.send(CtrlSignal::Pause);
+            self.speaker.pause();
+            self.set_status("Paused");
+        } else {
+            let _ = self.ctrl_tx.send(CtrlSignal::Resume);
+            self.speaker.resume();
+            self.set_status("Resumed");
+        }
     }
 
     /// Post a transient message to the bottom bar. The bar only ever shows

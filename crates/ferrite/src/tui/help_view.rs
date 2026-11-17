@@ -14,11 +14,12 @@ use ratatui::widgets::{Block, Clear, Widget};
 use crate::tui::colors;
 
 /// `(key, what it does)`, in the order shown.
-pub const KEYS: [(&str, &str); 11] = [
+pub const KEYS: [(&str, &str); 12] = [
     ("\u{2191}\u{2193}", "select / scroll"),
     ("\u{2190}\u{2192}", "adjust"),
     ("tab", "switch pane"),
     ("enter", "collapse / expand pane"),
+    ("space", "pause / resume"),
     ("f", "fullscreen waterfall"),
     ("[ ]", "floor -/+"),
     ("v", "spectrum style"),

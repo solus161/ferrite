@@ -235,11 +235,17 @@ fn main() -> Result<(), CustomError> {
         health.pilot_x10.clone(),
         )?;
 
-    let tui =
-        Tui::<IQ_SLOTS, IQ_BLOCK, FFT_N>::new(states, gain_table, consumer_fft, ctrl_tx, health);
-
-    // Let's run the whole thing
+    // Let's run the whole thing. The TUI takes the speaker after starting it,
+    // because pausing has to stop the audio stream too.
     speaker.play()?;
+    let tui = Tui::<IQ_SLOTS, IQ_BLOCK, FFT_N>::new(
+        states,
+        gain_table,
+        consumer_fft,
+        ctrl_tx,
+        health,
+        speaker,
+    );
     let _ = tui.run();
 
     let _ = source_handle.join();

@@ -28,7 +28,7 @@ use crate::tui::colors::{self, CYAN_GLOW, ORANGE_BASE, ORANGE_DANGER, ORANGE_GLO
 use super::tui_states::{Health, UNMEASURED};
 use crate::source::source::IQ_SLOTS;
 
-const ROWS: usize = 9;
+const ROWS: usize = 10;
 
 /// Span of the RSSI bar, in dBFS. Fixed rather than the waterfall's
 /// `[floor, ceil]`: RSSI is *channel* power, ~22 dB above the per-bin level
@@ -41,6 +41,7 @@ pub struct InfoView {
     tuned_freq: Rc<Cell<u32>>,
     sample_rate: Rc<Cell<u32>>,
     audio_rate: Rc<Cell<u32>>,
+    paused: Rc<Cell<bool>>,
     health: Health,
 
     /// First row drawn. A `Cell` because `render` takes `&self` and is the only
@@ -55,6 +56,7 @@ impl InfoView {
         tuned_freq: Rc<Cell<u32>>,
         sample_rate: Rc<Cell<u32>>,
         audio_rate: Rc<Cell<u32>>,
+        paused: Rc<Cell<bool>>,
         health: Health,
     ) -> Self {
         Self {
@@ -62,6 +64,7 @@ impl InfoView {
             tuned_freq,
             sample_rate,
             audio_rate,
+            paused,
             health,
             scroll: Cell::new(0),
         }
@@ -103,6 +106,7 @@ impl InfoView {
         let audio_lag = self.health.ring_audio_lag.load(Relaxed);
         let fft_lag = self.health.ring_fft_lag.load(Relaxed);
         let rows = [
+            ("Radio", state_line(self.paused.get())),
             (
                 "Rate",
                 plain(format!("{:.3} MS/s", self.sample_rate.get() as f64 / 1e6)),
@@ -149,6 +153,17 @@ impl InfoView {
             Line::styled(label, Style::new().fg(colors::LABEL)).render(label_area, buf);
             value.right_aligned().render(value_area, buf);
         }
+    }
+}
+
+/// `▶ live` or `▮▮ paused`. Geometric-shapes glyphs, the same block as the
+/// panel arrows, rather than U+23F8 ⏸ — that one is missing from many console
+/// fonts, including the Linux framebuffer's.
+fn state_line(paused: bool) -> Line<'static> {
+    if paused {
+        Line::styled("\u{25ae}\u{25ae} paused", Style::new().fg(ORANGE_BASE))
+    } else {
+        Line::styled("\u{25b6} live", Style::new().fg(CYAN_GLOW))
     }
 }
 
