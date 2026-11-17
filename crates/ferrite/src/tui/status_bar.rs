@@ -6,7 +6,8 @@
 //!
 //! Hints are per-focused-pane, which is what keeps the line short as controls
 //! are added. A transient status message takes the whole row while it is live —
-//! the log keeps the history, the bar only ever shows the latest.
+//! the bar only ever shows the latest; `--trace` keeps the history. Warnings
+//! and errors arrive here too, styled by level, since there is no log panel.
 
 
 use ratatui::buffer::Buffer;
@@ -15,6 +16,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Widget;
 
+use crate::log::Level;
 use crate::tui::colors;
 use crate::tui::tui_states::{Pane, TuiStates};
 
@@ -29,9 +31,7 @@ const CONTROL_KEYS: [(&str, &str); 7] = [
     ("q", "quit"),
 ];
 
-const LOG_KEYS: [(&str, &str); 4] = [
-    ("\u{2191}\u{2193}", "scroll"),
-    ("g", "tail"),
+const INFO_KEYS: [(&str, &str); 2] = [
     ("tab", "pane"),
     ("q", "quit"),
 ];
@@ -39,23 +39,35 @@ const LOG_KEYS: [(&str, &str); 4] = [
 pub struct StatusBar;
 
 impl StatusBar {
-    pub fn render(&self, area: Rect, buf: &mut Buffer, states: &TuiStates, status: Option<&str>) {
+    pub fn render(
+        &self,
+        area: Rect,
+        buf: &mut Buffer,
+        states: &TuiStates,
+        status: Option<(Level, &str)>,
+    ) {
         if area.is_empty() {
             return;
         }
 
-        if let Some(msg) = status {
-            Line::styled(
-                format!(" {msg}"),
-                Style::new().fg(colors::STATUS_FG).bg(colors::STATUS_BG),
-            )
-            .render(area, buf);
+        if let Some((level, msg)) = status {
+            let style = match level {
+                Level::Info => Style::new().fg(colors::STATUS_FG).bg(colors::STATUS_BG),
+                Level::Warn => Style::new().fg(colors::ALERT_WARN_FG).bg(colors::STATUS_BG),
+                Level::Error => Style::new()
+                    .fg(colors::ALERT_ERROR_FG)
+                    .bg(colors::ALERT_ERROR_BG),
+            };
+            // Paint the whole row first so an error reads as a bar, not as a
+            // short block that stops where the text does.
+            buf.set_style(area, style);
+            Line::styled(format!(" {msg}"), style).render(area, buf);
             return;
         }
 
         let keys: &[(&str, &str)] = match states.focus.get() {
             Pane::Control => &CONTROL_KEYS,
-            Pane::Log => &LOG_KEYS,
+            Pane::Info => &INFO_KEYS,
         };
 
         let mut spans = vec![Span::raw(" ")];

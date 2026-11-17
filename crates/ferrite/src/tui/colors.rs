@@ -181,17 +181,15 @@ pub const STATUS_BG: Color = ORANGE_BASE;
 pub const HINT_KEY: Color = CYAN_BRIGHT;
 pub const HINT_TEXT: Color = TEXT_DIM;
 
-// ── Log levels ──────────────────────────────────────────────────────────────
+// ── Alerts on the status bar ────────────────────────────────────────────────
 // The palette has **no red**. Rather than invent one — a hue from outside is
 // what makes a designed UI look assembled — error escalates by *inversion*:
 // warn is orange text, error is a block of orange. That reads as louder at a
 // glance and costs no new ink.
+pub const ALERT_WARN_FG: Color = ORANGE_BASE;
+pub const ALERT_ERROR_FG: Color = BG_VOID;
+pub const ALERT_ERROR_BG: Color = ORANGE_BASE;
 
-pub const LOG_TIME: Color = TEXT_DIM;
-pub const LOG_INFO: Color = TEXT;
-pub const LOG_WARN: Color = ORANGE_BASE;
-pub const LOG_ERROR_FG: Color = BG_VOID;
-pub const LOG_ERROR_BG: Color = ORANGE_BASE;
 
 // ── Data ────────────────────────────────────────────────────────────────────
 

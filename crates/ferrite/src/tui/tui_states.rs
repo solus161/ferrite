@@ -28,14 +28,14 @@ pub const UNMEASURED: i32 = i32::MIN;
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Pane {
     Control,
-    Log,
+    Info,
 }
 
 impl Pane {
     pub fn next(self) -> Self {
         match self {
-            Pane::Control => Pane::Log,
-            Pane::Log => Pane::Control,
+            Pane::Control => Pane::Info,
+            Pane::Info => Pane::Control,
         }
     }
 }
@@ -89,10 +89,6 @@ pub struct TuiStates {
     pub floor_db: Rc<Cell<f32>>,
     /// Top of the colour range, in dB.
     pub ceil_db: Rc<Cell<f32>>,
-
-    /// Lines the log panel is scrolled back from the newest. 0 follows the
-    /// tail, which is what you want while the radio is running.
-    pub log_scroll: Rc<Cell<usize>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -130,7 +126,6 @@ impl TuiStates {
             focus: Rc::new(Cell::new(Pane::Control)),
             floor_db: Rc::new(Cell::new(floor_db)),
             ceil_db: Rc::new(Cell::new(ceil_db)),
-            log_scroll: Rc::new(Cell::new(0)),
         }
     }
 

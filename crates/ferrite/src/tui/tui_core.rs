@@ -13,10 +13,10 @@ use ratatui::{DefaultTerminal, Frame};
 use sdr_core::spmc::RingConsumer;
 use sdr_core::{control_signal::CtrlSignal, fft::Fft};
 
+use crate::log::{self, Level};
 use crate::tui::colors;
 use crate::tui::control_view::{self, ControlView};
-use crate::tui::info_view::{self, InfoView};
-use crate::tui::log_view::LogView;
+use crate::tui::info_view::InfoView;
 use crate::tui::status_bar::StatusBar;
 use crate::tui::tui_states::{Health, Pane, TuiStates};
 
@@ -46,9 +46,8 @@ pub struct Tui<const SLOTS: usize, const BLOCK: usize, const N: usize> {
     signal_view: SignalView,
     control_view: ControlView,
     info_view: InfoView,
-    log_view: LogView,
     status_bar: StatusBar,
-    status: Option<(String, Instant)>,
+    status: Option<(Level, String, Instant)>,
 
     /// IQ stream buffer, after centered and high-pass filter
     block: [f32; BLOCK],
@@ -96,7 +95,6 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
             states, signal_view,
             control_view,
             info_view,
-            log_view: LogView,
             status_bar: StatusBar,
             status: None,
             consumer,
@@ -117,6 +115,7 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
         loop {
             let deadline = Instant::now() + FRAME;
             self.sample();
+            self.poll_alert();
             terminal.draw(|f| self.draw(f))?;
 
             // After drawing, wait for input till deadline
@@ -133,11 +132,12 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
         }
     }
 
-    pub fn status(&self) -> Option<&str> {
+    pub fn status(&self) -> Option<(Level, &str)> {
         self.status
             .as_ref()
-            .filter(|(_, at)| at.elapsed() < STATUS_TTL)
-            .map(|(t, _)| t.as_str()) }
+            .filter(|(_, _, at)| at.elapsed() < STATUS_TTL)
+            .map(|(level, t, _)| (*level, t.as_str()))
+    }
 
     /// Returns true when the app should exit.
     fn on_key(&mut self, k: KeyEvent) -> bool {
@@ -160,9 +160,6 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
                 self.states
                     .focus
                     .set(self.states.focus.get().next());
-                // A pane you scrolled back through should be showing the tail
-                // again next time you come to it.
-                self.states.log_scroll.set(0);
             }
 
             KeyCode::Up => self.scroll(-1),
@@ -198,9 +195,6 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
                 self.set_status(if muted { "Muted" } else { "Unmuted" });
             }
 
-            // Back to the tail of the log.
-            KeyCode::Char('g') => self.states.log_scroll.set(0),
-
             // A/B the spectrum renderers. Which of blocks and braille reads
             // better depends on the terminal font as much as on the signal, so
             // it is a key rather than a decision taken in the source.
@@ -223,25 +217,25 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
         true
     }
 
-    /// Post a transient message to the bottom bar. The log keeps the history;
-    /// the bar only ever shows the latest.
+    /// Post a transient message to the bottom bar. The bar only ever shows
+    /// the latest; `--trace` keeps the history.
     pub fn set_status(&mut self, text: impl Into<String>) {
-        self.status = Some((text.into(), Instant::now()));
+        self.status = Some((Level::Info, text.into(), Instant::now()));
+    }
+
+    /// Surface the newest warning or error from [`crate::log`] on the bar.
+    /// There is no log panel, so this is the only place one is seen live.
+    fn poll_alert(&mut self) {
+        if let Some((level, text)) = log::take_alert() {
+            self.status = Some((level, text, Instant::now()));
+        }
     }
 
     fn scroll(&mut self, dir: i32) {
         match self.states.focus.get() {
             Pane::Control => self.control_view.select(dir),
-            // Up scrolls *back* through history, which is the direction the
-            // text moves.
-            Pane::Log => {
-                let scroll = self
-                    .states
-                    .log_scroll
-                    .get()
-                    .saturating_add_signed(-dir as isize);
-                self.states.log_scroll.set(scroll);
-            }
+            // Info scrolling lands with the collapsible sidebar.
+            Pane::Info => {}
         }
     }
 
@@ -280,11 +274,10 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
     /// Left column of readouts, signal view filling the rest, one status row
     /// across the bottom.
     ///
-    /// The two panel heights come from the panels themselves, so adding a
-    /// control cannot silently clip the list. The log takes what is left; in a
-    /// terminal too short for all three each panel clips from its own bottom
-    /// rather than squeezing, which keeps the top of every list — the part you
-    /// steer with — on screen.
+    /// Control's height comes from the panel itself, so adding a control cannot
+    /// silently clip the list; Info takes what is left. In a terminal too short
+    /// for both each panel clips from its own bottom rather than squeezing,
+    /// which keeps the top of every list — the part you steer with — on screen.
     fn draw(&mut self, frame: &mut Frame) {
         // Paint the ground before anything else. Without this the panels sit on
         // whatever the terminal's own background happens to be, and a palette
@@ -305,9 +298,8 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
         let [sidebar, signal] =
             Layout::horizontal([Constraint::Length(SIDEBAR), Constraint::Fill(1)]).areas(main);
 
-        let [area_control, area_info, area_log] = Layout::vertical([
+        let [area_control, area_info] = Layout::vertical([
             Constraint::Length(control_view::HEIGHT),
-            Constraint::Length(info_view::HEIGHT),
             Constraint::Fill(1),
         ])
         .areas(sidebar);
@@ -315,18 +307,8 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
         let focus = self.states.focus.get();
         self.control_view
             .render(area_control, frame.buffer_mut(), focus == Pane::Control);
-        self.info_view.render(area_info, frame.buffer_mut());
-
-        // Clamped by the view, which is the only thing that knows how many
-        // lines fit — otherwise a held key winds the counter off past the end
-        // of the history and the pane goes blank.
-        let scroll = self.log_view.render(
-            area_log,
-            frame.buffer_mut(),
-            self.states.log_scroll.get(),
-            focus == Pane::Log,
-        );
-        self.states.log_scroll.set(scroll);
+        self.info_view
+            .render(area_info, frame.buffer_mut(), focus == Pane::Info);
 
         // The waterfall's own height, not the panel's. The time axis is scaled
         // from this, and the panel is taller by the border, the spectrum and

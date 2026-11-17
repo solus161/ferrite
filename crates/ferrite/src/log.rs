@@ -2,70 +2,94 @@
 //!
 //! Once `ratatui::init()` has switched to the alternate screen, stdout *is* the
 //! display: a `println!` is either overwritten by the next frame or shifts the
-//! layout, and `restore()` throws the alternate screen away on exit. So debug
+//! layout, and `restore()` throws the alternate screen away on exit. So log
 //! output has to leave the terminal entirely.
 //!
-//! Two sinks, one for each audience:
+//! Two sinks:
 //!
-//! - [`debug!`] — file only. Firehose; tail it from a second terminal with
-//!   `tail -f ferrite.log`. Truncated on first write, so each run starts clean.
-//!   Override the path with `FERRITE_LOG=/tmp/whatever cargo run -p ferrite`.
-//! - [`log_info!`] / [`log_warn!`] / [`log_error!`] — file *and* the in-TUI log
-//!   panel. For events with a human cause: a retune, a setting the hardware
-//!   silently refused, a device error.
+//! - **Trace file**, only when the app runs with `--trace [path]` (default
+//!   `ferrite.log`). Every macro writes here. Truncated at startup, so each run
+//!   starts clean; tail it from a second terminal with `tail -f ferrite.log`.
+//!   Without `--trace` nothing is written anywhere.
+//! - **Alert slot** — [`log_warn!`] and [`log_error!`] also leave their message
+//!   for the TUI, which flashes it on the status bar. There is no log panel any
+//!   more (it never fit on a small screen), and a warning that only reaches a
+//!   file nobody opened is a warning nobody sees.
+//!
+//! [`debug!`] and [`log_info!`] go to the trace file only.
 //!
 //! # Not from the hot path
 //!
-//! **Nothing on the USB, DSP or audio path may call any of these.** Both sinks
-//! take a mutex and the panel sink allocates a `String`; either can park a
-//! thread that has a hard deadline, which is the exact failure the three-thread
-//! split in PLAN.md §1 exists to prevent. A dropped ring block or an underrun is
-//! counted in an atomic and rendered by the Info panel (PLAN.md R1.3) — "a full
-//! or empty ring is a defect to **measure**", not to narrate. Only the UI and
-//! controller threads log.
+//! **Nothing on the USB, DSP or audio path may call any of these.** The sinks
+//! take a mutex and format a `String`; either can park a thread that has a hard
+//! deadline, which is the exact failure the three-thread split in PLAN.md §1
+//! exists to prevent. A dropped ring block or an underrun is counted in an
+//! atomic and rendered by the Info panel (PLAN.md R1.3) — "a full or empty ring
+//! is a defect to **measure**", not to narrate. Only the UI and controller
+//! threads log.
 
-use std::collections::VecDeque;
 use std::fs::File;
+use std::io::Write;
+use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
-static LOG: OnceLock<Mutex<File>> = OnceLock::new();
+/// `None` when tracing is off. Set once by [`init`]; unset reads as off, so a
+/// log call that somehow runs before `init` is dropped rather than panicking.
+static TRACE: OnceLock<Option<Mutex<File>>> = OnceLock::new();
 
-/// The open log file, created on first use.
-pub fn file() -> &'static Mutex<File> {
-    LOG.get_or_init(|| {
-        let path = std::env::var("FERRITE_LOG").unwrap_or_else(|_| "ferrite.log".into());
-        Mutex::new(File::create(&path).unwrap_or_else(|e| panic!("log: cannot open {path}: {e}")))
-    })
-}
+/// Process start, for the elapsed-time stamp on each line.
+static START: OnceLock<Instant> = OnceLock::new();
 
-/// `println!` that survives the TUI. Same formatting syntax. File only — see
-/// [`log_info!`] for lines that should also reach the panel.
+/// The latest warning or error the TUI has not shown yet. One slot, not a
+/// queue: the status bar only ever shows one message, and a burst of warnings
+/// should end on the newest.
+static ALERT: Mutex<Option<(Level, String)>> = Mutex::new(None);
+
+/// Open the trace file, or turn tracing off. Call once, first thing in `main`.
 ///
-/// Flushed per call so a crash or a `cancel_async_read` on the way out cannot
-/// swallow the last few lines — the point of the thing is usually the last line
-/// before something went wrong.
-#[macro_export]
-macro_rules! debug {
-    ($($arg:tt)*) => {{
-        use std::io::Write;
-        // A panic in one thread mid-write poisons the mutex; recovering the
-        // guard keeps that from cascading into every other logging site.
-        let mut f = $crate::log::file()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let _ = writeln!(f, $($arg)*);
-        let _ = f.flush();
-    }};
+/// With tracing on, also installs a panic hook that writes the panic to the
+/// file. A panic on the controller thread is otherwise invisible: the TUI owns
+/// the screen, so the default hook's message is drawn over or thrown away with
+/// the alternate screen, and the only symptom is every control going dead.
+pub fn init(path: Option<&Path>) -> std::io::Result<()> {
+    START.get_or_init(Instant::now);
+
+    let file = match path {
+        Some(p) => Some(Mutex::new(File::create(p)?)),
+        None => None,
+    };
+    let tracing = file.is_some();
+    let _ = TRACE.set(file);
+
+    if tracing {
+        let default = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let thread = std::thread::current();
+            let name = thread.name().unwrap_or("<unnamed>");
+            write_line(&format!("[PANIC] thread '{name}': {info}"));
+            default(info);
+        }));
+    }
+    Ok(())
 }
 
-// ── In-TUI log panel ────────────────────────────────────────────────────────
+/// Append one line to the trace file, if tracing. Flushed per call so a crash
+/// or a `cancel_async_read` on the way out cannot swallow the last few lines —
+/// the point of a trace is usually the last line before something went wrong.
+pub fn write_line(text: &str) {
+    let Some(Some(file)) = TRACE.get() else {
+        return;
+    };
+    let secs = START.get().map_or(0.0, |s| s.elapsed().as_secs_f64());
+    // A panic in one thread mid-write poisons the mutex; recovering the guard
+    // keeps that from cascading into every other logging site.
+    let mut f = file.lock().unwrap_or_else(|p| p.into_inner());
+    let _ = writeln!(f, "{secs:9.3} {text}");
+    let _ = f.flush();
+}
 
-/// How many entries the panel keeps. Oldest is dropped on overflow — the ring
-/// is a tail, not an archive; `ferrite.log` is the archive.
-const CAPACITY: usize = 512;
-
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Level {
     Info,
     Warn,
@@ -73,8 +97,6 @@ pub enum Level {
 }
 
 impl Level {
-    /// Prefix written to the file. The panel colours instead of prefixing, so
-    /// the narrow left column spends its width on the message.
     pub fn tag(self) -> &'static str {
         match self {
             Level::Info => "INFO",
@@ -84,54 +106,25 @@ impl Level {
     }
 }
 
-pub struct Entry {
-    /// Since process start. Wall-clock would need a date crate for one line of
-    /// formatting, and elapsed is the more useful axis in a log you read while
-    /// watching the radio do something.
-    pub at: Instant,
-    pub level: Level,
-    pub text: String,
-}
-
-struct Ring {
-    entries: VecDeque<Entry>,
-    start: Instant,
-}
-
-static RING: OnceLock<Mutex<Ring>> = OnceLock::new();
-
-fn ring() -> &'static Mutex<Ring> {
-    RING.get_or_init(|| {
-        Mutex::new(Ring {
-            entries: VecDeque::with_capacity(CAPACITY),
-            start: Instant::now(),
-        })
-    })
-}
-
-/// Append to both sinks. Use the [`log_info!`] family rather than calling this.
+/// Use the [`log_info!`] family rather than calling this.
 pub fn record(level: Level, text: String) {
-    debug!("[{}] {}", level.tag(), text);
-
-    let mut r = ring().lock().unwrap_or_else(|p| p.into_inner());
-    if r.entries.len() == CAPACITY {
-        r.entries.pop_front();
+    write_line(&format!("[{}] {}", level.tag(), text));
+    if level != Level::Info {
+        *ALERT.lock().unwrap_or_else(|p| p.into_inner()) = Some((level, text));
     }
-    r.entries.push_back(Entry {
-        at: Instant::now(),
-        level,
-        text,
-    });
 }
 
-/// Read the tail under the lock.
-///
-/// Borrowing rather than cloning keeps a redraw from allocating one `String`
-/// per visible line every frame. The closure runs with the lock held, so it
-/// must only format — never log, and never block.
-pub fn with_entries<R>(f: impl FnOnce(&VecDeque<Entry>, Instant) -> R) -> R {
-    let r = ring().lock().unwrap_or_else(|p| p.into_inner());
-    f(&r.entries, r.start)
+/// Take the pending warning or error, if any. The TUI polls this once a frame.
+pub fn take_alert() -> Option<(Level, String)> {
+    ALERT.lock().unwrap_or_else(|p| p.into_inner()).take()
+}
+
+/// `println!` that survives the TUI. Same formatting syntax. Trace file only.
+#[macro_export]
+macro_rules! debug {
+    ($($arg:tt)*) => {
+        $crate::log::write_line(&format!($($arg)*))
+    };
 }
 
 #[macro_export]

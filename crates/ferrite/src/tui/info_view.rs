@@ -64,12 +64,12 @@ impl InfoView {
         }
     }
 
-    pub fn render(&self, area: Rect, buf: &mut Buffer) {
+    pub fn render(&self, area: Rect, buf: &mut Buffer, focused: bool) {
         let block = Block::bordered()
             .style(colors::pane_card())
             .title("Info")
             .title_style(colors::pane_title())
-            .border_style(colors::pane_border(false));
+            .border_style(colors::pane_border(focused));
         let inner = block.inner(area);
         block.render(area, buf);
 
