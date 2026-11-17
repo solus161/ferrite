@@ -54,6 +54,10 @@ pub struct Tui<const SLOTS: usize, const BLOCK: usize, const N: usize> {
     status_bar: StatusBar,
     status: Option<(Level, String, Instant)>,
 
+    /// Waterfall and spectrum take the whole screen; the sidebar is hidden.
+    /// Toggled by `f`.
+    fullscreen: bool,
+
     /// Whether the help popup is up. While it is, it takes every key except
     /// its own close keys and `q`.
     help: bool,
@@ -107,6 +111,7 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
             status_bar: StatusBar,
             status: None,
             help: false,
+            fullscreen: false,
             consumer,
             fft: Fft::new(),
             block: [0.0f32; BLOCK],
@@ -174,6 +179,13 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
             // The popup covers the panels, so a key that changed them would
             // change something you cannot see.
             _ if self.help => {}
+
+            // The time axis follows on its own: `draw` rescales it from the
+            // waterfall height every frame.
+            KeyCode::Char('f') => self.fullscreen = !self.fullscreen,
+
+            // Both act on panels that are not on screen in fullscreen.
+            KeyCode::Tab | KeyCode::BackTab | KeyCode::Enter if self.fullscreen => {}
 
             KeyCode::Tab | KeyCode::BackTab => {
                 self.states
@@ -259,6 +271,12 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
     }
 
     fn scroll(&mut self, dir: i32) {
+        // Fullscreen hides Info, so ↑↓ always walk the Control fields there —
+        // the status bar shows which one ←→ will change.
+        if self.fullscreen {
+            self.control_view.select(dir);
+            return;
+        }
         match self.states.focus.get() {
             Pane::Control => self.control_view.select(dir),
             Pane::Info => self.info_view.scroll(dir),
@@ -321,28 +339,33 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
         let [main, status] =
             Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(area);
 
-        let [sidebar, signal] =
-            Layout::horizontal([Constraint::Length(SIDEBAR), Constraint::Fill(1)]).areas(main);
+        let signal = if self.fullscreen {
+            main
+        } else {
+            let [sidebar, signal] =
+                Layout::horizontal([Constraint::Length(SIDEBAR), Constraint::Fill(1)]).areas(main);
 
-        let (area_control, area_info) = split_sidebar(
-            sidebar,
-            self.states.control_open.get(),
-            self.states.info_open.get(),
-        );
+            let (area_control, area_info) = split_sidebar(
+                sidebar,
+                self.states.control_open.get(),
+                self.states.info_open.get(),
+            );
 
-        let focus = self.states.focus.get();
-        self.control_view.render(
-            area_control,
-            frame.buffer_mut(),
-            focus == Pane::Control,
-            self.states.control_open.get(),
-        );
-        self.info_view.render(
-            area_info,
-            frame.buffer_mut(),
-            focus == Pane::Info,
-            self.states.info_open.get(),
-        );
+            let focus = self.states.focus.get();
+            self.control_view.render(
+                area_control,
+                frame.buffer_mut(),
+                focus == Pane::Control,
+                self.states.control_open.get(),
+            );
+            self.info_view.render(
+                area_info,
+                frame.buffer_mut(),
+                focus == Pane::Info,
+                self.states.info_open.get(),
+            );
+            signal
+        };
 
         // The waterfall's own height, not the panel's. The time axis is scaled
         // from this, and the panel is taller by the border, the spectrum and
@@ -354,8 +377,11 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
         self.signal_view.waterfall_height = SignalView::layout(signal).water.height as f32;
         self.signal_view.gen_marked_labels(true);
         frame.render_widget(&self.signal_view, signal);
+        // In fullscreen the Control panel is hidden, so the bar keeps the field
+        // ←→ would change on screen instead of only flashing it after a press.
+        let field = self.fullscreen.then(|| self.control_view.focused());
         self.status_bar
-            .render(status, frame.buffer_mut(), self.status());
+            .render(status, frame.buffer_mut(), self.status(), field);
 
         // Last, so it sits over everything else.
         if self.help {

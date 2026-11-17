@@ -29,6 +29,7 @@ impl StatusBar {
         area: Rect,
         buf: &mut Buffer,
         status: Option<(Level, &str)>,
+        field: Option<(&str, String)>,
     ) {
         if area.is_empty() {
             return;
@@ -49,16 +50,59 @@ impl StatusBar {
             return;
         }
 
+        // Fullscreen: the selected Control field on the left, since the panel
+        // that would show it is hidden.
+        if let Some((label, value)) = field {
+            Line::from(vec![
+                Span::styled(" \u{25b8} ", Style::new().fg(colors::FOCUS_BRIGHT)),
+                Span::styled(format!("{label}  "), Style::new().fg(colors::FOCUS)),
+                Span::styled(
+                    value,
+                    Style::new()
+                        .fg(colors::FOCUS_BRIGHT)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ])
+            .render(area, buf);
+        }
+
         Line::from(vec![
-            Span::raw(" "),
             Span::styled(
                 "h",
                 Style::new()
                     .fg(colors::HINT_KEY)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(" help", Style::new().fg(colors::HINT_TEXT)),
+            Span::styled(" help ", Style::new().fg(colors::HINT_TEXT)),
         ])
+        .right_aligned()
         .render(area, buf);
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    fn row(field: Option<(&str, String)>, status: Option<(Level, &str)>) -> String {
+        let area = Rect::new(0, 0, 70, 1);
+        let mut buf = Buffer::empty(area);
+        StatusBar.render(area, &mut buf, status, field);
+        buf.content().iter().map(|c| c.symbol()).collect()
+    }
+
+    /// Fullscreen keeps the selected field and the help hint both on the bar.
+    #[test]
+    fn fullscreen_shows_the_field_and_the_help_hint() {
+        let r = row(Some(("Freq", "90.650 MHz".into())), None);
+        assert!(r.contains("Freq") && r.contains("90.650 MHz"), "{r:?}");
+        assert!(r.trim_end().ends_with("h help"), "{r:?}");
+    }
+
+    /// A transient message takes the whole bar, field or not.
+    #[test]
+    fn a_status_message_replaces_everything() {
+        let r = row(Some(("Freq", "90.650 MHz".into())), Some((Level::Info, "Muted")));
+        assert!(r.contains("Muted") && !r.contains("Freq") && !r.contains("help"), "{r:?}");
     }
 }
