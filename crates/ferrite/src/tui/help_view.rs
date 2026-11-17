@@ -14,10 +14,11 @@ use ratatui::widgets::{Block, Clear, Widget};
 use crate::tui::colors;
 
 /// `(key, what it does)`, in the order shown.
-pub const KEYS: [(&str, &str); 9] = [
+pub const KEYS: [(&str, &str); 10] = [
     ("\u{2191}\u{2193}", "select / scroll"),
     ("\u{2190}\u{2192}", "adjust"),
     ("tab", "switch pane"),
+    ("enter", "collapse / expand pane"),
     ("[ ]", "floor -/+"),
     ("v", "spectrum style"),
     ("m", "mute"),
@@ -27,7 +28,7 @@ pub const KEYS: [(&str, &str); 9] = [
 ];
 
 /// Width of the key column, sized to the longest key plus a gap.
-const KEY_W: u16 = 6;
+const KEY_W: u16 = 7;
 
 pub struct HelpView;
 

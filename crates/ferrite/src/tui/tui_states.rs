@@ -85,6 +85,12 @@ pub struct TuiStates {
     pub mode: Rc<Cell<TunerMode>>,
     pub focus: Rc<Cell<Pane>>,
 
+    /// Whether each sidebar panel is expanded. `Enter` toggles the focused
+    /// one; a collapsed panel is a one-row header that gives its height to the
+    /// other.
+    pub control_open: Rc<Cell<bool>>,
+    pub info_open: Rc<Cell<bool>>,
+
     /// Bottom of the colour range, in dB. Shared with the signal view.
     pub floor_db: Rc<Cell<f32>>,
     /// Top of the colour range, in dB.
@@ -124,6 +130,8 @@ impl TuiStates {
             deemph_us: Rc::new(Cell::new(50)),
             mode: Rc::new(Cell::new(TunerMode::WbFm)),
             focus: Rc::new(Cell::new(Pane::Control)),
+            control_open: Rc::new(Cell::new(true)),
+            info_open: Rc::new(Cell::new(true)),
             floor_db: Rc::new(Cell::new(floor_db)),
             ceil_db: Rc::new(Cell::new(ceil_db)),
         }

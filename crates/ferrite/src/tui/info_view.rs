@@ -28,9 +28,6 @@ use crate::tui::colors::{self, CYAN_GLOW, ORANGE_BASE, ORANGE_DANGER, ORANGE_GLO
 use super::tui_states::{Health, UNMEASURED};
 use crate::source::source::IQ_SLOTS;
 
-/// Rows plus border. Kept beside the row list for the same reason
-/// [`control_view::HEIGHT`](super::control_view::HEIGHT) is.
-pub const HEIGHT: u16 = ROWS as u16 + 2;
 const ROWS: usize = 9;
 
 /// Span of the RSSI bar, in dBFS. Fixed rather than the waterfall's
@@ -45,6 +42,11 @@ pub struct InfoView {
     sample_rate: Rc<Cell<u32>>,
     audio_rate: Rc<Cell<u32>>,
     health: Health,
+
+    /// First row drawn. A `Cell` because `render` takes `&self` and is the only
+    /// place that knows the pane height, so it clamps this there — otherwise a
+    /// held `↓` winds it past the last row and the pane goes blank.
+    scroll: Cell<usize>,
 }
 
 impl InfoView {
@@ -61,17 +63,30 @@ impl InfoView {
             sample_rate,
             audio_rate,
             health,
+            scroll: Cell::new(0),
         }
     }
 
-    pub fn render(&self, area: Rect, buf: &mut Buffer, focused: bool) {
-        let block = Block::bordered()
-            .style(colors::pane_card())
-            .title("Info")
-            .title_style(colors::pane_title())
-            .border_style(colors::pane_border(focused));
-        let inner = block.inner(area);
-        block.render(area, buf);
+    /// `↑`/`↓` while Info has focus. Clamped against the pane at the next render.
+    pub fn scroll(&self, dir: i32) {
+        self.scroll
+            .set(self.scroll.get().saturating_add_signed(dir as isize));
+    }
+
+    /// `open` false draws the collapsed one-row header only.
+    pub fn render(&self, area: Rect, buf: &mut Buffer, focused: bool, open: bool) {
+        if !open {
+            colors::pane_block("Info", focused, false, false, false).render(area, buf);
+            return;
+        }
+
+        let inner = Block::bordered().inner(area);
+        let height = inner.height as usize;
+        let offset = self.scroll.get().min(ROWS.saturating_sub(height));
+        self.scroll.set(offset);
+
+        colors::pane_block("Info", focused, true, offset > 0, offset + height < ROWS)
+            .render(area, buf);
 
         if inner.is_empty() {
             return;
@@ -123,15 +138,13 @@ impl InfoView {
             ),
         ];
 
-        // One terminal row per entry, leftover height left blank rather than
-        // stretched — a readout reads as a list, not as evenly spread lines. In
-        // a pane too short for all of them the trailing rows come back
-        // zero-height and `Line::render` skips them on its own.
-        let areas = Layout::vertical([Constraint::Length(1); ROWS]).split(inner);
-
-        for (r, (label, value)) in areas.iter().zip(rows) {
+        // One terminal row per entry, from the scroll offset down, leftover
+        // height left blank rather than stretched — a readout reads as a list,
+        // not as evenly spread lines.
+        for ((label, value), y) in rows.into_iter().skip(offset).zip(inner.y..inner.bottom()) {
+            let r = Rect::new(inner.x, y, inner.width, 1);
             let [label_area, value_area] =
-                Layout::horizontal([Constraint::Length(LABEL_W), Constraint::Fill(1)]).areas(*r);
+                Layout::horizontal([Constraint::Length(LABEL_W), Constraint::Fill(1)]).areas(r);
 
             Line::styled(label, Style::new().fg(colors::LABEL)).render(label_area, buf);
             value.right_aligned().render(value_area, buf);

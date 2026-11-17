@@ -6,7 +6,7 @@ use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::{DefaultTerminal, Frame};
 
@@ -32,7 +32,11 @@ pub const FRAME: Duration = Duration::from_millis(33);
 /// so every column past what they need belongs to the waterfall, where
 /// resolution is the product. At 200 columns a 30 % split would spend 60 of
 /// them on `Freq 91.500 MHz`.
-const SIDEBAR: u16 = 30;
+///
+/// 24 is the narrowest that still fits a Control row — marker 2, label 8,
+/// value up to `1766.000 MHz` (12), border 2. On a 70-column screen that is
+/// six more columns of waterfall than the old 30.
+const SIDEBAR: u16 = 24;
 
 /// How long a status message stays on the bottom bar before the key hints come
 /// back. Long enough to read, short enough that the bar is not stale.
@@ -177,6 +181,14 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
                     .set(self.states.focus.get().next());
             }
 
+            KeyCode::Enter => {
+                let open = match self.states.focus.get() {
+                    Pane::Control => &self.states.control_open,
+                    Pane::Info => &self.states.info_open,
+                };
+                open.set(!open.get());
+            }
+
             KeyCode::Up => self.scroll(-1),
             KeyCode::Down => self.scroll(1),
 
@@ -249,8 +261,7 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
     fn scroll(&mut self, dir: i32) {
         match self.states.focus.get() {
             Pane::Control => self.control_view.select(dir),
-            // Info scrolling lands with the collapsible sidebar.
-            Pane::Info => {}
+            Pane::Info => self.info_view.scroll(dir),
         }
     }
 
@@ -313,17 +324,25 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
         let [sidebar, signal] =
             Layout::horizontal([Constraint::Length(SIDEBAR), Constraint::Fill(1)]).areas(main);
 
-        let [area_control, area_info] = Layout::vertical([
-            Constraint::Length(control_view::HEIGHT),
-            Constraint::Fill(1),
-        ])
-        .areas(sidebar);
+        let (area_control, area_info) = split_sidebar(
+            sidebar,
+            self.states.control_open.get(),
+            self.states.info_open.get(),
+        );
 
         let focus = self.states.focus.get();
-        self.control_view
-            .render(area_control, frame.buffer_mut(), focus == Pane::Control);
-        self.info_view
-            .render(area_info, frame.buffer_mut(), focus == Pane::Info);
+        self.control_view.render(
+            area_control,
+            frame.buffer_mut(),
+            focus == Pane::Control,
+            self.states.control_open.get(),
+        );
+        self.info_view.render(
+            area_info,
+            frame.buffer_mut(),
+            focus == Pane::Info,
+            self.states.info_open.get(),
+        );
 
         // The waterfall's own height, not the panel's. The time axis is scaled
         // from this, and the panel is taller by the border, the spectrum and
@@ -344,3 +363,63 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
         }
     }
 }
+
+/// Split the sidebar between Control (top) and Info (below it).
+///
+/// A collapsed panel is one row. An open panel whose partner is collapsed takes
+/// everything else. With both open, Control gets its full list height (less
+/// one row, so Info's header always shows) and Info gets the rest — Control is
+/// what you steer with, and both scroll, so whichever is squeezed is still
+/// reachable. Collapsing both leaves the space below them blank.
+fn split_sidebar(area: Rect, control_open: bool, info_open: bool) -> (Rect, Rect) {
+    let h = area.height;
+    let control_h = match (control_open, info_open) {
+        (false, _) => 1,
+        (true, false) => h.saturating_sub(1),
+        (true, true) => control_view::HEIGHT.min(h.saturating_sub(1)),
+    }
+    .min(h);
+    let rest = h - control_h;
+    let info_h = if info_open { rest } else { rest.min(1) };
+
+    let control = Rect { height: control_h, ..area };
+    let info = Rect {
+        y: area.y + control_h,
+        height: info_h,
+        ..area
+    };
+    (control, info)
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    /// The four collapse states at the PocketTerm35's 23 sidebar rows.
+    #[test]
+    fn the_sidebar_splits_by_what_is_open() {
+        let area = Rect::new(0, 0, SIDEBAR, 23);
+        let hs = |c, i| {
+            let (a, b) = split_sidebar(area, c, i);
+            assert_eq!(b.y, a.y + a.height, "Info starts right under Control");
+            (a.height, b.height)
+        };
+
+        assert_eq!(hs(true, true), (control_view::HEIGHT, 23 - control_view::HEIGHT));
+        assert_eq!(hs(true, false), (22, 1));
+        assert_eq!(hs(false, true), (1, 22));
+        assert_eq!(hs(false, false), (1, 1));
+    }
+
+    /// Too short for anything still never overflows the sidebar.
+    #[test]
+    fn a_tiny_sidebar_never_overflows() {
+        for h in 0..5 {
+            for (c, i) in [(true, true), (true, false), (false, true), (false, false)] {
+                let (a, b) = split_sidebar(Rect::new(0, 0, SIDEBAR, h), c, i);
+                assert!(a.height + b.height <= h, "h={h} c={c} i={i}");
+            }
+        }
+    }
+}
+

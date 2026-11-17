@@ -400,9 +400,11 @@ impl ControlView {
             buf.set_style(area, Style::new().bg(colors::BG_SELECTED));
         }
 
+        // 8 for the label: the longest is 7 (`Squelch`, `De-emph`, `Ceiling`).
+        // Every column spared here goes to the waterfall.
         let [marker, label, value] = Layout::horizontal([
             Constraint::Length(2),
-            Constraint::Length(12),
+            Constraint::Length(8),
             Constraint::Fill(1),
         ])
         .areas(area);
@@ -440,47 +442,80 @@ impl ControlView {
             .render(value, buf);
     }
 
-    pub fn render(&self, area: Rect, buf: &mut Buffer, focused_pane: bool) {
-        let block = Block::bordered()
-            .style(colors::pane_card())
-            .title("Control")
-            .title_style(colors::pane_title())
-            .border_style(colors::pane_border(focused_pane));
-        let inner = block.inner(area);
-        block.render(area, buf);
+    /// Every row the panel would draw given unlimited height: section headers
+    /// interleaved with fields, in list order.
+    fn rows() -> impl Iterator<Item = Row> {
+        Field::ALL.iter().enumerate().flat_map(|(i, &f)| {
+            f.section()
+                .map(Row::Header)
+                .into_iter()
+                .chain(std::iter::once(Row::Field(i, f)))
+        })
+    }
+
+    /// First row to draw so the selected field is on screen in a pane `height`
+    /// rows tall.
+    ///
+    /// Stateless — derived from the selection every frame rather than kept as
+    /// a scroll position. The list only ever moves when the cursor would
+    /// otherwise leave it, it pins the cursor to the bottom edge while you walk
+    /// down, and wrapping back to the first field puts the list back at the top
+    /// with its `RADIO` header, without any state to reset.
+    fn scroll_offset(&self, height: usize) -> usize {
+        let sel = Self::rows()
+            .position(|r| matches!(r, Row::Field(i, _) if i == self.selected))
+            .unwrap_or(0);
+        (sel + 1).saturating_sub(height)
+    }
+
+    /// `open` false draws the collapsed one-row header only.
+    pub fn render(&self, area: Rect, buf: &mut Buffer, focused_pane: bool, open: bool) {
+        if !open {
+            colors::pane_block("Control", focused_pane, false, false, false).render(area, buf);
+            return;
+        }
+
+        let inner = Block::bordered().inner(area);
+        let height = inner.height as usize;
+        let total = Self::rows().count();
+        let offset = self.scroll_offset(height);
+
+        colors::pane_block(
+            "Control",
+            focused_pane,
+            true,
+            offset > 0,
+            offset + height < total,
+        )
+        .render(area, buf);
 
         if inner.is_empty() {
             return;
         }
 
-        // Walked with an explicit cursor rather than a `Layout` of fixed rows:
-        // section headers make the row count depend on the list, and running
-        // off the bottom of a short pane should stop drawing, not squeeze.
-        let mut y = inner.y;
-        let mut row = |h: u16| -> Option<Rect> {
-            (y < inner.bottom()).then(|| {
-                let r = Rect::new(inner.x, y, inner.width, h);
-                y += h;
-                r
-            })
-        };
-
-        for (i, &field) in Field::ALL.iter().enumerate() {
-            if let Some(name) = field.section() {
-                let Some(r) = row(1) else { return };
-                Line::styled(
+        for (row, y) in Self::rows().skip(offset).zip(inner.y..inner.bottom()) {
+            let r = Rect::new(inner.x, y, inner.width, 1);
+            match row {
+                Row::Header(name) => Line::styled(
                     name,
                     Style::new()
                         .fg(colors::SECTION)
                         .add_modifier(Modifier::BOLD),
                 )
-                .render(r, buf);
+                .render(r, buf),
+                Row::Field(i, field) => {
+                    self.render_row(r, buf, field, focused_pane && i == self.selected)
+                }
             }
-
-            let Some(r) = row(1) else { return };
-            self.render_row(r, buf, field, focused_pane && i == self.selected);
         }
     }
+}
+
+/// One line of the panel.
+#[derive(Clone, Copy)]
+enum Row {
+    Header(&'static str),
+    Field(usize, Field),
 }
 
 /// Hz in whichever unit keeps the number short. Step and bandwidth span 1 kHz
@@ -644,17 +679,54 @@ mod test {
         for height in 0..=HEIGHT + 4 {
             let area = Rect::new(0, 0, 30, height);
             let mut buf = Buffer::empty(area);
-            v.render(area, &mut buf, true);
+            v.render(area, &mut buf, true, true);
         }
 
         // At full height every field is on screen, in list order.
         let area = Rect::new(0, 0, 30, HEIGHT);
         let mut buf = Buffer::empty(area);
-        v.render(area, &mut buf, true);
+        v.render(area, &mut buf, true, true);
         let text: String = buf.content().iter().map(|c| c.symbol()).collect();
         for f in Field::ALL {
             assert!(text.contains(f.label()), "{} missing", f.label());
         }
+    }
+
+    /// On a short pane the list scrolls so the selected field stays on screen,
+    /// and the bottom border says there is more above.
+    #[test]
+    fn a_short_pane_scrolls_to_keep_the_selection_visible() {
+        let mut v = ControlView::new(states(197, -90.0, 0.0), vec![]);
+        let area = Rect::new(0, 0, 24, 8);
+
+        for _ in 0..Field::ALL.len() {
+            let mut buf = Buffer::empty(area);
+            v.render(area, &mut buf, true, true);
+            let text: String = buf.content().iter().map(|c| c.symbol()).collect();
+            let (label, _) = v.focused();
+            assert!(text.contains(label), "selected {label} scrolled off screen");
+            v.select(1);
+        }
+
+        // Last field selected: scrolled down, so the top is marked.
+        v.select(-1);
+        let mut buf = Buffer::empty(area);
+        v.render(area, &mut buf, true, true);
+        let bottom: String = (0..area.width)
+            .map(|x| buf.cell((x, area.height - 1)).unwrap().symbol())
+            .collect();
+        assert!(bottom.contains('\u{25b2}'), "no ▲ mark: {bottom:?}");
+    }
+
+    /// Collapsed, the panel is one row and draws no fields.
+    #[test]
+    fn a_collapsed_panel_is_a_single_header_row() {
+        let v = ControlView::new(states(197, -90.0, 0.0), vec![]);
+        let area = Rect::new(0, 0, 24, 1);
+        let mut buf = Buffer::empty(area);
+        v.render(area, &mut buf, true, false);
+        let text: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("Control") && !text.contains("Freq"), "{text:?}");
     }
 
     /// The focused row is lifted by a background, not only by its foreground
@@ -667,7 +739,7 @@ mod test {
 
         let area = Rect::new(0, 0, 30, HEIGHT);
         let mut buf = Buffer::empty(area);
-        v.render(area, &mut buf, true);
+        v.render(area, &mut buf, true, true);
 
         // Find the lifted row, then check it is lifted edge to edge.
         let lifted: Vec<u16> = (area.y..area.bottom())
@@ -693,7 +765,7 @@ mod test {
 
         let area = Rect::new(0, 0, 30, HEIGHT);
         let mut buf = Buffer::empty(area);
-        v.render(area, &mut buf, false);
+        v.render(area, &mut buf, false, true);
 
         assert!(
             !buf.content().iter().any(|c| c.bg == colors::BG_SELECTED),
@@ -709,7 +781,7 @@ mod test {
 
         let area = Rect::new(0, 0, 30, HEIGHT);
         let mut buf = Buffer::empty(area);
-        v.render(area, &mut buf, false);
+        v.render(area, &mut buf, false, true);
 
         // A border corner and an interior cell: both belong to the card.
         for (x, y) in [(area.x, area.y), (area.x + 1, area.y + 1)] {
