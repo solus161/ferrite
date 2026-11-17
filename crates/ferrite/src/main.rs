@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32};
 use std::sync::mpsc::channel;
@@ -36,7 +37,35 @@ const DEFAULT_STEP_HZ: u32 = 100_000;
 /// dozens of real-time callbacks.
 const FFT_N: usize = 2048;
 
+/// Where `--trace` writes when it is given no path.
+const DEFAULT_TRACE_PATH: &str = "ferrite.log";
+
+/// `--trace [path]` → `Some(path)`, absent → `None`. The path is optional, so
+/// the next argument counts as one only when it is not itself a flag.
+fn trace_path() -> Option<PathBuf> {
+    let mut args = std::env::args().skip(1).peekable();
+    while let Some(arg) = args.next() {
+        if arg == "--trace" {
+            let path = args
+                .next_if(|next| !next.starts_with('-'))
+                .unwrap_or_else(|| DEFAULT_TRACE_PATH.into());
+            return Some(path.into());
+        }
+    }
+    None
+}
+
 fn main() -> Result<(), CustomError> {
+    // First, so anything that logs during setup — and any panic — is captured.
+    let trace = trace_path();
+    if let Err(e) = log::init(trace.as_deref()) {
+        eprintln!("--trace: cannot open {}: {e}", trace.unwrap().display());
+        std::process::exit(1);
+    }
+    if let Some(p) = &trace {
+        println!("tracing to {}", p.display());
+    }
+
     // ── Device discovery ────────────────────────────────────────────────────
     println!("===RTL-SDR devices===");
     for (i, name) in rtlsdr_mt::devices().enumerate() {
@@ -206,11 +235,17 @@ fn main() -> Result<(), CustomError> {
         health.pilot_x10.clone(),
         )?;
 
-    let tui =
-        Tui::<IQ_SLOTS, IQ_BLOCK, FFT_N>::new(states, gain_table, consumer_fft, ctrl_tx, health);
-
-    // Let's run the whole thing
+    // Let's run the whole thing. The TUI takes the speaker after starting it,
+    // because pausing has to stop the audio stream too.
     speaker.play()?;
+    let tui = Tui::<IQ_SLOTS, IQ_BLOCK, FFT_N>::new(
+        states,
+        gain_table,
+        consumer_fft,
+        ctrl_tx,
+        health,
+        speaker,
+    );
     let _ = tui.run();
 
     let _ = source_handle.join();

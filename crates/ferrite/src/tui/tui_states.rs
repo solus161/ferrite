@@ -28,14 +28,14 @@ pub const UNMEASURED: i32 = i32::MIN;
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Pane {
     Control,
-    Log,
+    Info,
 }
 
 impl Pane {
     pub fn next(self) -> Self {
         match self {
-            Pane::Control => Pane::Log,
-            Pane::Log => Pane::Control,
+            Pane::Control => Pane::Info,
+            Pane::Info => Pane::Control,
         }
     }
 }
@@ -85,14 +85,20 @@ pub struct TuiStates {
     pub mode: Rc<Cell<TunerMode>>,
     pub focus: Rc<Cell<Pane>>,
 
+    /// Whether each sidebar panel is expanded. `Enter` toggles the focused
+    /// one; a collapsed panel is a one-row header that gives its height to the
+    /// other.
+    pub control_open: Rc<Cell<bool>>,
+
+    /// Streaming stopped by `Space`: no RTL samples, no audio, no FFT, and the
+    /// waterfall frozen on its last frame.
+    pub paused: Rc<Cell<bool>>,
+    pub info_open: Rc<Cell<bool>>,
+
     /// Bottom of the colour range, in dB. Shared with the signal view.
     pub floor_db: Rc<Cell<f32>>,
     /// Top of the colour range, in dB.
     pub ceil_db: Rc<Cell<f32>>,
-
-    /// Lines the log panel is scrolled back from the newest. 0 follows the
-    /// tail, which is what you want while the radio is running.
-    pub log_scroll: Rc<Cell<usize>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -128,9 +134,11 @@ impl TuiStates {
             deemph_us: Rc::new(Cell::new(50)),
             mode: Rc::new(Cell::new(TunerMode::WbFm)),
             focus: Rc::new(Cell::new(Pane::Control)),
+            control_open: Rc::new(Cell::new(true)),
+            paused: Rc::new(Cell::new(false)),
+            info_open: Rc::new(Cell::new(true)),
             floor_db: Rc::new(Cell::new(floor_db)),
             ceil_db: Rc::new(Cell::new(ceil_db)),
-            log_scroll: Rc::new(Cell::new(0)),
         }
     }
 
@@ -140,6 +148,7 @@ impl TuiStates {
     get_attr_clone!(tuned_freq, u32);
     get_attr_clone!(floor_db, f32);
     get_attr_clone!(ceil_db, f32);
+    get_attr_clone!(paused, bool);
 
     pub fn set_mode(&self, mode: TunerMode) {
         self.mode.set(mode);

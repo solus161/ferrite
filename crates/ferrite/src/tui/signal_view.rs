@@ -54,6 +54,14 @@ const BRAILLE_BASE: u32 = 0x2800;
 /// will draw. Fewer are drawn when the pane is too short to hold them all.
 const MARKS: usize = 6;
 
+/// Labels on the frequency axis: the two edges of the span and the centre.
+///
+/// Three, not six. At 70 columns the plot is ~40 wide in the split layout and
+/// six `91.000`s do not fit, so the old thinning dropped labels in an order
+/// that changed with the width. Edges and centre are the three a reader
+/// actually uses: where the span starts, where the LO is, where it ends.
+const FREQ_MARKS: usize = 3;
+
 /// Columns reserved for a vertical axis: four for the number, one for the tick.
 /// Wide enough for `-100` and for a negative time in tenths.
 const Y_AXIS_WIDTH: u16 = 5;
@@ -154,8 +162,8 @@ pub struct SignalView {
     /// Read for the frequency axis only; the spectra themselves arrive through
     /// `push`.
 
-    /// 4 segments, 5 values
-    water_xaxis_labels: [f32; 6],
+    /// Left edge, centre, right edge of the span, in Hz.
+    water_xaxis_labels: [f32; FREQ_MARKS],
 
     /// Preallocated arrays labels for waterfall timelapse axis
     /// 5 segments, 6 values
@@ -206,7 +214,7 @@ impl SignalView {
             sample_rate,
             floor_db: (floor_db, floor_db_old),
             ceil_db: (ceil_db, ceil_db_old),
-            water_xaxis_labels: array::from_fn(|_| 0.0f32),
+            water_xaxis_labels: [0.0; FREQ_MARKS],
             water_yaxis_labels: array::from_fn(|_| 0.0f32),
             spec_yaxis_labels: array::from_fn(|_| 0.0f32), waterfall_height: 0.0,
             style: SpectrumStyle::BrailleFill,
@@ -480,77 +488,47 @@ impl SignalView {
     /// below.
     ///
     /// `post_process` rotates DC to the middle, so the display spans
-    /// `center ± sample_rate/2`, and the labels are the *bounds* of that span:
-    /// the first names the plot's left edge and the last its right edge.
+    /// `center ± sample_rate/2`. The labels are those bounds and the centre:
+    /// the first flush with the plot's left edge, the last flush with its right
+    /// edge, the centre on the middle column — the same column
+    /// [`freq_col`](Self::freq_col) puts the centre cursor in, so the LO label
+    /// sits under its ▼.
     ///
-    /// So they are placed at their true fractional position across the plot and
-    /// **not** centred in equal columns. Equal columns put the first label at
-    /// 1/12 of the width and the last at 11/12 — around 8 % in from each end,
-    /// which on a waterfall reads as the whole scale being offset. The two ends
-    /// are clamped rather than centred: the first is flush left, the last flush
-    /// right, and only the interior ones are centred on their tick. That is
-    /// what makes the axis agree with the pixels above it.
+    /// Two decimals: 10 kHz resolution is finer than a cell is wide at any
+    /// usable terminal width (2.4 MHz over even 200 columns is 12 kHz a cell),
+    /// and the dropped digit is a column back for the gaps.
+    ///
+    /// When the three would touch, only the centre is drawn — the one label
+    /// that still says where the span is.
     fn render_mhz_axis(&self, area: Rect, buf: &mut Buffer) {
         if area.is_empty() {
             return;
         }
-
-        // `water_xaxis_labels` — the frequency array. Reading `water_yaxis_labels`
-        // here put the waterfall's *time* range on the frequency scale, and
-        // since that range is derived from `waterfall_height`, which is zero
-        // until `draw` has laid the pane out, every label came out `0.000`.
-        let labels = &self.water_xaxis_labels;
         let width = area.width as usize;
+        let fmt = |hz: f32| format!("{:.2}", hz as f64 / 1e6);
+        let [lo, mid, hi] = self.water_xaxis_labels.map(fmt);
 
-        let fmt = |hz: f32| format!("{:.3}", hz as f64 / 1e6);
+        // Leftmost cell of each label.
+        let mid_x = (width / 2).saturating_sub(mid.len() / 2);
+        let hi_x = width.saturating_sub(hi.len());
 
-        // The longest label decides how many fit. A fixed count overlaps as
-        // soon as the pane narrows or the tuner passes 100 MHz and every label
-        // gains a digit — and two frequencies printed over each other are worse
-        // than one frequency printed alone.
-        let widest = labels.iter().map(|hz| fmt(*hz).len()).max().unwrap_or(0);
-        if widest == 0 || widest > width {
-            return;
+        // A one-cell gap either side of the centre label, or the ends go.
+        let all_fit = lo.len() < mid_x && mid_x + mid.len() < hi_x;
+
+        let mut put = |text: &str, x: usize| {
+            if x + text.len() <= width {
+                Line::styled(text.to_string(), Style::new().fg(colors::LABEL)).render(
+                    Rect::new(area.x + x as u16, area.y, text.len() as u16, 1),
+                    buf,
+                );
+            }
+        };
+
+        if all_fit {
+            put(&lo, 0);
+            put(&hi, hi_x);
         }
-
-        // How many fit, given that the two ends are clamped rather than centred.
-        //
-        // The clamp is what costs the extra room: the first label's tick is at
-        // column 0 but its text runs to `widest`, so its neighbour — centred on
-        // its own tick — has to start at least `1.5 × widest + 1` along. That,
-        // not `widest + 1`, is the binding constraint; using the naive spacing
-        // let the first two labels touch (`89.80090.400`) at exactly the widths
-        // where the axis is most cramped. The same bound falls out at the right
-        // end by symmetry, and the interior only needs `widest + 1`.
-        let min_spacing = widest + widest / 2 + 1;
-        let shown = MARKS.min((width - 1) / min_spacing + 1);
-        if shown < 2 {
-            return;
-        }
-
-        // Interpolated across the span, not indexed out of the array — the same
-        // trap as the vertical axes: picking `j * (MARKS - 1) / (shown - 1)`
-        // gives 0, 1, 3, 5 for four of six, which is one narrow gap and two
-        // wide ones.
-        let (lo, hi) = (labels[0], labels[MARKS - 1]);
-
-        for j in 0..shown {
-            let t = j as f32 / (shown - 1) as f32;
-            let text = fmt(lo + (hi - lo) * t);
-            let len = text.len();
-
-            // The tick this label names, then the leftmost cell that centres
-            // the text on it, clamped so neither end runs off the plot. The
-            // clamp is what makes the first label flush left and the last
-            // flush right.
-            let tick = j * (width - 1) / (shown - 1);
-            let x = tick.saturating_sub(len / 2).min(width - len);
-
-            Line::styled(text, Style::new().fg(colors::LABEL)).render(
-                Rect::new(area.x + x as u16, area.y, len as u16, 1),
-                buf,
-            );
-        }
+        put(&mid, mid_x);
     }
 
     /// One vertical axis in a [`Y_AXIS_WIDTH`] gutter.
@@ -1013,15 +991,17 @@ mod braille_tests {
                 "w={w}: last label is not flush with the right edge: {row:?}"
             );
 
-            // 89.800 and 92.200 are the span bounds for 91 MHz at 2.4 MS/s.
-            assert!(row.contains("89.800") && row.contains("92.200"), "w={w}: {row:?}");
+            // The span bounds and centre for 91 MHz at 2.4 MS/s, two decimals.
+            assert!(
+                row.contains("89.80") && row.contains("91.00") && row.contains("92.20"),
+                "w={w}: {row:?}"
+            );
+            assert_eq!(row.split_whitespace().count(), 3, "w={w}: {row:?}");
         }
     }
 
-    /// Labels must never touch. The two ends are clamped rather than centred,
-    /// which steals room from their neighbours — sizing the gap as `widest + 1`
-    /// instead of `1.5 x widest + 1` let the first two run together as
-    /// `89.80090.400` at exactly the widths where the axis is most cramped.
+    /// Labels must never touch. Too narrow for all three, the ends go and the
+    /// centre stays.
     #[test]
     fn frequency_labels_never_run_together() {
         for w in 20u16..80 {
@@ -1044,10 +1024,11 @@ mod braille_tests {
             for chunk in row.split_whitespace() {
                 assert_eq!(
                     chunk.len(),
-                    6,
+                    5,
                     "w={w}: two labels ran together as {chunk:?} in {row:?}"
                 );
             }
+            assert!(row.contains("91.00"), "w={w}: the centre must always show: {row:?}");
         }
     }
 
@@ -1083,6 +1064,35 @@ mod braille_tests {
         // still at the baseline: dot 7 plus the whole left column.
         assert_eq!(g[1], '\u{28C7}', "carrier should fill only the left dots");
         assert_eq!(g[0], '\u{28C0}', "and leave its neighbours at the floor");
+    }
+
+    /// The centre label sits under the centre cursor, at every width.
+    #[test]
+    fn the_centre_label_sits_under_the_centre_cursor() {
+        for w in 20u16..120 {
+            let area = Rect::new(0, 0, w, 12);
+            let v = SignalView::new(
+                BINS,
+                8,
+                Rc::new(Cell::new(91_000_000)),
+                Rc::new(Cell::new(91_350_000)),
+                Rc::new(Cell::new(2_400_000)),
+                Rc::new(Cell::new(FLOOR)),
+                Rc::new(Cell::new(CEIL)),
+            );
+            let l = SignalView::layout(area);
+            let mut buf = Buffer::empty(area);
+            v.render_mhz_axis(l.freq_axis, &mut buf);
+
+            let cursor = v.freq_col(91_000_000, l.freq_axis.width).unwrap();
+            let row = row_text(&buf, l.freq_axis.y, w);
+            let start = row.find("91.00").unwrap() - l.freq_axis.x as usize;
+            assert!(
+                (start..start + 5).contains(&(cursor as usize)),
+                "w={w}: cursor at {cursor}, label at {start}..{}: {row:?}",
+                start + 5
+            );
+        }
     }
 
     /// The two cursors are the only thing tying the waterfall to what is

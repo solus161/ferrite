@@ -34,5 +34,12 @@ pub enum CtrlSignal {
     AgcOn,
     /// Signed: most dongles need a negative correction.
     Ppm(i32),
+    /// Stop streaming from the dongle. The controller cancels the async read;
+    /// the reader thread parks until [`Resume`](CtrlSignal::Resume) or
+    /// [`Quit`](CtrlSignal::Quit). Device settings sent while paused still
+    /// apply, and are in effect when streaming restarts.
+    Pause,
+    /// Restart streaming after a [`Pause`](CtrlSignal::Pause).
+    Resume,
     Quit,
 }

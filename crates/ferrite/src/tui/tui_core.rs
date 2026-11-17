@@ -6,17 +6,19 @@ use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::{DefaultTerminal, Frame};
 
 use sdr_core::spmc::RingConsumer;
 use sdr_core::{control_signal::CtrlSignal, fft::Fft};
 
+use crate::log::{self, Level};
 use crate::tui::colors;
 use crate::tui::control_view::{self, ControlView};
-use crate::tui::info_view::{self, InfoView};
-use crate::tui::log_view::LogView;
+use crate::speaker::Speaker;
+use crate::tui::help_view::HelpView;
+use crate::tui::info_view::InfoView;
 use crate::tui::status_bar::StatusBar;
 use crate::tui::tui_states::{Health, Pane, TuiStates};
 
@@ -31,7 +33,11 @@ pub const FRAME: Duration = Duration::from_millis(33);
 /// so every column past what they need belongs to the waterfall, where
 /// resolution is the product. At 200 columns a 30 % split would spend 60 of
 /// them on `Freq 91.500 MHz`.
-const SIDEBAR: u16 = 30;
+///
+/// 24 is the narrowest that still fits a Control row — marker 2, label 8,
+/// value up to `1766.000 MHz` (12), border 2. On a 70-column screen that is
+/// six more columns of waterfall than the old 30.
+const SIDEBAR: u16 = 24;
 
 /// How long a status message stays on the bottom bar before the key hints come
 /// back. Long enough to read, short enough that the bar is not stale.
@@ -46,9 +52,20 @@ pub struct Tui<const SLOTS: usize, const BLOCK: usize, const N: usize> {
     signal_view: SignalView,
     control_view: ControlView,
     info_view: InfoView,
-    log_view: LogView,
     status_bar: StatusBar,
-    status: Option<(String, Instant)>,
+    status: Option<(Level, String, Instant)>,
+
+    /// Waterfall and spectrum take the whole screen; the sidebar is hidden.
+    /// Toggled by `f`.
+    fullscreen: bool,
+
+    /// Owned here so `Space` can stop and restart the audio stream. cpal's
+    /// `Stream` stays on the thread that made it, which is this one.
+    speaker: Speaker,
+
+    /// Whether the help popup is up. While it is, it takes every key except
+    /// its own close keys and `q`.
+    help: bool,
 
     /// IQ stream buffer, after centered and high-pass filter
     block: [f32; BLOCK],
@@ -66,6 +83,7 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
         consumer: RingConsumer<f32, SLOTS, BLOCK>,
         ctrl_tx: Sender<CtrlSignal>,
         health: Health,
+        speaker: Speaker,
     ) -> Self {
         // Block size must be x*window size
         const { assert!(BLOCK.is_multiple_of(2 * N)) };
@@ -87,6 +105,7 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
             states.tuned_freq(),
             states.sample_rate(),
             states.audio_rate(),
+            states.paused(),
             health,
         );
 
@@ -96,9 +115,11 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
             states, signal_view,
             control_view,
             info_view,
-            log_view: LogView,
             status_bar: StatusBar,
             status: None,
+            help: false,
+            fullscreen: false,
+            speaker,
             consumer,
             fft: Fft::new(),
             block: [0.0f32; BLOCK],
@@ -116,7 +137,12 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
     fn event_loop(&mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
         loop {
             let deadline = Instant::now() + FRAME;
-            self.sample();
+            // Paused, the ring holds only stale blocks; reading them would
+            // scroll the waterfall with repeats instead of freezing it.
+            if !self.states.paused.get() {
+                self.sample();
+            }
+            self.poll_alert();
             terminal.draw(|f| self.draw(f))?;
 
             // After drawing, wait for input till deadline
@@ -133,11 +159,12 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
         }
     }
 
-    pub fn status(&self) -> Option<&str> {
+    pub fn status(&self) -> Option<(Level, &str)> {
         self.status
             .as_ref()
-            .filter(|(_, at)| at.elapsed() < STATUS_TTL)
-            .map(|(t, _)| t.as_str()) }
+            .filter(|(_, _, at)| at.elapsed() < STATUS_TTL)
+            .map(|(level, t, _)| (*level, t.as_str()))
+    }
 
     /// Returns true when the app should exit.
     fn on_key(&mut self, k: KeyEvent) -> bool {
@@ -154,15 +181,38 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
             // Raw mode swallows SIGINT, so Ctrl-C has to be handled like any
             // other key or `q` is the only way out.
             KeyCode::Char('c') if ctrl => return self.quit(),
-            KeyCode::Char('q') | KeyCode::Esc => return self.quit(),
+            // Only `q`. Esc used to quit too, and on a handheld it is the key
+            // you hit by accident; it now only closes the help popup.
+            KeyCode::Char('q') => return self.quit(),
+
+            KeyCode::Char('h') => self.help = !self.help,
+            KeyCode::Esc => self.help = false,
+
+            // The popup covers the panels, so a key that changed them would
+            // change something you cannot see.
+            _ if self.help => {}
+
+            // The time axis follows on its own: `draw` rescales it from the
+            // waterfall height every frame.
+            KeyCode::Char('f') => self.fullscreen = !self.fullscreen,
+
+            KeyCode::Char(' ') => self.toggle_pause(),
+
+            // Both act on panels that are not on screen in fullscreen.
+            KeyCode::Tab | KeyCode::BackTab | KeyCode::Enter if self.fullscreen => {}
 
             KeyCode::Tab | KeyCode::BackTab => {
                 self.states
                     .focus
                     .set(self.states.focus.get().next());
-                // A pane you scrolled back through should be showing the tail
-                // again next time you come to it.
-                self.states.log_scroll.set(0);
+            }
+
+            KeyCode::Enter => {
+                let open = match self.states.focus.get() {
+                    Pane::Control => &self.states.control_open,
+                    Pane::Info => &self.states.info_open,
+                };
+                open.set(!open.get());
             }
 
             KeyCode::Up => self.scroll(-1),
@@ -198,9 +248,6 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
                 self.set_status(if muted { "Muted" } else { "Unmuted" });
             }
 
-            // Back to the tail of the log.
-            KeyCode::Char('g') => self.states.log_scroll.set(0),
-
             // A/B the spectrum renderers. Which of blocks and braille reads
             // better depends on the terminal font as much as on the signal, so
             // it is a key rather than a decision taken in the source.
@@ -223,25 +270,50 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
         true
     }
 
-    /// Post a transient message to the bottom bar. The log keeps the history;
-    /// the bar only ever shows the latest.
+    /// Stop or restart the radio: the RTL stream through the controller, and
+    /// the audio stream here. Device settings changed while paused still go to
+    /// the dongle and are in effect on resume.
+    ///
+    /// Resume starts the source before the speaker, so the audio callback finds
+    /// fresh blocks arriving rather than a ring that is only stale.
+    fn toggle_pause(&mut self) {
+        let paused = !self.states.paused.get();
+        self.states.paused.set(paused);
+        if paused {
+            let _ = self.ctrl_tx.send(CtrlSignal::Pause);
+            self.speaker.pause();
+            self.set_status("Paused");
+        } else {
+            let _ = self.ctrl_tx.send(CtrlSignal::Resume);
+            self.speaker.resume();
+            self.set_status("Resumed");
+        }
+    }
+
+    /// Post a transient message to the bottom bar. The bar only ever shows
+    /// the latest; `--trace` keeps the history.
     pub fn set_status(&mut self, text: impl Into<String>) {
-        self.status = Some((text.into(), Instant::now()));
+        self.status = Some((Level::Info, text.into(), Instant::now()));
+    }
+
+    /// Surface the newest warning or error from [`crate::log`] on the bar.
+    /// There is no log panel, so this is the only place one is seen live.
+    fn poll_alert(&mut self) {
+        if let Some((level, text)) = log::take_alert() {
+            self.status = Some((level, text, Instant::now()));
+        }
     }
 
     fn scroll(&mut self, dir: i32) {
+        // Fullscreen hides Info, so ↑↓ always walk the Control fields there —
+        // the status bar shows which one ←→ will change.
+        if self.fullscreen {
+            self.control_view.select(dir);
+            return;
+        }
         match self.states.focus.get() {
             Pane::Control => self.control_view.select(dir),
-            // Up scrolls *back* through history, which is the direction the
-            // text moves.
-            Pane::Log => {
-                let scroll = self
-                    .states
-                    .log_scroll
-                    .get()
-                    .saturating_add_signed(-dir as isize);
-                self.states.log_scroll.set(scroll);
-            }
+            Pane::Info => self.info_view.scroll(dir),
         }
     }
 
@@ -280,11 +352,10 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
     /// Left column of readouts, signal view filling the rest, one status row
     /// across the bottom.
     ///
-    /// The two panel heights come from the panels themselves, so adding a
-    /// control cannot silently clip the list. The log takes what is left; in a
-    /// terminal too short for all three each panel clips from its own bottom
-    /// rather than squeezing, which keeps the top of every list — the part you
-    /// steer with — on screen.
+    /// Control's height comes from the panel itself, so adding a control cannot
+    /// silently clip the list; Info takes what is left. In a terminal too short
+    /// for both each panel clips from its own bottom rather than squeezing,
+    /// which keeps the top of every list — the part you steer with — on screen.
     fn draw(&mut self, frame: &mut Frame) {
         // Paint the ground before anything else. Without this the panels sit on
         // whatever the terminal's own background happens to be, and a palette
@@ -302,31 +373,33 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
         let [main, status] =
             Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(area);
 
-        let [sidebar, signal] =
-            Layout::horizontal([Constraint::Length(SIDEBAR), Constraint::Fill(1)]).areas(main);
+        let signal = if self.fullscreen {
+            main
+        } else {
+            let [sidebar, signal] =
+                Layout::horizontal([Constraint::Length(SIDEBAR), Constraint::Fill(1)]).areas(main);
 
-        let [area_control, area_info, area_log] = Layout::vertical([
-            Constraint::Length(control_view::HEIGHT),
-            Constraint::Length(info_view::HEIGHT),
-            Constraint::Fill(1),
-        ])
-        .areas(sidebar);
+            let (area_control, area_info) = split_sidebar(
+                sidebar,
+                self.states.control_open.get(),
+                self.states.info_open.get(),
+            );
 
-        let focus = self.states.focus.get();
-        self.control_view
-            .render(area_control, frame.buffer_mut(), focus == Pane::Control);
-        self.info_view.render(area_info, frame.buffer_mut());
-
-        // Clamped by the view, which is the only thing that knows how many
-        // lines fit — otherwise a held key winds the counter off past the end
-        // of the history and the pane goes blank.
-        let scroll = self.log_view.render(
-            area_log,
-            frame.buffer_mut(),
-            self.states.log_scroll.get(),
-            focus == Pane::Log,
-        );
-        self.states.log_scroll.set(scroll);
+            let focus = self.states.focus.get();
+            self.control_view.render(
+                area_control,
+                frame.buffer_mut(),
+                focus == Pane::Control,
+                self.states.control_open.get(),
+            );
+            self.info_view.render(
+                area_info,
+                frame.buffer_mut(),
+                focus == Pane::Info,
+                self.states.info_open.get(),
+            );
+            signal
+        };
 
         // The waterfall's own height, not the panel's. The time axis is scaled
         // from this, and the panel is taller by the border, the spectrum and
@@ -338,7 +411,75 @@ impl<const SLOTS: usize, const BLOCK: usize, const N: usize> Tui<SLOTS, BLOCK, N
         self.signal_view.waterfall_height = SignalView::layout(signal).water.height as f32;
         self.signal_view.gen_marked_labels(true);
         frame.render_widget(&self.signal_view, signal);
+        // In fullscreen the Control panel is hidden, so the bar keeps the field
+        // ←→ would change on screen instead of only flashing it after a press.
+        let field = self.fullscreen.then(|| self.control_view.focused());
         self.status_bar
-            .render(status, frame.buffer_mut(), &self.states, self.status());
+            .render(status, frame.buffer_mut(), self.status(), field);
+
+        // Last, so it sits over everything else.
+        if self.help {
+            HelpView.render(main, frame.buffer_mut());
+        }
     }
 }
+
+/// Split the sidebar between Control (top) and Info (below it).
+///
+/// A collapsed panel is one row. An open panel whose partner is collapsed takes
+/// everything else. With both open, Control gets its full list height (less
+/// one row, so Info's header always shows) and Info gets the rest — Control is
+/// what you steer with, and both scroll, so whichever is squeezed is still
+/// reachable. Collapsing both leaves the space below them blank.
+fn split_sidebar(area: Rect, control_open: bool, info_open: bool) -> (Rect, Rect) {
+    let h = area.height;
+    let control_h = match (control_open, info_open) {
+        (false, _) => 1,
+        (true, false) => h.saturating_sub(1),
+        (true, true) => control_view::HEIGHT.min(h.saturating_sub(1)),
+    }
+    .min(h);
+    let rest = h - control_h;
+    let info_h = if info_open { rest } else { rest.min(1) };
+
+    let control = Rect { height: control_h, ..area };
+    let info = Rect {
+        y: area.y + control_h,
+        height: info_h,
+        ..area
+    };
+    (control, info)
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    /// The four collapse states at the PocketTerm35's 23 sidebar rows.
+    #[test]
+    fn the_sidebar_splits_by_what_is_open() {
+        let area = Rect::new(0, 0, SIDEBAR, 23);
+        let hs = |c, i| {
+            let (a, b) = split_sidebar(area, c, i);
+            assert_eq!(b.y, a.y + a.height, "Info starts right under Control");
+            (a.height, b.height)
+        };
+
+        assert_eq!(hs(true, true), (control_view::HEIGHT, 23 - control_view::HEIGHT));
+        assert_eq!(hs(true, false), (22, 1));
+        assert_eq!(hs(false, true), (1, 22));
+        assert_eq!(hs(false, false), (1, 1));
+    }
+
+    /// Too short for anything still never overflows the sidebar.
+    #[test]
+    fn a_tiny_sidebar_never_overflows() {
+        for h in 0..5 {
+            for (c, i) in [(true, true), (true, false), (false, true), (false, false)] {
+                let (a, b) = split_sidebar(Rect::new(0, 0, SIDEBAR, h), c, i);
+                assert!(a.height + b.height <= h, "h={h} c={c} i={i}");
+            }
+        }
+    }
+}
+

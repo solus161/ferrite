@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::{Condvar, Mutex};
 use std::sync::mpsc::Receiver;
 use std::{ array,
     thread::{self, JoinHandle},
@@ -86,6 +87,49 @@ fn snap_gain(gains: &[i32], db: u32) -> i32 {
     snap_gain_tenths(gains, db as i32 * 10)
 }
 
+/// Whether the reader thread should be streaming.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RunState {
+    Running,
+    Paused,
+    Quit,
+}
+
+/// The run state, shared by the controller (which writes it) and the reader
+/// thread (which waits on it between `read_async` calls).
+///
+/// A condvar rather than a channel: the reader only ever needs the *latest*
+/// state, never a backlog of transitions, and a pause/resume pair that both
+/// land while it is still unwinding `read_async` should simply leave it
+/// running.
+#[derive(Clone)]
+pub struct RunGate(Arc<(Mutex<RunState>, Condvar)>);
+
+impl RunGate {
+    pub fn new() -> Self {
+        Self(Arc::new((Mutex::new(RunState::Running), Condvar::new())))
+    }
+
+    pub fn get(&self) -> RunState {
+        *self.0.0.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    pub fn set(&self, state: RunState) {
+        *self.0.0.lock().unwrap_or_else(|p| p.into_inner()) = state;
+        self.0.1.notify_all();
+    }
+
+    /// Block while paused. Returns `Running` or `Quit`, whichever ended it.
+    pub fn wait_while_paused(&self) -> RunState {
+        let (lock, cv) = &*self.0;
+        let guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+        let guard = cv
+            .wait_while(guard, |s| *s == RunState::Paused)
+            .unwrap_or_else(|p| p.into_inner());
+        *guard
+    }
+}
+
 pub struct Source {
     /// rtl lib
     // ctl: Controller,
@@ -93,6 +137,9 @@ pub struct Source {
 
     /// Handler for control signal threat
     ctrl_handle: JoinHandle<()>,
+
+    /// Pause/resume/quit, from the controller to the reader thread.
+    gate: RunGate,
 
     /// What librtlsdr's divider actually rounded the requested rate to. Not
     /// generally the value passed to [`new`](Self::new).
@@ -194,6 +241,9 @@ impl Source {
         ));
         let ctrl_offset = xlator_offset.clone();
 
+        let gate = RunGate::new();
+        let ctrl_gate = gate.clone();
+
         // Start a thread to receive control signal
         // better than checking within read_async
         let ctrl_handle = thread::spawn(move || {
@@ -275,7 +325,34 @@ impl Source {
                         .set_ppm(ppm)
                         .unwrap_or_else(|_| panic!("{}", CustomError::RtlSetPpm(ppm).to_string())),
 
+                    // Cancelling returns the reader from `read_async`; the gate
+                    // is what makes it park instead of restarting. Set first,
+                    // so the reader cannot see `Running` on the way out.
+                    CtrlSignal::Pause => {
+                        if ctrl_gate.get() == RunState::Running {
+                            ctrl_gate.set(RunState::Paused);
+                            ctl.cancel_async_read();
+                            log_info!("paused");
+                        }
+                    }
+
+                    // Flush whatever librtlsdr buffered before the pause, so
+                    // the first samples after it are new ones.
+                    CtrlSignal::Resume => {
+                        if ctrl_gate.get() == RunState::Paused {
+                            if ctl.reset_buffer().is_err() {
+                                log_warn!("resume: could not reset the USB buffer");
+                            }
+                            ctrl_gate.set(RunState::Running);
+                            log_info!("resumed");
+                        }
+                    }
+
+                    // The gate before the cancel, and the gate also wakes a
+                    // reader parked by a pause — otherwise quitting while
+                    // paused would hang on the join.
                     CtrlSignal::Quit => {
+                        ctrl_gate.set(RunState::Quit);
                         ctl.cancel_async_read();
                         break;
                     }
@@ -290,6 +367,7 @@ impl Source {
             applied_gain_tenths: gain,
             gain_table: gains_for_ui,
             xlator_offset,
+            gate,
         }
     }
 
@@ -336,10 +414,13 @@ impl Source {
         let builder = thread::Builder::new()
             .stack_size(8 << 20)
             .name("thread-sdr".to_string());
+        let gate = self.gate.clone();
         let handle = builder
             .spawn(move || {
-                self.reader
-                    .read_async(15, IQ_BLOCK as u32, move |bytes| {
+                // Defined once and passed by `&mut` so it survives a pause:
+                // `read_async` returns on every cancel, and the DSP state, the
+                // producers and the translator all live in this closure.
+                let mut on_buffer = move |bytes: &[u8]| {
                         // Once per buffer rather than per sample: a retune is a
                         // UI-rate event, and `set_offset` leaves the phasor
                         // untouched, so the change is phase-continuous and makes
@@ -387,12 +468,69 @@ impl Source {
 
                         // Feed FFT
                         let _ = producer_fft.write(&buf);
-                    })
-                    .expect("rtlsdr: read_async failed");
+                };
+
+                // One `read_async` per running stretch. It returns when the
+                // controller cancels it, for a pause or a quit, and the gate
+                // says which.
+                loop {
+                    if gate.wait_while_paused() == RunState::Quit {
+                        break;
+                    }
+                    if self
+                        .reader
+                        .read_async(15, IQ_BLOCK as u32, &mut on_buffer)
+                        .is_err()
+                    {
+                        log_error!("rtlsdr: read_async failed, streaming stopped");
+                        break;
+                    }
+                }
             })
             .unwrap();
 
         Ok((handle, self.ctrl_handle))
+    }
+}
+
+#[cfg(test)]
+mod gate_test {
+    use super::{RunGate, RunState};
+    use std::thread;
+    use std::time::Duration;
+
+    /// Running passes straight through; the reader never blocks on it.
+    #[test]
+    fn running_does_not_block() {
+        assert_eq!(RunGate::new().wait_while_paused(), RunState::Running);
+    }
+
+    /// A parked reader stays parked until resumed, then reports `Running`.
+    #[test]
+    fn paused_parks_until_resume() {
+        let gate = RunGate::new();
+        gate.set(RunState::Paused);
+        let g = gate.clone();
+        let reader = thread::spawn(move || g.wait_while_paused());
+
+        thread::sleep(Duration::from_millis(50));
+        assert!(!reader.is_finished(), "returned while still paused");
+
+        gate.set(RunState::Running);
+        assert_eq!(reader.join().unwrap(), RunState::Running);
+    }
+
+    /// Quitting while paused must wake the reader, or `main` hangs on the join.
+    #[test]
+    fn quit_wakes_a_paused_reader() {
+        let gate = RunGate::new();
+        gate.set(RunState::Paused);
+        let g = gate.clone();
+        let reader = thread::spawn(move || g.wait_while_paused());
+
+        thread::sleep(Duration::from_millis(50));
+        gate.set(RunState::Quit);
+        assert_eq!(reader.join().unwrap(), RunState::Quit);
     }
 }
 

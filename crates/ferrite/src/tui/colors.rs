@@ -25,6 +25,8 @@
 //! `COLORTERM=truecolor` is the case that is not.
 
 use ratatui::style::{Color, Style};
+use ratatui::text::Line;
+use ratatui::widgets::{Block, Borders};
 
 const fn to_array_f32(color: &Color) -> [f32; 3] {
     let mut output = [0.0_f32; 3];
@@ -181,17 +183,15 @@ pub const STATUS_BG: Color = ORANGE_BASE;
 pub const HINT_KEY: Color = CYAN_BRIGHT;
 pub const HINT_TEXT: Color = TEXT_DIM;
 
-// ── Log levels ──────────────────────────────────────────────────────────────
+// ── Alerts on the status bar ────────────────────────────────────────────────
 // The palette has **no red**. Rather than invent one — a hue from outside is
 // what makes a designed UI look assembled — error escalates by *inversion*:
 // warn is orange text, error is a block of orange. That reads as louder at a
 // glance and costs no new ink.
+pub const ALERT_WARN_FG: Color = ORANGE_BASE;
+pub const ALERT_ERROR_FG: Color = BG_VOID;
+pub const ALERT_ERROR_BG: Color = ORANGE_BASE;
 
-pub const LOG_TIME: Color = TEXT_DIM;
-pub const LOG_INFO: Color = TEXT;
-pub const LOG_WARN: Color = ORANGE_BASE;
-pub const LOG_ERROR_FG: Color = BG_VOID;
-pub const LOG_ERROR_BG: Color = ORANGE_BASE;
 
 // ── Data ────────────────────────────────────────────────────────────────────
 
@@ -269,6 +269,36 @@ pub fn pane_title() -> Style {
 /// a frame with a differently-coloured hole in it.
 pub fn pane_card() -> Style {
     Style::new().bg(BG_CARD)
+}
+
+/// The frame for a collapsible, scrollable sidebar panel.
+///
+/// Collapsed, it is a single row — just the top border and a `▸` title — so it
+/// stays findable and focusable while giving its height to the other panel.
+/// Open, the title gets a `▾`, and `▲`/`▼` on the bottom border say there are
+/// rows scrolled off above or below: on a short screen the list is clipped,
+/// and without a mark you cannot tell a clipped list from a short one.
+pub fn pane_block<'a>(title: &'a str, focused: bool, open: bool, above: bool, below: bool) -> Block<'a> {
+    let base = |b: Block<'a>| {
+        b.style(pane_card())
+            .title_style(pane_title())
+            .border_style(pane_border(focused))
+    };
+    if !open {
+        return base(Block::new().borders(Borders::TOP).title(format!("\u{25b8} {title}")));
+    }
+
+    let mut block = base(Block::bordered().title(format!("\u{25be} {title}")));
+    let marks = match (above, below) {
+        (true, true) => Some(" \u{25b2}\u{25bc} "),
+        (true, false) => Some(" \u{25b2} "),
+        (false, true) => Some(" \u{25bc} "),
+        (false, false) => None,
+    };
+    if let Some(m) = marks {
+        block = block.title_bottom(Line::styled(m, Style::new().fg(FOCUS)).right_aligned());
+    }
+    block
 }
 
 #[cfg(test)]
