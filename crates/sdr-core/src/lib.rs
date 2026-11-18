@@ -4,8 +4,8 @@
 //!
 //! Nothing here depends on cpal, ratatui or rtlsdr_mt — `Cargo.toml` has an
 //! empty `[dependencies]`, so the boundary is enforced by the compiler rather
-//! than by convention. Device I/O and rendering live in the `ferrite` binary,
-//! and the dependency arrow only ever runs `ferrite -> sdr-core`.
+//! than by convention. Device I/O and rendering live in the `ferrite-sdr` binary,
+//! and the dependency arrow only ever runs `ferrite-sdr -> sdr-core`.
 //!
 //! Being a library is also what lets `benches/` link against it: a bench target
 //! is its own crate and can never depend on a `main.rs`.

@@ -38,7 +38,7 @@ const DEFAULT_STEP_HZ: u32 = 100_000;
 const FFT_N: usize = 2048;
 
 /// Where `--trace` writes when it is given no path.
-const DEFAULT_TRACE_PATH: &str = "ferrite.log";
+const DEFAULT_TRACE_PATH: &str = "ferrite-sdr.log";
 
 /// `--trace [path]` → `Some(path)`, absent → `None`. The path is optional, so
 /// the next argument counts as one only when it is not itself a flag.

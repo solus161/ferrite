@@ -1,5 +1,5 @@
 [package]
-name = "ferrite"
+name = "ferrite-sdr"
 version.workspace = true
 edition.workspace = true
 

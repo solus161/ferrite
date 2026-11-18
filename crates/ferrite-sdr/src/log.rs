@@ -8,8 +8,8 @@
 //! Two sinks:
 //!
 //! - **Trace file**, only when the app runs with `--trace [path]` (default
-//!   `ferrite.log`). Every macro writes here. Truncated at startup, so each run
-//!   starts clean; tail it from a second terminal with `tail -f ferrite.log`.
+//!   `ferrite-sdr.log`). Every macro writes here. Truncated at startup, so each run
+//!   starts clean; tail it from a second terminal with `tail -f ferrite-sdr.log`.
 //!   Without `--trace` nothing is written anywhere.
 //! - **Alert slot** — [`log_warn!`] and [`log_error!`] also leave their message
 //!   for the TUI, which flashes it on the status bar. There is no log panel any
