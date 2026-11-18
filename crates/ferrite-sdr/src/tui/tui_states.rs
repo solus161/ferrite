@@ -1,0 +1,229 @@
+//! State that never leaves the UI thread.
+//!
+//! The counterpart to [`AppStates`](super::app_states::AppStates): nothing here
+//! is a radio setting, so nothing here needs an atomic. `Rc<Cell<_>>` because
+//! two widgets read the same value — the colour range is edited in the Control
+//! panel and consumed by [`SignalView`](super::signal_view::SignalView), and a
+//! shared cell keeps them from drifting the way a copied `f32` would.
+//!
+//! The Control panel's cursor is deliberately *not* here: it indexes
+//! `Field::ALL`, so it belongs with the row table it indexes.
+
+use std::cell::Cell;
+use std::rc::Rc;
+use std::sync::Arc;
+
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicU32, AtomicU64};
+
+use super::utils::get_attr_clone;
+
+/// Sentinel for a measurement nothing has written yet, so the Info panel can
+/// render "—" instead of a confident zero.
+pub const UNMEASURED: i32 = i32::MIN;
+
+/// Which pane the arrow keys are talking to.
+///
+/// The signal view is not focusable — it has nothing to select. `Tab` cycles
+/// the two that do.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Pane {
+    Control,
+    Info,
+}
+
+impl Pane {
+    pub fn next(self) -> Self {
+        match self {
+            Pane::Control => Pane::Info,
+            Pane::Info => Pane::Control,
+        }
+    }
+}
+
+pub struct TuiStates {
+    // ── RF ──────────────────────────────────────────────────────────────────
+    pub sample_rate: Rc<Cell<u32>>,
+    pub audio_rate: Rc<Cell<u32>>,
+    pub center_freq: Rc<Cell<u32>>,
+
+    /// The channel actually demodulated, which the `Xlator` brings down to DC.
+    ///
+    /// Distinct from `center_freq`: that one is the LO programmed into the
+    /// dongle and the centre of the waterfall, while this one is a channel
+    /// anywhere within `TUNE_SPAN_HZ` of it.
+    ///
+    /// Held at a fixed *offset* from the centre rather than at a fixed absolute
+    /// frequency: moving `center_freq` moves this by the same delta, so the
+    /// cursor keeps its place on the waterfall and the translator offset never
+    /// changes. What is demodulated does move with the centre.
+    pub tuned_freq: Rc<Cell<u32>>,
+
+    pub step: Rc<Cell<u32>>,
+    /// librtlsdr's units, and always a value from the tuner's own table — the
+    /// UI steps that table rather than whole dB, so what is displayed is what
+    /// the hardware has.
+    pub gain_tenths: Rc<Cell<i32>>,
+    pub agc: Rc<Cell<bool>>,
+    /// Channel bandwidth. The tuner's IF filter is set wider than this to clear
+    /// the offset-tuning gap; see `source::source`.
+    pub bandwidth: Rc<Cell<u32>>,
+    /// Signed: most dongles need a negative correction.
+    pub ppm: Rc<Cell<i32>>,
+
+    // ── Audio ───────────────────────────────────────────────────────────────
+    /// 0..=100, applied in the cpal callback.
+    pub volume: Arc<AtomicU32>,
+    pub muted: Arc<AtomicBool>,
+    
+    /// Squelch limit, from -100 to 0 db
+    pub squelch: Arc<AtomicI32>,
+
+    /// De-emphasis time constant in µs: 50 outside the Americas and South
+    /// Korea, 75 inside.
+    pub deemph_us: Rc<Cell<u32>>,
+
+    pub mode: Rc<Cell<TunerMode>>,
+    pub focus: Rc<Cell<Pane>>,
+
+    /// Whether each sidebar panel is expanded. `Enter` toggles the focused
+    /// one; a collapsed panel is a one-row header that gives its height to the
+    /// other.
+    pub control_open: Rc<Cell<bool>>,
+
+    /// Streaming stopped by `Space`: no RTL samples, no audio, no FFT, and the
+    /// waterfall frozen on its last frame.
+    pub paused: Rc<Cell<bool>>,
+    pub info_open: Rc<Cell<bool>>,
+
+    /// Bottom of the colour range, in dB. Shared with the signal view.
+    pub floor_db: Rc<Cell<f32>>,
+    /// Top of the colour range, in dB.
+    pub ceil_db: Rc<Cell<f32>>,
+}
+
+#[allow(clippy::too_many_arguments)]
+impl TuiStates {
+    pub fn new(
+        sample_rate: u32,
+        audio_rate: u32,
+        center_freq: u32,
+        tuned_freq: u32,
+        step: u32,
+        gain_tenths: i32,
+        bandwidth: u32,
+        ppm: i32,
+        floor_db: f32,
+        ceil_db: f32,
+        volumn_scale: Arc<AtomicU32>,
+        muted: Arc<AtomicBool>,
+        squelch: Arc<AtomicI32>
+    ) -> Self {
+        Self {
+            sample_rate: Rc::new(Cell::new(sample_rate)),
+            audio_rate: Rc::new(Cell::new(audio_rate)),
+            center_freq: Rc::new(Cell::new(center_freq)),
+            tuned_freq: Rc::new(Cell::new(tuned_freq)),
+            step: Rc::new(Cell::new(step)),
+            gain_tenths: Rc::new(Cell::new(gain_tenths)),
+            agc: Rc::new(Cell::new(true)),
+            bandwidth: Rc::new(Cell::new(bandwidth)),
+            ppm: Rc::new(Cell::new(ppm)),
+            volume: volumn_scale,
+            muted,
+            squelch,
+            deemph_us: Rc::new(Cell::new(50)),
+            mode: Rc::new(Cell::new(TunerMode::WbFm)),
+            focus: Rc::new(Cell::new(Pane::Control)),
+            control_open: Rc::new(Cell::new(true)),
+            paused: Rc::new(Cell::new(false)),
+            info_open: Rc::new(Cell::new(true)),
+            floor_db: Rc::new(Cell::new(floor_db)),
+            ceil_db: Rc::new(Cell::new(ceil_db)),
+        }
+    }
+
+    get_attr_clone!(sample_rate, u32);
+    get_attr_clone!(audio_rate, u32);
+    get_attr_clone!(center_freq, u32);
+    get_attr_clone!(tuned_freq, u32);
+    get_attr_clone!(floor_db, f32);
+    get_attr_clone!(ceil_db, f32);
+    get_attr_clone!(paused, bool);
+
+    pub fn set_mode(&self, mode: TunerMode) {
+        self.mode.set(mode);
+    }
+}
+
+/// Written by the DSP and USB threads, read by the UI.
+///
+/// Counters are the *only* way the hot path is allowed to report anything —
+/// see the logging rules in [`crate::log`].
+pub struct Health {
+    /// `lag` attribute from `RingProducer`
+    pub ring_audio_lag: Arc<AtomicIsize>,
+    pub ring_fft_lag: Arc<AtomicIsize>,
+    /// cpal callbacks that found the audio ring empty and emitted silence.
+    pub underruns: Arc<AtomicU64>,
+    /// Tenths of a dBFS, or [`UNMEASURED`]. PLAN.md R1.5.
+    pub rssi_dbfs_x10: Arc<AtomicI32>,
+    /// The stereo decoder's PLL is locked on a pilot. PLAN.md R1.9.
+    pub stereo: Arc<AtomicBool>,
+    /// Coherent pilot level in tenths of a percent of full deviation, or
+    /// [`UNMEASURED`]. A healthy stereo station reads 80–100.
+    pub pilot_x10: Arc<AtomicI32>,
+}
+
+impl Health {
+    pub fn new(
+        ring_audio_lag: Arc<AtomicIsize>,
+        ring_fft_lag: Arc<AtomicIsize>,
+    ) ->Self {
+        Self {
+            ring_audio_lag,
+            ring_fft_lag,
+            underruns: Arc::new(AtomicU64::new(0)),
+            rssi_dbfs_x10: Arc::new(AtomicI32::new(UNMEASURED)),
+            stereo: Arc::new(AtomicBool::new(false)),
+            pilot_x10: Arc::new(AtomicI32::new(UNMEASURED)),
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+pub enum TunerMode {
+    WbFm, // Wide-band FM
+    Nfm,  // Narrow-band FM
+    Am,   // Amplitude modulation
+    Usb,  // Upper sideband
+    Lsb,  // Lower sideband
+    Raw,  // No demodulation
+}
+
+impl TunerMode {
+    pub const ALL: [TunerMode; 6] = [
+        TunerMode::WbFm,
+        TunerMode::Nfm,
+        TunerMode::Am,
+        TunerMode::Usb,
+        TunerMode::Lsb,
+        TunerMode::Raw,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            TunerMode::WbFm => "WFM",
+            TunerMode::Nfm => "NFM",
+            TunerMode::Am => "AM",
+            TunerMode::Usb => "USB",
+            TunerMode::Lsb => "LSB",
+            TunerMode::Raw => "RAW",
+        }
+    }
+
+    /// Whether the DSP can actually run this mode today.
+    pub fn implemented(self) -> bool {
+        matches!(self, TunerMode::WbFm)
+    }
+}

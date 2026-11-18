@@ -1,10 +1,12 @@
 use std::cell::UnsafeCell;
 use std::ops::Deref;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicIsize, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 use std::{array, thread};
+
+use crossbeam_utils::CachePadded;
 
 use crate::buffer::Buffer;
 use crate::exceptions::CustomError;
@@ -59,7 +61,7 @@ const READ_RETRIES: usize = 4;
 /// deliberately conservative there: they may discard a block that happened to be
 /// intact, but never accept a torn one. That mode is lossy by definition.
 struct Ring<T: Copy + Default, const N: usize, const M: usize> {
-    slots: [UnsafeCell<Buffer<T, M>>; N],
+    slots: [CachePadded<UnsafeCell<Buffer<T, M>>>; N],
     head: AtomicU64,
 }
 
@@ -74,7 +76,7 @@ impl<T: Copy + Default, const N: usize, const M: usize> Ring<T, N, M> {
             "ring slot count N must be a power of two"
         );
         Self {
-            slots: array::from_fn(|_| UnsafeCell::new(Buffer::<T, M>::new())),
+            slots: array::from_fn(|_| CachePadded::new(UnsafeCell::new(Buffer::<T, M>::new()))),
             head: AtomicU64::new(0),
         }
     }
@@ -128,7 +130,7 @@ impl<T: Copy + Default, const N: usize, const M: usize> Ring<T, N, M> {
         self.head.store(head + 1, Ordering::Release);
     }
 
-    pub fn slot(&self, i: usize) -> Result<&UnsafeCell<Buffer<T, M>>, CustomError> {
+    pub fn slot(&self, i: usize) -> Result<&CachePadded<UnsafeCell<Buffer<T, M>>>, CustomError> {
         self.slots.get(i).ok_or(CustomError::InvalidIndex)
     }
 
@@ -331,6 +333,9 @@ impl<T: Copy + Default, const N: usize, const M: usize> RingProducer<T, N, M> {
 pub struct RingConsumer<T: Copy + Default, const N: usize, const M: usize> {
     ring: Arc<Ring<T, N, M>>,
     head: Arc<AtomicU64>,
+    /// Most recent buffers lagged compared to Ring's head
+    /// > 0 -> slow consumer, <= 0 -> possibly slow producer
+    pub lag: Arc<AtomicIsize>,
 }
 
 impl<T: Copy + Default, const N: usize, const M: usize> RingConsumer<T, N, M> {
@@ -340,6 +345,7 @@ impl<T: Copy + Default, const N: usize, const M: usize> RingConsumer<T, N, M> {
         Self {
             ring,
             head: Arc::new(AtomicU64::new(0)),
+            lag: Arc::new(AtomicIsize::new(0)),
         }
     }
 
@@ -351,6 +357,10 @@ impl<T: Copy + Default, const N: usize, const M: usize> RingConsumer<T, N, M> {
     /// A handle to this consumer's cursor, for [`RingProducer::add_consumer`].
     pub fn cursor(&self) -> Arc<AtomicU64> {
         self.head.clone()
+    }
+
+    pub fn lag(&self) -> Arc<AtomicIsize> {
+        self.lag.clone()
     }
 
     /// Jump to the newest published block, abandoning the backlog.
@@ -379,6 +389,9 @@ impl<T: Copy + Default, const N: usize, const M: usize> RingConsumer<T, N, M> {
         let seq = self.head.load(Ordering::Relaxed);
         let ring_head = self.ring.head();
 
+        // Update lag
+        self.lag.store((ring_head - seq) as isize, Ordering::Release);
+
         if seq >= ring_head {
             return Err(CustomError::SlowProducer);
         };
@@ -394,7 +407,7 @@ impl<T: Copy + Default, const N: usize, const M: usize> RingConsumer<T, N, M> {
             //
             // Cannot underflow: this branch requires ring_head >= N.
             let resync = ring_head - (N as u64) / 2;
-            self.head.store(resync, Ordering::Release);
+            self.head.store(resync, Ordering::Relaxed);
             return Ok(resync);
         };
 

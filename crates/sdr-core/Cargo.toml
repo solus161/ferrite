@@ -2,10 +2,15 @@
 name = "sdr-core"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "DSP building blocks and the lock-free ring behind ferrite-sdr"
 
 # Deliberately empty. Nothing here may reach for cpal, ratatui or rtlsdr_mt —
 # the crate boundary is what enforces that, rather than discipline.
 [dependencies]
+crossbeam-utils = "0.8.5"
 
 [[bench]]
 name = "ring_vs_mutex"

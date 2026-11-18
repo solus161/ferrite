@@ -1,0 +1,264 @@
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32};
+use std::sync::mpsc::channel;
+
+#[macro_use]
+mod log;
+
+mod source;
+mod speaker;
+mod tui;
+
+use sdr_core::{control_signal::CtrlSignal, exceptions::CustomError, spmc::RingProducer};
+
+use crate::source::source::Source;
+use crate::source::source::{CPAL_BLOCK, IQ_BLOCK, IQ_SLOTS, OFFSET_TUNING_HZ};
+use crate::speaker::Speaker;
+use crate::tui::{tui_core::Tui, tui_states::Health, tui_states::TuiStates};
+
+/// Startup gain, in librtlsdr's tenths of a dB. Snapped to the tuner's own
+/// table at open, so this is a request, not a promise — 20 dB lands on the
+/// FC0013's 19.7 dB ceiling and near the top of an R820T's range.
+const DEFAULT_GAIN_TENTHS: i32 = 200;
+
+/// How far one `←`/`→` press moves the frequency at startup. 100 kHz is the
+/// spacing of the FM broadcast raster in most of the world.
+const DEFAULT_STEP_HZ: u32 = 100_000;
+
+/// Ring geometry lives with the producers: audio is `IQ_SLOTS × CPAL_BLOCK`,
+/// raw IQ is `IQ_SLOTS × IQ_BLOCK` (see `source::source`). A block only becomes
+/// readable once it is full, so the block size is a latency floor paid by every
+/// consumer — CPAL_BLOCK (164 stereo frames) @ 48 kHz is ~3.4 ms, ~55 ms for
+/// the whole ring.
+/// Consumers wanting a larger window (an FFT, say) accumulate blocks on their
+/// own side; that is cheap, whereas splitting a large block down to cpal's
+/// ~512-frame callbacks would mean holding a borrow into a ring slot across
+/// dozens of real-time callbacks.
+const FFT_N: usize = 2048;
+
+/// Where `--trace` writes when it is given no path.
+const DEFAULT_TRACE_PATH: &str = "ferrite-sdr.log";
+
+/// `--trace [path]` → `Some(path)`, absent → `None`. The path is optional, so
+/// the next argument counts as one only when it is not itself a flag.
+fn trace_path() -> Option<PathBuf> {
+    let mut args = std::env::args().skip(1).peekable();
+    while let Some(arg) = args.next() {
+        if arg == "--trace" {
+            let path = args
+                .next_if(|next| !next.starts_with('-'))
+                .unwrap_or_else(|| DEFAULT_TRACE_PATH.into());
+            return Some(path.into());
+        }
+    }
+    None
+}
+
+fn main() -> Result<(), CustomError> {
+    // First, so anything that logs during setup — and any panic — is captured.
+    let trace = trace_path();
+    if let Err(e) = log::init(trace.as_deref()) {
+        eprintln!("--trace: cannot open {}: {e}", trace.unwrap().display());
+        std::process::exit(1);
+    }
+    if let Some(p) = &trace {
+        println!("tracing to {}", p.display());
+    }
+
+    // ── Device discovery ────────────────────────────────────────────────────
+    println!("===RTL-SDR devices===");
+    for (i, name) in rtlsdr_mt::devices().enumerate() {
+        println!("#{i}: {}", name.to_string_lossy());
+    }
+
+    // Ring producer
+    // Non-blocking: a slow DSP consumer must never stall the USB callback, so the ring overwrites and drags the reader forward to the freshest data.
+
+    /* A shared ring for speaker and fft, stream of interleaving IQ, block size 16384
+    The flow is like this:
+
+    Two frequencies (`source.rs`). `center_freq` is the LO, written
+    to the dongle verbatim; it is the centre of the sampled span and of the
+    waterfall. `tuned_freq` is the channel, and the Xlator shifts it down to 0 Hz
+    for the demodulator. They start OFFSET_TUNING_HZ apart so the channel does
+    not open on the LO-leakage spike, and the channel may sit anywhere within
+    TUNE_SPAN_HZ of the centre.
+
+    The channel is pinned at a fixed *offset* from the centre, not at a fixed
+    absolute frequency: retuning the dongle slides both together, so the cursor
+    holds its place on the waterfall and the translator is never disturbed. The
+    demodulated frequency does follow the centre — Tuned is what moves the
+    channel relative to it.
+
+    RTL-SDR at 2.4MHz, 15 queued blocks of 16384 interleaved IQ bytes, u8
+    |―Preprocessing, per sample, inside the read_async callback (`source.rs`)
+    | |―center_iq: u8 -> f32, (x - 127.4)/128
+    | |―IqDcBlocker: leaky-integrator high-pass, ~8Hz corner, on I and Q
+    |―Split to Audio/CPAL and FFT (TUI), [f32; 16384] interleaved
+    |  The split is *ahead* of the Xlator, and has to be. Shifting a sampled
+    |  signal rotates its spectrum circularly, so translating before the FFT
+    |  wraps the bottom of the span around to the top, where it is drawn a whole
+    |  sample rate away from its real frequency. The FFT leg therefore stays
+    |  LO-centred and only the audio leg is translated.
+      |―Audio/CPAL — decimators want I and Q as separate arrays, for SIMD,
+      |               so this leg carries two [f32; 8192] rather than the
+      |               interleaved block.
+      | |―Xlator: shift down by (tuned_freq - center_freq), bringing the channel
+      | |          to 0Hz. Offset arrives from the controller thread through a
+      | |          shared atomic, read once per USB buffer.
+      | `DSPFlow` in `source/dsp.rs`:
+      | |―Multi-stage decimator: sliding window multiplied by precomputed taps.
+      | | |                      Same shape as SDR++'s `plan_8`.
+      | | |―WFM (the only mode implemented)
+      | | | |―27 taps Hann, fc 100kHz @2.4MHz, step 4 -> 2x [f32; 2048] ~600kHz
+      | | | |―69 taps Hann, fc 100kHz @600kHz,  step 2 -> 2x [f32; 1024] ~300kHz
+      | | |―NFM `plan_32`, AM, SSB: not built. Needs the mode abstraction first
+      | |                           — see PLAN.md R3.0, then R3.1/R3.2.
+      | |―FM Demodulation — atan2 discriminator, deviation 75kHz @300kHz, so
+      | |                   full deviation maps to +-1.0. Must run here, before
+      | |                   any resampling: a 200kHz channel does not fit in
+      | |                   48kHz of bandwidth. -> [f32; 1024] real, 300kHz
+      | |―Polyphase resampler 4/25, 300kHz -> 48kHz. Its 1900-tap prototype is
+      | |                     designed at interp x 300kHz = 1.2MHz with fc 15kHz,
+      | |                     and is both the audio channel filter and the
+      | |                     anti-alias. Taps are scaled by interp (4) because
+      | |                     `create_taps` normalises DC gain to 1.0 and each
+      | |                     of the 4 branches would otherwise carry a quarter.
+      | |                     -> 163 or 164 samples (8192/50 = 163.84)
+      | |―Stereo (R1.9): PLL on the 19kHz pilot gives a coherent 38kHz;
+      | |                2·MPX·sin 2φ is L−R, resampled by a twin of the
+      | |                above. L = sum + diff, R = sum − diff. No pilot ->
+      | |                diff is silent and the output is plain mono.
+      | |―De-emphasis, 50us one-pole, at 48kHz, per channel after the matrix
+      | |―Audio ring carries L/R interleaved; CPAL_BLOCK is 164 frames
+      |―FFT: convert to ComplexF32 for more graceful api. Untranslated, so bin
+      |      centre is the LO and the MHz axis can be labelled on center_freq
+      |      directly. Two cursors mark centre (cyan) and channel (orange).
+
+    */
+
+    // For speaker
+    let producer_audio = RingProducer::<f32, IQ_SLOTS, CPAL_BLOCK>::new(false);
+
+    // For FFT
+    let producer_fft = RingProducer::<f32, IQ_SLOTS, IQ_BLOCK>::new(false);
+
+    // Ring for TUI: spectrograme, etc., required u8 of raw IQ
+    // let producer_iq = RingProducer::<u8, IQ_SLOTS, IQ_BLOCK>::new(false);
+
+    // A consumer for cpal/audio stream
+    let consumer_audio = producer_audio.subscribe();
+
+    // A consumer for tui
+    let consumer_fft = producer_fft.subscribe();
+
+    // For controller
+    let (ctrl_tx, ctrl_rx) = channel::<CtrlSignal>();
+
+    // Health states is shared accross threads: source, fft, cpal, etc
+    let health = Health::new(
+        consumer_audio.lag(),
+        consumer_fft.lag(),
+    );
+
+    let volumn_scale = Arc::new(AtomicU32::new(100));
+    let muted = Arc::new(AtomicBool::new(false));
+    let rssi_dbfs_x10 = health.rssi_dbfs_x10.clone();
+    
+    // Squelch's open threshold
+    let squelch = Arc::new(AtomicI32::new(-30));
+
+    // Speaker. Fills in both rates, since it is what asks cpal for one.
+    let speaker = Speaker::new(
+        consumer_audio,
+        volumn_scale.clone(),
+        muted.clone(),
+        health.underruns.clone(),
+        );
+    let rtl_rate = speaker.rtl_rate;
+
+    // Some initial states
+    let states = TuiStates::new(
+        speaker.rtl_rate,
+        speaker.audio_rate,
+        91_000_000 - OFFSET_TUNING_HZ,
+        91_000_000,
+        DEFAULT_STEP_HZ,
+        DEFAULT_GAIN_TENTHS,
+        300_000,
+        0,
+        -90.0,
+        0.0,
+        volumn_scale,
+        muted,
+        squelch,
+    );
+
+    let source = Source::new(
+        rtl_rate,
+        states.center_freq.get(),
+        states.tuned_freq.get(),
+        states.bandwidth.get(),
+        (DEFAULT_GAIN_TENTHS / 10).max(0) as u32,
+        ctrl_rx,
+    );
+
+    // The tuner's gain table is discrete and its ceiling is tuner-specific, so
+    // the request is rarely what lands. Reflect what the hardware took, and
+    // hand the table itself to the Control panel — its Gain row steps that
+    // table rather than whole dB, which is what keeps the displayed gain a gain
+    // the device actually has.
+    states.gain_tenths.set(source.applied_gain_tenths);
+    // librtlsdr rounds the requested rate to what its divider can make.
+    states.sample_rate.set(source.sample_rate);
+    let gain_table = source.gain_table.clone();
+
+    log_info!(
+        "tuner gain {:.1} dB \u{b7} {} steps available",
+        source.applied_gain_tenths as f32 / 10.0,
+        gain_table.len()
+    );
+    log_info!(
+        "{:.3} MS/s \u{b7} LO {:.3} MHz \u{b7} tuned {:.3} MHz",
+        source.sample_rate as f64 / 1e6,
+        states.center_freq.get() as f64 / 1e6,
+        states.tuned_freq.get() as f64 / 1e6
+    );
+
+    // From here until the TUI exits, C-library chatter on stderr would draw
+    // over the frame. Dropped last, after the terminal is restored.
+    let _stderr = match log::StderrRedirect::new() {
+        Ok(r) => Some(r),
+        Err(e) => {
+            log_warn!("cannot redirect stderr ({e}); librtlsdr messages may garble the screen");
+            None
+        }
+    };
+
+    let (source_handle, ctrl_handle) = source.start_receive(
+        producer_audio,
+        producer_fft,
+        states.squelch.clone(),
+        rssi_dbfs_x10,
+        health.stereo.clone(),
+        health.pilot_x10.clone(),
+        )?;
+
+    // Let's run the whole thing. The TUI takes the speaker after starting it,
+    // because pausing has to stop the audio stream too.
+    speaker.play()?;
+    let tui = Tui::<IQ_SLOTS, IQ_BLOCK, FFT_N>::new(
+        states,
+        gain_table,
+        consumer_fft,
+        ctrl_tx,
+        health,
+        speaker,
+    );
+    let _ = tui.run();
+
+    let _ = source_handle.join();
+    let _ = ctrl_handle.join();
+    Ok(())
+}
