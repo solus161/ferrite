@@ -51,7 +51,8 @@ Run it as your normal user; it uses `sudo` where needed. The script:
    the `plugdev` group;
 4. installs Rust through rustup if you do not have it, or updates it if it is
    older than 1.88;
-5. builds the release binary and installs it to `~/.local/bin/ferrite-sdr`.
+5. builds the release binary and installs it to `~/.local/bin/ferrite-sdr`,
+   adding `~/.local/bin` to your PATH in `~/.bashrc` if it is not there yet.
 
 Then **unplug and replug the dongle** and run:
 
@@ -59,7 +60,9 @@ Then **unplug and replug the dongle** and run:
 ferrite-sdr
 ```
 
-If the script added you to `plugdev`, log out and back in first.
+If the script added you to `plugdev`, log out and back in first. If it
+changed your PATH, run `source ~/.bashrc` (or open a new terminal) so the
+shell finds `ferrite-sdr`.
 
 ### Options
 
@@ -69,7 +72,7 @@ If the script added you to `plugdev`, log out and back in first.
 | `--deps-only` | Install system packages, the blacklist and udev rule only; do not build |
 | `--no-blacklist` | Leave the DVB-T kernel driver alone |
 | `--prefix DIR` | Install to `DIR/bin` instead of `~/.local/bin` |
-| `--uninstall` | Remove the binary, and the udev rule and blacklist if this script created them |
+| `--uninstall` | Remove the binary, and the udev rule, blacklist and PATH line if this script created them |
 
 To upgrade, `git pull` and run `./install.sh` again.
 

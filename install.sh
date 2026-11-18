@@ -51,6 +51,10 @@ cd "$(dirname "$0")"
 if [ "$UNINSTALL" -eq 1 ]; then
     step "Removing $BIN"
     rm -fv "$PREFIX/bin/$BIN"
+    if grep -qs "# ferrite-sdr: PATH" "$HOME/.bashrc"; then
+        sed -i '/# ferrite-sdr: PATH$/d' "$HOME/.bashrc"
+        echo "removed the PATH line from ~/.bashrc"
+    fi
     for f in "$UDEV_RULE" "$BLACKLIST"; do
         if [ -f "$f" ] && grep -q 'ferrite-sdr' "$f"; then
             sudo rm -fv "$f"
@@ -147,10 +151,24 @@ cargo build --release --locked -p "$BIN" "${FEATURES[@]}"
 step "Installing to $PREFIX/bin/$BIN"
 install -Dm755 "target/release/$BIN" "$PREFIX/bin/$BIN"
 
+# Debian's ~/.profile adds ~/.local/bin only if it existed at login, so on a
+# fresh account the directory this script just created is not on PATH until
+# the next login. Add it to ~/.bashrc so new shells find the binary.
+ON_PATH=1
 case ":$PATH:" in
     *":$PREFIX/bin:"*) ;;
-    *) warn "$PREFIX/bin is not on your PATH; add it in your shell profile" ;;
+    *)
+        ON_PATH=0
+        if ! grep -qs "# ferrite-sdr: PATH" "$HOME/.bashrc"; then
+            step "Adding $PREFIX/bin to PATH in ~/.bashrc"
+            printf '\nexport PATH="%s/bin:$PATH"  # ferrite-sdr: PATH\n' "$PREFIX" >> "$HOME/.bashrc"
+        fi
+        ;;
 esac
 
 echo
 echo "Done. Plug in the dongle (re-plug it if it was already in) and run: $BIN"
+if [ "$ON_PATH" -eq 0 ]; then
+    echo "This shell does not see $PREFIX/bin yet; first run: source ~/.bashrc"
+    echo "(or run it directly: $PREFIX/bin/$BIN)"
+fi
