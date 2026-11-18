@@ -226,6 +226,16 @@ fn main() -> Result<(), CustomError> {
         states.tuned_freq.get() as f64 / 1e6
     );
 
+    // From here until the TUI exits, C-library chatter on stderr would draw
+    // over the frame. Dropped last, after the terminal is restored.
+    let _stderr = match log::StderrRedirect::new() {
+        Ok(r) => Some(r),
+        Err(e) => {
+            log_warn!("cannot redirect stderr ({e}); librtlsdr messages may garble the screen");
+            None
+        }
+    };
+
     let (source_handle, ctrl_handle) = source.start_receive(
         producer_audio,
         producer_fft,

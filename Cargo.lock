@@ -547,6 +547,7 @@ name = "ferrite-sdr"
 version = "0.1.0"
 dependencies = [
  "cpal",
+ "libc",
  "ratatui",
  "rtlsdr_mt",
  "sdr-core",
