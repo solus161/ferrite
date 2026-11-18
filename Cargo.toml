@@ -5,6 +5,10 @@ members = ["crates/sdr-core", "crates/ferrite-sdr"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+# ratatui 0.30's widget crates are the floor.
+rust-version = "1.88"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/solus161/ferrite"
 
 # The DSP runs 2.4 M samples/s through several FIR stages. At opt-level 0 the
 # per-sample work is non-inlined calls and the audio thread cannot keep up,
