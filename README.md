@@ -36,8 +36,8 @@ implemented. See [Limitations](#limitations).
 ## Install
 
 ```sh
-git clone https://github.com/solus161/ferrite.git
-cd ferrite
+git clone https://github.com/solus161/ferrite-sdr.git
+cd ferrite-sdr
 ./install.sh
 ```
 
