@@ -8,8 +8,8 @@
 //! Two sinks:
 //!
 //! - **Trace file**, only when the app runs with `--trace [path]` (default
-//!   `ferrite.log`). Every macro writes here. Truncated at startup, so each run
-//!   starts clean; tail it from a second terminal with `tail -f ferrite.log`.
+//!   `ferrite-sdr.log`). Every macro writes here. Truncated at startup, so each run
+//!   starts clean; tail it from a second terminal with `tail -f ferrite-sdr.log`.
 //!   Without `--trace` nothing is written anywhere.
 //! - **Alert slot** — [`log_warn!`] and [`log_error!`] also leave their message
 //!   for the TUI, which flashes it on the status bar. There is no log panel any
@@ -30,8 +30,10 @@
 
 use std::fs::File;
 use std::io::Write;
+use std::os::fd::AsRawFd;
 use std::path::Path;
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::{Mutex, Once, OnceLock};
 use std::time::Instant;
 
 /// `None` when tracing is off. Set once by [`init`]; unset reads as off, so a
@@ -102,6 +104,79 @@ impl Level {
             Level::Info => "INFO",
             Level::Warn => "WARN",
             Level::Error => "ERR ",
+        }
+    }
+}
+
+/// The real stderr, parked by [`StderrRedirect`]; -1 when it is not redirected.
+static SAVED_STDERR: AtomicI32 = AtomicI32::new(-1);
+
+/// Points file descriptor 2 away from the terminal until dropped.
+///
+/// C libraries write straight to fd 2, which no Rust-side logging can catch:
+/// librtlsdr prints `Allocating 15 zero-copy buffers…` on *every*
+/// `rtlsdr_read_async`, so each resume from pause would land a line on the
+/// bottom row of the TUI and scroll the whole frame up. With `--trace` that
+/// output goes to the trace file, so it is still there to read; without it,
+/// to `/dev/null`.
+///
+/// Create it before the source starts streaming and keep it until the
+/// terminal is restored. A panic puts stderr back before the default hook
+/// prints, so the message still reaches the screen.
+pub struct StderrRedirect(());
+
+impl StderrRedirect {
+    pub fn new() -> std::io::Result<Self> {
+        let target = match TRACE.get() {
+            Some(Some(file)) => file
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .try_clone()?,
+            _ => File::options().write(true).open("/dev/null")?,
+        };
+        // SAFETY: plain fd calls on descriptors this process owns; `target`
+        // stays open until after the dup2, which takes its own reference.
+        unsafe {
+            let saved = libc::dup(libc::STDERR_FILENO);
+            if saved < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::dup2(target.as_raw_fd(), libc::STDERR_FILENO) < 0 {
+                let err = std::io::Error::last_os_error();
+                libc::close(saved);
+                return Err(err);
+            }
+            SAVED_STDERR.store(saved, Ordering::SeqCst);
+        }
+
+        static HOOK: Once = Once::new();
+        HOOK.call_once(|| {
+            let prev = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                restore_stderr();
+                prev(info);
+            }));
+        });
+        Ok(Self(()))
+    }
+}
+
+impl Drop for StderrRedirect {
+    fn drop(&mut self) {
+        restore_stderr();
+    }
+}
+
+/// Undo [`StderrRedirect`]. Idempotent, so the panic hook and the guard's
+/// drop can both call it.
+fn restore_stderr() {
+    let saved = SAVED_STDERR.swap(-1, Ordering::SeqCst);
+    if saved >= 0 {
+        // SAFETY: `saved` came from `dup` above and is closed exactly once,
+        // guarded by the swap.
+        unsafe {
+            libc::dup2(saved, libc::STDERR_FILENO);
+            libc::close(saved);
         }
     }
 }
