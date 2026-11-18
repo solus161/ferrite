@@ -216,19 +216,22 @@ const CYAN_SOFT: [f32; 3] = [0x80 as f32, 0xC5 as f32, 0xCE as f32];
 /// Monotone in lightness, which is what keeps a weak signal legible against the
 /// noise floor and survives a grayscale screenshot — see
 /// [`stops_are_monotone_in_lightness`](self::tests::stops_are_monotone_in_lightness).
-/// It is also near-uniform perceptually: L\* steps of 24.7, 15.9, 19.3, 15.2,
-/// 18.4, a 1.62× spread against inferno's 1.32×.
+/// It is also near-uniform perceptually: L\* steps of 24.6, 15.9, 18.2, 26.5,
+/// a 1.67× spread against inferno's 1.32×. (`BG_PRIMARY` is left out: only
+/// 5.3 L\* above `BG_VOID`, it was a step nobody could see.)
 ///
 /// The top two stops are warm, which costs the "orange is never data" rule but
 /// buys a peak you can find without hunting. What it constrains is the cursor
 /// colours: see [`CURSOR_CENTER`] and [`CURSOR_TUNED`].
-pub const SPECTRUM_STOPS: [[f32; 3]; 6] = [
+pub const SPECTRUM_STOPS: [[f32; 3]; 5] = [
     to_array_f32(&BG_VOID),
-    to_array_f32(&BG_PRIMARY),
     to_array_f32(&CYAN_MUTED),
-    to_array_f32(&CYAN_BASE),        // These last 3 really make peaks bright
-    to_array_f32(&ORANGE_GLOW),
+    to_array_f32(&CYAN_BASE),
+    // Warm top. `ORANGE_DANGER` sits *below* `ORANGE_GLOW` because it is the
+    // darker of the two (L* 59 vs 86); the other way round, the strongest
+    // peaks would render darker than the ones just under them.
     to_array_f32(&ORANGE_DANGER),
+    to_array_f32(&ORANGE_GLOW),
 ];
 
 // ── Spectrum cursors ────────────────────────────────────────────────────────
@@ -243,7 +246,7 @@ pub const CURSOR_CENTER: Color = CYAN_HIGHLIGHT;
 /// The tuned channel, wherever the translator has been pointed.
 ///
 /// `ORANGE_BASE` is the one warm tone the gradient never produces — it runs
-/// `CYAN_BASE` → `ORANGE_GLOW` → `ORANGE_DANGER` and skips straight past this
+/// `CYAN_BASE` → `ORANGE_DANGER` → `ORANGE_GLOW` and skips straight past this
 /// one — so the cursor stays distinct even lying across a saturated carrier.
 pub const CURSOR_TUNED: Color = ORANGE_BASE;
 
@@ -340,7 +343,7 @@ mod tests {
     /// rather than only at one end. Measured in L\*, not luminance: the eye
     /// reports lightness, and uniform L\* steps look uneven in Y.
     ///
-    /// 2.0 is slack — the ramp measures 1.62 and inferno 1.32, so this catches
+    /// 2.0 is slack — the ramp measures 1.67 and inferno 1.32, so this catches
     /// a stop being dropped or reordered without failing on a tasteful tweak.
     #[test]
     fn stops_are_perceptually_evenly_spaced() {
